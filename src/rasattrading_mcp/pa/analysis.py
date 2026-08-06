@@ -39,29 +39,75 @@ async def _store_payload(
     effective_from: int,
     payload: dict,
 ) -> None:
-    """Açık kaydı kapat (effective_to) ve yeni kaydı ekle / aynı bar için güncelle."""
+    """Immutable kayıt: üzerine yazma yok, geçmiş korunur (2.9 fix).
+
+    - Aynı (symbol, timeframe, effective_from) + aynı sürüm + aynı payload →
+      idempotent no-op; mevcut kayıt dokunulmaz.
+    - Aynı effective_from + farklı sürüm/payload → mevcut revision kapanır
+      (effective_to = effective_from, nokta aralık), yeni açık revision eklenir.
+      Her iki kayıt da tarihçede sorgulanabilir kalır.
+    - İleri (yeni bar): açık kayıt `effective_from - 1` ile kapanır, yeni açık eklenir.
+    - Geriye (backfill / geriye dönük as-of): açık kayıt KAPATILMAZ; tarihsel kapalı
+      kayıt eklenir — ters aralık (örn. 300..199) üretilmez.
+    """
     payload_json = json.dumps(payload, ensure_ascii=False)
 
     def _w(conn) -> None:
         now = int(time.time())
-        row = conn.execute(
-            f"SELECT id FROM {table} WHERE symbol=? AND timeframe=? AND effective_from=? AND effective_to IS NULL",
+        same_bar = conn.execute(
+            f"SELECT id, effective_to, algo_version, payload FROM {table} "
+            f"WHERE symbol=? AND timeframe=? AND effective_from=? ORDER BY id DESC LIMIT 1",
             (symbol, timeframe, effective_from),
         ).fetchone()
-        if row is not None:
+        if same_bar is not None:
+            if same_bar["algo_version"] == algo_version and same_bar["payload"] == payload_json:
+                return  # idempotent — sessiz üzerine yazma yok
+            if same_bar["effective_to"] is None:
+                conn.execute(f"UPDATE {table} SET effective_to=? WHERE id=?", (effective_from, same_bar["id"]))
+                conn.execute(
+                    f"INSERT INTO {table} (symbol, timeframe, algo_version, effective_from, effective_to, payload, created_at) "
+                    f"VALUES (?,?,?,?,NULL,?,?)",
+                    (symbol, timeframe, algo_version, effective_from, payload_json, now),
+                )
+            else:
+                conn.execute(
+                    f"INSERT INTO {table} (symbol, timeframe, algo_version, effective_from, effective_to, payload, created_at) "
+                    f"VALUES (?,?,?,?,?,?,?)",
+                    (symbol, timeframe, algo_version, effective_from, same_bar["effective_to"], payload_json, now),
+                )
+            return
+
+        open_row = conn.execute(
+            f"SELECT id, effective_from FROM {table} "
+            f"WHERE symbol=? AND timeframe=? AND effective_to IS NULL "
+            f"ORDER BY effective_from DESC, id DESC LIMIT 1",
+            (symbol, timeframe),
+        ).fetchone()
+        if open_row is None:
             conn.execute(
-                f"UPDATE {table} SET payload=?, algo_version=?, created_at=? WHERE id=?",
-                (payload_json, algo_version, now, row["id"]),
+                f"INSERT INTO {table} (symbol, timeframe, algo_version, effective_from, effective_to, payload, created_at) "
+                f"VALUES (?,?,?,?,NULL,?,?)",
+                (symbol, timeframe, algo_version, effective_from, payload_json, now),
             )
             return
-        conn.execute(
-            f"UPDATE {table} SET effective_to=? WHERE symbol=? AND timeframe=? AND effective_to IS NULL",
-            (effective_from - 1, symbol, timeframe),
-        )
+        if effective_from > open_row["effective_from"]:
+            conn.execute(f"UPDATE {table} SET effective_to=? WHERE id=?", (effective_from - 1, open_row["id"]))
+            conn.execute(
+                f"INSERT INTO {table} (symbol, timeframe, algo_version, effective_from, effective_to, payload, created_at) "
+                f"VALUES (?,?,?,?,NULL,?,?)",
+                (symbol, timeframe, algo_version, effective_from, payload_json, now),
+            )
+            return
+        # Geriye (backfill): açık kaydı kapatmadan tarihsel kapalı kayıt ekle.
+        next_gt = conn.execute(
+            f"SELECT MIN(effective_from) AS m FROM {table} WHERE symbol=? AND timeframe=? AND effective_from > ?",
+            (symbol, timeframe, effective_from),
+        ).fetchone()
+        eff_to = (next_gt["m"] - 1) if next_gt["m"] is not None else open_row["effective_from"] - 1
         conn.execute(
             f"INSERT INTO {table} (symbol, timeframe, algo_version, effective_from, effective_to, payload, created_at) "
-            f"VALUES (?,?,?,?,NULL,?,?)",
-            (symbol, timeframe, algo_version, effective_from, payload_json, now),
+            f"VALUES (?,?,?,?,?,?,?)",
+            (symbol, timeframe, algo_version, effective_from, eff_to, payload_json, now),
         )
 
     await db.write(_w)
