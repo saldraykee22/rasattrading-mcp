@@ -83,6 +83,50 @@ register_tool(
     )
 )
 
+register_tool(
+    ToolSpec(
+        name="get_candles",
+        description=(
+            "Ham OHLCV mum verisi. Sembol sabit izlenen timeframe setinde ise (15m/1h/4h/1d) "
+            "öncelikli warm-up yapılır; değilse istek anında canlı çekilir. "
+            "meta.freshness son barın güncelliğini gösterir."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string", "description": "Spot USDT çifti, örn. BTCUSDT"},
+                "timeframe": {"type": "string", "description": "1m,3m,5m,15m,30m,1h,2h,4h,6h,8h,12h,1d,3d,1w,1M"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 300},
+                "source": {"type": "string", "enum": ["spot", "futures"], "default": "spot"},
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["symbol", "timeframe"],
+            "additionalProperties": False,
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="get_ticker",
+        description=(
+            "Sembolün anlık 24h ticker'ı (miniTicker WS'ten). meta.freshness verinin güncel olup "
+            "olmadığını söyler; WS kopuksa stale döner."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string", "description": "Spot USDT çifti, örn. BTCUSDT"},
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["symbol"],
+            "additionalProperties": False,
+        },
+    )
+)
+
 
 def describe_tools() -> list[dict[str, Any]]:
     return [

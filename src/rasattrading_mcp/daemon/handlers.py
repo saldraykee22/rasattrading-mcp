@@ -7,8 +7,6 @@ import time
 from typing import Any
 
 from .. import __version__
-from ..config import Config
-from ..daemon.lock import LockInfo
 from ..daemon.readiness import Readiness
 from ..envelope import FRESHNESS_FRESH, Meta, SOURCE_DAEMON, utc_iso
 from ..errors import RasatError, ErrorCode
@@ -45,10 +43,54 @@ async def readiness_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
     return data, Meta(as_of=utc_iso(), source=SOURCE_DAEMON, freshness=FRESHNESS_FRESH)
 
 
+def _require_pipeline(ctx: dict):
+    pipeline = ctx.get("pipeline")
+    if pipeline is None:
+        raise RasatError(ErrorCode.NOT_IMPLEMENTED, "veri pipeline'ı bu daemon'da kapalı")
+    return pipeline
+
+
+async def candles_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    pipeline = _require_pipeline(ctx)
+    symbol = params.get("symbol")
+    timeframe = params.get("timeframe")
+    limit = params.get("limit", 300)
+    source = params.get("source", "spot")
+    if not isinstance(symbol, str) or not symbol:
+        raise RasatError(ErrorCode.INVALID_REQUEST, "symbol zorunlu (string)")
+    if not isinstance(timeframe, str) or not timeframe:
+        raise RasatError(ErrorCode.INVALID_REQUEST, "timeframe zorunlu (string)")
+    if not isinstance(limit, int):
+        raise RasatError(ErrorCode.INVALID_REQUEST, "limit integer olmalı")
+
+    rows = await pipeline.get_candles(symbol, timeframe, limit, source)
+    freshness = pipeline.candle_freshness(symbol, timeframe, rows)
+    return (
+        {"symbol": symbol, "timeframe": timeframe, "source": source, "count": len(rows), "candles": rows},
+        Meta(as_of=utc_iso(), source=f"binance-rest-{source}", freshness=freshness),
+    )
+
+
+async def ticker_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    pipeline = _require_pipeline(ctx)
+    symbol = params.get("symbol")
+    if not isinstance(symbol, str) or not symbol:
+        raise RasatError(ErrorCode.INVALID_REQUEST, "symbol zorunlu (string)")
+    if not await pipeline.ensure_symbol(symbol):
+        raise RasatError(ErrorCode.INVALID_SYMBOL, f"evrende bilinmeyen sembol: {symbol}")
+    ticker = pipeline.get_ticker(symbol)
+    if ticker is None:
+        raise RasatError(ErrorCode.STALE_DATA, f"ticker verisi yok: {symbol}")
+    return ticker, Meta(as_of=utc_iso(), source="binance-ws-miniticker", freshness=ticker["freshness"])
+
+
 def build_dispatcher(ctx: dict) -> ToolDispatcher:
     from ..tools import REGISTRY
 
     dispatcher = ToolDispatcher(REGISTRY)
     dispatcher.register("ping", ping_handler)
     dispatcher.register("get_readiness", readiness_handler)
+    if ctx.get("pipeline") is not None:
+        dispatcher.register("get_candles", candles_handler)
+        dispatcher.register("get_ticker", ticker_handler)
     return dispatcher

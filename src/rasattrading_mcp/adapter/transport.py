@@ -8,7 +8,6 @@ from typing import Any
 import aiohttp
 
 from ..config import Config
-from ..envelope import dumps
 from ..errors import ErrorCode, RasatError
 
 logger = logging.getLogger("rasattrading.adapter.transport")

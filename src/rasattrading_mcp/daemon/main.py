@@ -96,7 +96,12 @@ class DaemonRunner:
         self.lock_mgr.update_state(self.readiness.state)
 
     async def _start_pipeline(self) -> None:
-        """1.4'te gerçek veri pipeline'ı ile doldurulacak. Şimdilik no-op."""
+        """Veri toplama pipeline'ı: universe, miniTicker WS, kline scheduler, futures, retention."""
+        from ..data.pipeline import DataPipeline
+
+        self.pipeline = DataPipeline(self.config, self.db)
+        await self.pipeline.start()
+        logger.info("veri pipeline başlatıldı")
 
     async def _start_http(self) -> None:
         """HTTP IPC sunucusunu başlatır (localhost-only, bearer token)."""
