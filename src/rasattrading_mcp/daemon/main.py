@@ -38,6 +38,8 @@ class DaemonRunner:
         self.started_at = time.time()
         self._stop = asyncio.Event()
         self.db = None  # 1.2'de doldurulur
+        self.audit = None
+        self.account_service = None
         self.pipeline = None  # 1.4'te doldurulur
         self.http_site = None
         self.http_runner = None
@@ -82,6 +84,9 @@ class DaemonRunner:
     async def _run_migrations(self) -> None:
         """SQLite açılır, migration'lar `migrating` durumunda uygulanır."""
         from ..storage.db import Database
+        from ..storage.accounts import AccountService
+        from ..storage.audit import AuditLog
+        from ..storage.credentials import SecretStore
         from ..storage.migrations import run_migrations
 
         self.db = Database(self.config.db_path)
@@ -92,6 +97,8 @@ class DaemonRunner:
         applied = await run_migrations(self.db)
         if applied:
             logger.info("migration uygulandı: %s", applied)
+        self.audit = AuditLog(self.db)
+        self.account_service = AccountService(self.db, secret_store=SecretStore(), audit=self.audit)
         self.readiness.set_state("warming_up")
         self.lock_mgr.update_state(self.readiness.state)
 
@@ -113,6 +120,10 @@ class DaemonRunner:
             "readiness": self.readiness,
             "started_at": self.started_at,
             "pid": os.getpid(),
+            "db": self.db,
+            "audit": self.audit,
+            "account_service": self.account_service,
+            "accounts": self.account_service,
             "pipeline": self.pipeline,
         }
         self.dispatcher = build_dispatcher(ctx)

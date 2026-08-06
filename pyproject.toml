@@ -12,6 +12,8 @@ dependencies = [
   "aiohttp>=3.9.0",
   "websockets>=12.0",
   "psutil>=5.9",
+  "keyring>=24.0",
+  "pywin32>=306; platform_system == 'Windows'",
 ]
 
 [project.optional-dependencies]

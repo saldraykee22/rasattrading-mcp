@@ -57,23 +57,38 @@ class AuditLog:
 
     async def append(self, actor: str, action: str, details: dict | None = None) -> int:
         """Bir satır ekler; satırın seq'ini döner."""
-        details = _redact(details or {})
+        return await self._db.write(
+            lambda conn: self.append_in_connection(conn, actor=actor, action=action, details=details)
+        )
 
-        def _append(conn: sqlite3.Connection) -> int:
-            row = conn.execute("SELECT seq, hash FROM audit_log ORDER BY seq DESC LIMIT 1").fetchone()
-            prev_seq = int(row["seq"]) if row else 0
-            prev_hash = str(row["hash"]) if row else GENESIS_HASH
-            seq = prev_seq + 1
-            details_json = json.dumps(details, ensure_ascii=False, sort_keys=True, default=str)
-            created_at = int(time.time())
-            h = hash_entry(prev_hash, seq, actor, action, details_json, created_at)
-            conn.execute(
-                "INSERT INTO audit_log (seq, actor, action, details, prev_hash, hash, created_at) VALUES (?,?,?,?,?,?,?)",
-                (seq, actor, action, details_json, prev_hash, h, created_at),
-            )
-            return seq
+    def append_in_connection(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        actor: str,
+        action: str,
+        details: dict | None = None,
+    ) -> int:
+        """Append within an already-open transaction.
 
-        return await self._db.write(_append)
+        Account mutations use this helper so the CRUD row and its audit entry
+        commit or roll back together through the single SQLite writer queue.
+        Callers must not close/commit the connection outside ``Database.write``.
+        """
+
+        safe_details = _redact(details or {})
+        row = conn.execute("SELECT seq, hash FROM audit_log ORDER BY seq DESC LIMIT 1").fetchone()
+        prev_seq = int(row["seq"]) if row else 0
+        prev_hash = str(row["hash"]) if row else GENESIS_HASH
+        seq = prev_seq + 1
+        details_json = json.dumps(safe_details, ensure_ascii=False, sort_keys=True, default=str)
+        created_at = int(time.time())
+        h = hash_entry(prev_hash, seq, actor, action, details_json, created_at)
+        conn.execute(
+            "INSERT INTO audit_log (seq, actor, action, details, prev_hash, hash, created_at) VALUES (?,?,?,?,?,?,?)",
+            (seq, actor, action, details_json, prev_hash, h, created_at),
+        )
+        return seq
 
     async def tail(self, limit: int = 50) -> list[dict]:
         def _tail(conn: sqlite3.Connection) -> list[dict]:

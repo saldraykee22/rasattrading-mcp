@@ -127,6 +127,67 @@ register_tool(
     )
 )
 
+# ---------- Modül 3 / 3.1: account + credential CRUD ----------
+
+register_tool(
+    ToolSpec(
+        name="add_account",
+        description=(
+            "Spot hesap ekler. api_key/api_secret verilmezse hesap public/read-only modda oluşturulur; "
+            "secret alanlar hiçbir cevapta döndürülmez."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "label": {"type": "string", "minLength": 1, "maxLength": 200},
+                "api_key": {"type": "string", "minLength": 1},
+                "api_secret": {"type": "string", "minLength": 1},
+                "tags": {"type": "array", "items": {"type": "string"}, "default": []},
+                "market": {"type": "string", "enum": ["spot"], "default": "spot"},
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["label"],
+            "additionalProperties": False,
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="list_accounts",
+        description=(
+            "Hesapları secret içermeyen özetlerle listeler. credentials_configured/read_only alanları "
+            "hesapta API anahtarı bulunup bulunmadığını gösterir."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="remove_account",
+        description="Hesabı ve bağlı credential kayıtlarını kaldırır; işlem audit log'a yazılır.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "account_id": {"type": "string", "minLength": 1},
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["account_id"],
+            "additionalProperties": False,
+        },
+    )
+)
+
 
 def describe_tools() -> list[dict[str, Any]]:
     return [

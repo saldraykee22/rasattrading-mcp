@@ -50,6 +50,22 @@ def _require_pipeline(ctx: dict):
     return pipeline
 
 
+def _require_account_service(ctx: dict):
+    """Return the daemon-owned account service, creating a test-context one lazily."""
+
+    service = ctx.get("account_service") or ctx.get("accounts") or ctx.get("account_store")
+    if service is not None:
+        return service
+    db = ctx.get("db")
+    if db is None:
+        raise RasatError(ErrorCode.NOT_IMPLEMENTED, "account servisi bu daemon'da başlatılmamış")
+    from ..storage.accounts import AccountService
+
+    service = AccountService(db, audit=ctx.get("audit"))
+    ctx["account_service"] = service
+    return service
+
+
 async def candles_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
     pipeline = _require_pipeline(ctx)
     symbol = params.get("symbol")
@@ -84,6 +100,34 @@ async def ticker_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
     return ticker, Meta(as_of=utc_iso(), source="binance-ws-miniticker", freshness=ticker["freshness"])
 
 
+async def add_account_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    service = _require_account_service(ctx)
+    data = await service.add_account(
+        label=params.get("label"),
+        api_key=params.get("api_key"),
+        api_secret=params.get("api_secret"),
+        tags=params.get("tags"),
+        market=params.get("market", "spot"),
+        actor=str(ctx.get("actor", "mcp-agent")),
+    )
+    return data, Meta(as_of=utc_iso(), source="sqlite-accounts", freshness=FRESHNESS_FRESH)
+
+
+async def list_accounts_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    service = _require_account_service(ctx)
+    data = await service.list_accounts()
+    return data, Meta(as_of=utc_iso(), source="sqlite-accounts", freshness=FRESHNESS_FRESH)
+
+
+async def remove_account_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    service = _require_account_service(ctx)
+    data = await service.remove_account(
+        params.get("account_id"),
+        actor=str(ctx.get("actor", "mcp-agent")),
+    )
+    return data, Meta(as_of=utc_iso(), source="sqlite-accounts", freshness=FRESHNESS_FRESH)
+
+
 def build_dispatcher(ctx: dict) -> ToolDispatcher:
     from ..tools import REGISTRY
 
@@ -93,4 +137,7 @@ def build_dispatcher(ctx: dict) -> ToolDispatcher:
     if ctx.get("pipeline") is not None:
         dispatcher.register("get_candles", candles_handler)
         dispatcher.register("get_ticker", ticker_handler)
+    dispatcher.register("add_account", add_account_handler)
+    dispatcher.register("list_accounts", list_accounts_handler)
+    dispatcher.register("remove_account", remove_account_handler)
     return dispatcher
