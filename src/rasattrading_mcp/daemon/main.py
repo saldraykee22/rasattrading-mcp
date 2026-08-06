@@ -41,6 +41,7 @@ class DaemonRunner:
         self.audit = None
         self.account_service = None
         self.risk_service = None
+        self.order_service = None
         self.pipeline = None  # 1.4'te doldurulur
         self.http_site = None
         self.http_runner = None
@@ -120,6 +121,28 @@ class DaemonRunner:
         from .handlers import build_dispatcher
         from .server import build_site
 
+        # Emir broker'ı: pipeline bütçesini ve hesap credential'larını kullanır.
+        from ..data.order_broker import BinanceOrderBroker
+        from ..storage.orders import OrderService, PipelineMarketFeed
+
+        order_broker = None
+        order_service = None
+        if self.pipeline is not None and self.account_service is not None:
+            order_broker = BinanceOrderBroker(
+                self.config.rest_spot_base,
+                credentials=lambda account_id: self.account_service.get_credentials(account_id),
+                budget=self.pipeline.budget,
+            )
+            order_service = OrderService(
+                self.db,
+                accounts=self.account_service,
+                risk=self.risk_service,
+                broker=order_broker,
+                market=PipelineMarketFeed(self.pipeline),
+                audit=self.audit,
+            )
+            self.order_service = order_service
+
         ctx = {
             "config": self.config,
             "readiness": self.readiness,
@@ -131,6 +154,8 @@ class DaemonRunner:
             "accounts": self.account_service,
             "risk_service": self.risk_service,
             "risk_policy_service": self.risk_service,
+            "order_service": order_service,
+            "order_broker": order_broker,
             "pipeline": self.pipeline,
         }
         self.dispatcher = build_dispatcher(ctx)

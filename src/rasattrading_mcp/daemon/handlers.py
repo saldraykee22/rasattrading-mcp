@@ -249,6 +249,69 @@ async def calculate_position_size_handler(params: dict, ctx: dict) -> tuple[dict
     return result, Meta(as_of=utc_iso(), source="daemon-position-sizing", freshness=FRESHNESS_FRESH)
 
 
+def _require_order_service(ctx: dict):
+    """Return the daemon-owned order service, creating a test-context one lazily."""
+
+    service = ctx.get("order_service") or ctx.get("orders")
+    if service is not None:
+        return service
+    db = ctx.get("db")
+    if db is None:
+        raise RasatError(ErrorCode.NOT_IMPLEMENTED, "order servisi bu daemon'da başlatılmamış")
+    from ..storage.orders import OrderService
+
+    accounts = _require_account_service(ctx)
+    risk = _require_risk_service(ctx)
+    pipeline = ctx.get("pipeline")
+    broker = ctx.get("order_broker")
+    if pipeline is None or broker is None:
+        raise RasatError(ErrorCode.NOT_IMPLEMENTED, "order servisi için pipeline ve broker gereklidir")
+    from ..storage.orders import PipelineMarketFeed
+
+    service = OrderService(
+        db,
+        accounts=accounts,
+        risk=risk,
+        broker=broker,
+        market=PipelineMarketFeed(pipeline),
+        audit=ctx.get("audit"),
+    )
+    ctx["order_service"] = service
+    return service
+
+
+async def execute_on_accounts_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    service = _require_order_service(ctx)
+    data = await service.execute_on_accounts(
+        account_ids=params.get("account_ids"),
+        tags=params.get("tags"),
+        symbol=params.get("symbol"),
+        side=params.get("side", "BUY"),
+        entry=params.get("entry"),
+        stop_loss=params.get("stop_loss"),
+        risk_pct=params.get("risk_pct"),
+        idempotency_key=params.get("idempotency_key"),
+        order_type=params.get("order_type", "MARKET"),
+        actor=str(ctx.get("actor", "mcp-agent")),
+    )
+    return data, Meta(as_of=utc_iso(), source="sqlite-orders", freshness=FRESHNESS_FRESH)
+
+
+async def place_order_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    service = _require_order_service(ctx)
+    data = await service.place_order(
+        account_id=params.get("account_id"),
+        symbol=params.get("symbol"),
+        side=params.get("side"),
+        order_type=params.get("order_type", "MARKET"),
+        quantity=params.get("quantity"),
+        price=params.get("price"),
+        idempotency_key=params.get("idempotency_key"),
+        actor=str(ctx.get("actor", "mcp-agent")),
+    )
+    return data, Meta(as_of=utc_iso(), source="sqlite-orders", freshness=FRESHNESS_FRESH)
+
+
 def build_dispatcher(ctx: dict) -> ToolDispatcher:
     from ..tools import REGISTRY
 
@@ -260,6 +323,8 @@ def build_dispatcher(ctx: dict) -> ToolDispatcher:
         dispatcher.register("get_ticker", ticker_handler)
         dispatcher.register("get_symbol_info", get_symbol_info_handler)
         dispatcher.register("calculate_position_size", calculate_position_size_handler)
+        dispatcher.register("execute_on_accounts", execute_on_accounts_handler)
+        dispatcher.register("place_order", place_order_handler)
     dispatcher.register("add_account", add_account_handler)
     dispatcher.register("list_accounts", list_accounts_handler)
     dispatcher.register("remove_account", remove_account_handler)

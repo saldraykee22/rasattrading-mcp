@@ -206,10 +206,49 @@ def _m3_risk_policy(conn: sqlite3.Connection) -> None:
     )
 
 
+def _m4_orders(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        -- Emir kayıtları: idempotency + gerçek Binance state machine + aggregate exposure.
+        -- status: NEW | PARTIALLY_FILLED | FILLED | CANCELED | REJECTED | EXPIRED | UNKNOWN | PAPER
+        -- (account_id, idempotency_key) UNIQUE -> aynı anahtarla retry çift emir üretmez,
+        --   stored emir döner / durum reconcile edilir.
+        CREATE TABLE orders (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          order_id TEXT NOT NULL UNIQUE,
+          account_id TEXT NOT NULL,
+          idempotency_key TEXT NOT NULL,
+          symbol TEXT NOT NULL,
+          side TEXT NOT NULL,
+          order_type TEXT NOT NULL,
+          quantity REAL NOT NULL,
+          price REAL,
+          status TEXT NOT NULL,
+          exchange_order_id TEXT,
+          client_order_id TEXT,
+          executed_qty REAL,
+          avg_price REAL,
+          fee REAL,
+          notional REAL,
+          reference_price REAL,
+          error_code TEXT,
+          error_message TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          UNIQUE (account_id, idempotency_key)
+        );
+
+        CREATE INDEX idx_orders_account ON orders (account_id, status);
+        CREATE INDEX idx_orders_open ON orders (account_id, status, created_at);
+        """
+    )
+
+
 MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (1, "initial_schema", _m1_initial_schema),
     (2, "indexes", _m2_indexes),
     (3, "risk_policy_override", _m3_risk_policy),
+    (4, "orders", _m4_orders),
 ]
 
 

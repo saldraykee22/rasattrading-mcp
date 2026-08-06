@@ -328,6 +328,64 @@ register_tool(
     )
 )
 
+# ---------- Modül 3 / 3.4: emir yürütme ----------
+
+register_tool(
+    ToolSpec(
+        name="execute_on_accounts",
+        description=(
+            "Birden çok hesapta pozisyon açar. account_ids + tags birlikte verilirse UNION'dur; "
+            "ikisi de boşsa reddedilir. Emir boyutu daemon'ın kendi taze bakiye/equity/fiyat "
+            "snapshot'ından hesaplanır (agent rakamlarına güvenilmez). Idempotency: aynı "
+            "idempotency_key retry'i çift emir üretmez. Kısmi başarı: hesap başına ayrı sonuç döner. "
+            "Temel doğruluk kontrolleri (bakiye/stale/stop yönü/sembol) her zaman aktiftir."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "account_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "description": "Hedef account_id'ler (tags ile UNION)"},
+                "tags": {"type": "array", "items": {"type": "string", "minLength": 1}, "description": "Hedef tag'ler (account_ids ile UNION)"},
+                "symbol": {"type": "string", "description": "Spot USDT çifti, örn. BTCUSDT"},
+                "side": {"type": "string", "enum": ["BUY", "SELL"], "default": "BUY"},
+                "entry": {"type": "number", "exclusiveMinimum": 0},
+                "stop_loss": {"type": "number", "exclusiveMinimum": 0},
+                "risk_pct": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+                "order_type": {"type": "string", "enum": ["MARKET", "LIMIT"], "default": "MARKET"},
+                "idempotency_key": {"type": "string", "minLength": 1},
+                "request_id": {"type": "string"},
+            },
+            "required": ["symbol", "side", "entry", "stop_loss", "risk_pct", "idempotency_key"],
+            "additionalProperties": False,
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="place_order",
+        description=(
+            "Tek hesapta doğrudan emir gönderir (order_type: MARKET|LIMIT, miktar base asset). "
+            "Aynı idempotency_key ile retry çift emir üretmez; ağ zaman aşımında Binance'ten "
+            "gerçek durum reconcile edilir. Temel doğruluk kontrolleri her zaman aktiftir."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "account_id": {"type": "string", "minLength": 1},
+                "symbol": {"type": "string", "description": "Spot USDT çifti, örn. BTCUSDT"},
+                "side": {"type": "string", "enum": ["BUY", "SELL"]},
+                "order_type": {"type": "string", "enum": ["MARKET", "LIMIT"], "default": "MARKET"},
+                "quantity": {"type": "number", "exclusiveMinimum": 0, "description": "Base asset miktarı"},
+                "price": {"type": "number", "exclusiveMinimum": 0, "description": "LIMIT emir için zorunlu"},
+                "idempotency_key": {"type": "string", "minLength": 1},
+                "request_id": {"type": "string"},
+            },
+            "required": ["account_id", "symbol", "side", "quantity", "idempotency_key"],
+            "additionalProperties": False,
+        },
+    )
+)
+
 
 def describe_tools() -> list[dict[str, Any]]:
     return [
