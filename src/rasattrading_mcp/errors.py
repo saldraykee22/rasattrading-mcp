@@ -1,0 +1,59 @@
+"""Canonical hata kodu sözlüğü (Modül 2/3 genişletecektir)."""
+
+from __future__ import annotations
+
+from typing import Any
+
+
+class ErrorCode:
+    INTERNAL_ERROR = "INTERNAL_ERROR"
+    INVALID_REQUEST = "INVALID_REQUEST"
+    UNAUTHORIZED = "UNAUTHORIZED"
+    NOT_READY = "NOT_READY"
+    TOOL_NOT_FOUND = "TOOL_NOT_FOUND"
+    INVALID_SYMBOL = "INVALID_SYMBOL"
+    STALE_DATA = "STALE_DATA"
+    RATE_LIMITED = "RATE_LIMITED"
+    TIMEOUT = "TIMEOUT"
+    INSUFFICIENT_BALANCE = "INSUFFICIENT_BALANCE"
+    NOT_IMPLEMENTED = "NOT_IMPLEMENTED"
+
+
+class RasatError(Exception):
+    """Tüm modüllerde fırlatılan canonical hata."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        details: Any = None,
+        http_status: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.details = details
+        self.http_status = http_status
+
+    def to_dict(self) -> dict:
+        d: dict = {"code": self.code, "message": self.message}
+        if self.details is not None:
+            d["details"] = self.details
+        return d
+
+
+_HTTP_STATUS: dict[str, int] = {
+    ErrorCode.UNAUTHORIZED: 401,
+    ErrorCode.INVALID_REQUEST: 400,
+    ErrorCode.TOOL_NOT_FOUND: 404,
+    ErrorCode.RATE_LIMITED: 429,
+    ErrorCode.NOT_READY: 503,
+    ErrorCode.TIMEOUT: 504,
+    ErrorCode.STALE_DATA: 409,
+    ErrorCode.INVALID_SYMBOL: 422,
+    ErrorCode.INSUFFICIENT_BALANCE: 409,
+}
+
+
+def http_status_for(code: str) -> int:
+    return _HTTP_STATUS.get(code, 500)
