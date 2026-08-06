@@ -31,8 +31,8 @@ def _tables(conn):
 
 async def test_migrations_on_empty_db(cfg, db):
     applied = await run_migrations(db)
-    assert applied == [1, 2, 3, 4, 5, 6]
-    assert await current_version(db) == 6
+    assert applied == [1, 2, 3, 4, 5, 6, 7]
+    assert await current_version(db) == 7
     tables = await db.read(_tables)
     expected = {
         "candles", "futures_context", "market_structure", "liquidity_zones",
@@ -47,6 +47,12 @@ async def test_migrations_on_empty_db(cfg, db):
 
     cols = await db.read(_cols)
     assert "cooldown_until" in cols
+
+    def _order_cols(conn):
+        return {r["name"] for r in conn.execute("PRAGMA table_info(orders)").fetchall()}
+
+    order_cols = await db.read(_order_cols)
+    assert "equity_snapshot" in order_cols  # 3.20 M1: migration 7 sütunu ekler
 
 
 async def test_migrations_idempotent_on_filled_db(cfg, db):

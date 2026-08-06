@@ -584,3 +584,104 @@ async def test_trading_lock_required(ex_ctx):
     )
     # paper hesap simüle eder, reddetmez
     assert result["results"][0]["status"] == "paper"
+
+
+# ---------- 3.20 M1: equity_snapshot saklanıyor ----------
+
+
+async def test_equity_snapshot_persisted_in_order_row(ex_ctx):
+    # 3.20 M1: execute_on_accounts equity'yi hesaplar; bu değer orders tablosunda
+    # kalıcı olarak saklanmalı ve sonuca yansımalı.
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx, balance_usdt=10000.0, base_holdings={"BTC": 1.0})
+    service = ctx["service"]
+
+    result = await service.execute_on_accounts(
+        account_ids=[account_id], symbol="ETHUSDT", side="BUY", entry=50, stop_loss=45,
+        risk_pct=0.01, idempotency_key="eq-snap",
+    )
+    detail = result["results"][0]
+    # equity: 10000 USDT + 1 BTC * 100 = 10100
+    assert detail["status"] == "FILLED"
+    assert detail["equity_snapshot"] == pytest.approx(10100.0)
+
+    def _q(conn):
+        return dict(conn.execute("SELECT * FROM orders WHERE idempotency_key = 'eq-snap'").fetchone())
+
+    row = await ctx["db"].read(_q)
+    assert row["equity_snapshot"] == pytest.approx(10100.0)
+
+
+async def test_equity_snapshot_persisted_place_order(ex_ctx):
+    # 3.20 M1: place_order da equity snapshot'ı saklar.
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx, balance_usdt=2000.0)
+    service = ctx["service"]
+    result = await service.place_order(
+        account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="MARKET",
+        quantity=1.0, idempotency_key="eq-snap-direct",
+    )
+    assert result["status"] == "FILLED"
+    assert result["equity_snapshot"] == pytest.approx(2000.0)
+
+    def _q(conn):
+        return dict(conn.execute("SELECT * FROM orders WHERE idempotency_key = 'eq-snap-direct'").fetchone())
+
+    row = await ctx["db"].read(_q)
+    assert row["equity_snapshot"] == pytest.approx(2000.0)
+
+
+# ---------- 3.20 M4: eksik zorunlu parametre INVALID_REQUEST ----------
+
+
+async def test_execute_missing_entry_invalid_request(ex_ctx):
+    # 3.20 M4: entry eksikken float(None) TypeError → UNKNOWN değil; INVALID_REQUEST.
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx)
+    service = ctx["service"]
+    with pytest.raises(RasatError) as exc_info:
+        await service.execute_on_accounts(
+            account_ids=[account_id], symbol="BTCUSDT", side="BUY", entry=None,
+            stop_loss=95, risk_pct=0.01, idempotency_key="no-entry",
+        )
+    assert exc_info.value.code == ErrorCode.INVALID_REQUEST
+    assert len(ctx["broker"].placed) == 0
+
+
+async def test_execute_missing_risk_pct_invalid_request(ex_ctx):
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx)
+    service = ctx["service"]
+    with pytest.raises(RasatError) as exc_info:
+        await service.execute_on_accounts(
+            account_ids=[account_id], symbol="BTCUSDT", side="BUY", entry=100,
+            stop_loss=95, risk_pct=None, idempotency_key="no-risk",
+        )
+    assert exc_info.value.code == ErrorCode.INVALID_REQUEST
+
+
+async def test_place_order_missing_quantity_invalid_request(ex_ctx):
+    # 3.20 M4: quantity eksikken float(None) TypeError değil; INVALID_REQUEST.
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx)
+    service = ctx["service"]
+    with pytest.raises(RasatError) as exc_info:
+        await service.place_order(
+            account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="MARKET",
+            quantity=None, idempotency_key="no-qty",
+        )
+    assert exc_info.value.code == ErrorCode.INVALID_REQUEST
+    assert len(ctx["broker"].placed) == 0
+
+
+async def test_execute_non_numeric_entry_invalid_request(ex_ctx):
+    # 3.20 M4: sayısal olmayan entry de INVALID_REQUEST (UNKNOWN değil).
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx)
+    service = ctx["service"]
+    with pytest.raises(RasatError) as exc_info:
+        await service.execute_on_accounts(
+            account_ids=[account_id], symbol="BTCUSDT", side="BUY", entry="abc",
+            stop_loss=95, risk_pct=0.01, idempotency_key="bad-entry",
+        )
+    assert exc_info.value.code == ErrorCode.INVALID_REQUEST

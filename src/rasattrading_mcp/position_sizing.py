@@ -166,7 +166,7 @@ def calculate_position_size(
 
     return {
         "symbol": symbol,
-        "side": "BUY",
+        "side": (side or "BUY").upper(),
         "account_balance": account_balance,
         "risk_pct": risk_pct,
         "risk_amount": risk_amount,

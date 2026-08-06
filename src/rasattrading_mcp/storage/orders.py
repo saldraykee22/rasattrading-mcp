@@ -56,6 +56,7 @@ _ORDER_COLUMNS = (
     "fee",
     "notional",
     "reference_price",
+    "equity_snapshot",
     "error_code",
     "error_message",
     "created_at",
@@ -121,6 +122,26 @@ class OrderService:
         return lock
 
     # ---------- hedef çözümleme ----------
+
+    @staticmethod
+    def _require_number(value: Any, name: str) -> float:
+        """Zorunlu sayısal parametre: eksik/geçersiz değer INVALID_REQUEST (3.20 M4).
+
+        `float(None)` TypeError fırlatıp aşağıda UNKNOWN'a yutuluyordu; zorunlu
+        parametre eksikse canonical INVALID_REQUEST dönmelidir.
+        """
+        if value is None or isinstance(value, bool):
+            raise RasatError(ErrorCode.INVALID_REQUEST, f"{name} zorunlu (sayı)")
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            raise RasatError(ErrorCode.INVALID_REQUEST, f"{name} sayı olmalı")
+
+    @staticmethod
+    def _require_string(value: Any, name: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise RasatError(ErrorCode.INVALID_REQUEST, f"{name} zorunlu (string)")
+        return value.strip()
 
     async def _resolve_targets(self, account_ids: Any, tags: Any) -> list[dict]:
         if not account_ids and not tags:
@@ -194,8 +215,9 @@ class OrderService:
         conn.execute(
             "INSERT INTO orders "
             "(order_id, account_id, idempotency_key, symbol, side, order_type, quantity, price, status, "
-            " client_order_id, executed_qty, avg_price, fee, notional, reference_price, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,0,0,0,?,?,?,?)",
+            " client_order_id, executed_qty, avg_price, fee, notional, reference_price, equity_snapshot, "
+            " created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,0,0,0,?,?,?,?,?)",
             (
                 order_id,
                 account_id,
@@ -209,6 +231,7 @@ class OrderService:
                 client_order_id,
                 notional,
                 reference_price,
+                equity_snapshot,
                 now,
                 now,
             ),
@@ -284,6 +307,7 @@ class OrderService:
             "exchange_order_id": order.get("exchange_order_id"),
             "executed_qty": order.get("executed_qty", 0.0),
             "avg_price": order.get("avg_price", 0.0),
+            "equity_snapshot": order.get("equity_snapshot"),
         }
         if position_size is not None:
             result["position_size"] = position_size
@@ -309,6 +333,13 @@ class OrderService:
     ) -> dict[str, Any]:
         if not isinstance(idempotency_key, str) or not idempotency_key.strip():
             raise RasatError(ErrorCode.INVALID_REQUEST, "idempotency_key zorunlu (string)")
+        # 3.20 M4: zorunlu parametreler preflight öncesi doğrulanır — eksik değer
+        # float(None) TypeError → UNKNOWN yerine INVALID_REQUEST döner.
+        symbol = self._require_string(symbol, "symbol")
+        side = self._require_string(side, "side")
+        entry = self._require_number(entry, "entry")
+        stop_loss = self._require_number(stop_loss, "stop_loss")
+        risk_pct = self._require_number(risk_pct, "risk_pct")
         targets = await self._resolve_targets(account_ids, tags)
         results = []
         for account in targets:
@@ -319,9 +350,9 @@ class OrderService:
                         account,
                         symbol=symbol,
                         side=side,
-                        entry=float(entry),
-                        stop_loss=float(stop_loss),
-                        risk_pct=float(risk_pct),
+                        entry=entry,
+                        stop_loss=stop_loss,
+                        risk_pct=risk_pct,
                         idempotency_key=idempotency_key.strip(),
                         order_type=order_type,
                         actor=actor or "mcp-agent",
@@ -370,6 +401,13 @@ class OrderService:
             raise RasatError(ErrorCode.INVALID_REQUEST, "account_id zorunlu (string)")
         if not isinstance(idempotency_key, str) or not idempotency_key.strip():
             raise RasatError(ErrorCode.INVALID_REQUEST, "idempotency_key zorunlu (string)")
+        # 3.20 M4: eksik/geçersiz zorunlu parametre TypeError → UNKNOWN yerine
+        # INVALID_REQUEST döner.
+        symbol = self._require_string(symbol, "symbol")
+        side = self._require_string(side, "side")
+        quantity = self._require_number(quantity, "quantity")
+        if price is not None:
+            price = self._require_number(price, "price")
         lock = self._lock(account_id.strip())
         async with lock:
             return await self._execute_one_direct(
@@ -377,8 +415,8 @@ class OrderService:
                 symbol=symbol,
                 side=side,
                 order_type=order_type,
-                quantity=float(quantity),
-                price=None if price is None else float(price),
+                quantity=quantity,
+                price=price,
                 idempotency_key=idempotency_key.strip(),
                 actor=actor or "mcp-agent",
             )

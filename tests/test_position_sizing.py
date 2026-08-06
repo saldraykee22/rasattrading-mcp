@@ -201,6 +201,35 @@ def test_calculate_position_size_price_filter_rejected():
     assert exc_info.value.code == ErrorCode.FILTER_VIOLATION
 
 
+def test_calculate_position_size_returns_side():
+    # 3.20 M3: dönüş side'ı sabit "BUY" değil; geçilen side'a uygun olmalı.
+    buy = calculate_position_size(
+        symbol="BTCUSDT", account_balance=10000, risk_pct=0.01,
+        entry=100, stop_loss=95, filters=DEFAULT_FILTERS, side="BUY",
+    )
+    assert buy["side"] == "BUY"
+
+    sell = calculate_position_size(
+        symbol="BTCUSDT", account_balance=10000, risk_pct=0.01,
+        entry=100, stop_loss=105, filters=DEFAULT_FILTERS, side="SELL",
+    )
+    assert sell["side"] == "SELL"
+
+    # küçük harfle gelen side normalleştirilir
+    lower = calculate_position_size(
+        symbol="BTCUSDT", account_balance=10000, risk_pct=0.01,
+        entry=100, stop_loss=95, filters=DEFAULT_FILTERS, side="buy",
+    )
+    assert lower["side"] == "BUY"
+
+    # side verilmezse varsayılan BUY
+    default = calculate_position_size(
+        symbol="BTCUSDT", account_balance=10000, risk_pct=0.01,
+        entry=100, stop_loss=95, filters=DEFAULT_FILTERS,
+    )
+    assert default["side"] == "BUY"
+
+
 # ---------- get_symbol_info + handler dispatch ----------
 
 

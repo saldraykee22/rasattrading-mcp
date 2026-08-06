@@ -265,6 +265,17 @@ def _m6_emergency_reconciled(conn: sqlite3.Connection) -> None:
     )
 
 
+def _m7_orders_equity_snapshot(conn: sqlite3.Connection) -> None:
+    """Emir kaydına hesap equity snapshot'ı (3.20 M1).
+
+    `execute_on_accounts` equity'yi hesaplayıp `_insert_order`'a geçiyordu ama
+    tabloda sütun yoktu; risk_pct boyutlandırmasının yapıldığı anın equity'si
+    kalıcı olarak saklanmazdı. Eski emir kayıtları NULL kalır (geriye dönük dolgu
+    yok — geçmişin equity'si yeniden hesaplanamaz).
+    """
+    conn.execute("ALTER TABLE orders ADD COLUMN equity_snapshot REAL")
+
+
 MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (1, "initial_schema", _m1_initial_schema),
     (2, "indexes", _m2_indexes),
@@ -272,6 +283,7 @@ MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (4, "risk_policy_override", _m4_risk_policy),
     (5, "orders", _m5_orders),
     (6, "emergency_reconciled", _m6_emergency_reconciled),
+    (7, "orders_equity_snapshot", _m7_orders_equity_snapshot),
 ]
 
 
