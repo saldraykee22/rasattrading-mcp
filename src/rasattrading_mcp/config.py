@@ -61,6 +61,7 @@ class Config:
     lock_probe_delay: float = 0.4
     rate_limit_window_seconds: float = 60.0
     http_timeout_seconds: float = 20.0
+    alarm_eval_seconds: float = 30.0
 
     @property
     def db_path(self) -> Path:

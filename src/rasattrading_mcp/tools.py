@@ -346,6 +346,106 @@ register_tool(
 )
 
 
+# ---------- Modül 2 / 2.6: Alarm motoru ----------
+
+
+def _alarm_schema(extra: dict) -> dict:
+    base = {
+        "request_id": {"type": "string"},
+        "idempotency_key": {"type": "string"},
+    }
+    base.update(extra)
+    return {"type": "object", "properties": base, "additionalProperties": False}
+
+
+register_tool(
+    ToolSpec(
+        name="create_alert",
+        description=(
+            "Tek sembol+timeframe için koşullu alarm tanımlar. Koşul, scan_market ile aynı "
+            "allowlisted filtre AST'sidir. State machine: armed→triggered→cooldown→armed; "
+            "aynı veri penceresi tekrar tetiklenmez (dedup)."
+        ),
+        input_schema=_alarm_schema(
+            {
+                "symbol": {"type": "string"},
+                "timeframe": {"type": "string"},
+                "condition": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "Filtre AST'si (scan_market ile aynı türler)",
+                },
+                "cooldown_seconds": {"type": "integer", "minimum": 0, "default": 300},
+                "note": {"type": "string"},
+            }
+        ),
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="create_composite_alert",
+        description=(
+            "Birden çok clause'ı AND/OR ile birleştiren alarm. Her clause bir "
+            "(symbol,timeframe) çifti + koşul taşır; tüm clause'ların verisi taze "
+            "olmadan değerlendirilmez (stale → tetiklenmez)."
+        ),
+        input_schema=_alarm_schema(
+            {
+                "clauses": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "symbol": {"type": "string"},
+                            "timeframe": {"type": "string"},
+                            "filters": {"type": "array", "items": {"type": "object"}},
+                        },
+                        "required": ["symbol", "timeframe", "filters"],
+                    },
+                },
+                "combine": {"type": "string", "enum": ["AND", "OR"], "default": "AND"},
+                "cooldown_seconds": {"type": "integer", "minimum": 0, "default": 300},
+                "note": {"type": "string"},
+            }
+        ),
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="list_alerts",
+        description="Tüm alarm tanımlarını durumlarıyla (armed/triggered) listeler.",
+        input_schema=_alarm_schema({}),
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="delete_alert",
+        description="Alarm tanımını siler.",
+        input_schema=_alarm_schema({"alert_id": {"type": "string", "minLength": 1}}),
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="get_triggered_alerts",
+        description=(
+            "Kalıcı tetiklenme kayıtlarını döner (agent kapalıyken tetiklenenler kaybolmaz). "
+            "İsteğe bağlı alert_id filtresi + sayfalama."
+        ),
+        input_schema=_alarm_schema(
+            {
+                "alert_id": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50},
+                "cursor": {"type": "integer"},
+            }
+        ),
+    )
+)
+
+
 def describe_tools() -> list[dict[str, Any]]:
     return [
         {

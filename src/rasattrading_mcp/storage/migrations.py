@@ -162,9 +162,16 @@ def _m2_indexes(conn: sqlite3.Connection) -> None:
     )
 
 
+def _m3_alert_cooldown(conn: sqlite3.Connection) -> None:
+    """Alarm state machine'i için soğuma sütunu (armed→triggered→cooldown→armed)."""
+    conn.execute("ALTER TABLE alerts ADD COLUMN cooldown_until INTEGER")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_state ON alerts (state, updated_at)")
+
+
 MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (1, "initial_schema", _m1_initial_schema),
     (2, "indexes", _m2_indexes),
+    (3, "alert_cooldown", _m3_alert_cooldown),
 ]
 
 

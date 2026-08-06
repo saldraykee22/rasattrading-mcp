@@ -31,8 +31,8 @@ def _tables(conn):
 
 async def test_migrations_on_empty_db(cfg, db):
     applied = await run_migrations(db)
-    assert applied == [1, 2]
-    assert await current_version(db) == 2
+    assert applied == [1, 2, 3]
+    assert await current_version(db) == 3
     tables = await db.read(_tables)
     expected = {
         "candles", "futures_context", "market_structure", "liquidity_zones",
@@ -40,6 +40,12 @@ async def test_migrations_on_empty_db(cfg, db):
         "accounts", "audit_log", "schema_migrations",
     }
     assert expected.issubset(tables)
+
+    def _cols(conn):
+        return {r["name"] for r in conn.execute("PRAGMA table_info(alerts)").fetchall()}
+
+    cols = await db.read(_cols)
+    assert "cooldown_until" in cols
 
 
 async def test_migrations_idempotent_on_filled_db(cfg, db):

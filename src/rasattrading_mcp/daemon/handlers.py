@@ -253,6 +253,69 @@ async def scan_market_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
     return data, Meta(as_of=utc_iso(), source="pa-screener", freshness=data["freshness"])
 
 
+# ---------- Modül 2 / 2.6: alarm handler'ları ----------
+
+
+def _require_alarm_service(ctx: dict):
+    alarm = ctx.get("alarm_service")
+    if alarm is not None:
+        return alarm
+    from ..pa.alarms import AlarmService
+
+    engine = _require_pa_engine(ctx)
+    alarm = AlarmService(engine.db, engine=engine)
+    engine.alarm_service = alarm  # PAEngine.analyze → on_analysis_updated hook'u
+    ctx["alarm_service"] = alarm
+    return alarm
+
+
+async def create_alert_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    alarm = _require_alarm_service(ctx)
+    data = await alarm.create_alert(
+        params["symbol"],
+        params["timeframe"],
+        params["condition"],
+        cooldown_seconds=params.get("cooldown_seconds", 300),
+        note=params.get("note"),
+    )
+    return data, Meta(as_of=utc_iso(), source="alarm-engine", freshness=FRESHNESS_FRESH)
+
+
+async def create_composite_alert_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    alarm = _require_alarm_service(ctx)
+    data = await alarm.create_composite_alert(
+        params["clauses"],
+        combine=params.get("combine", "AND"),
+        cooldown_seconds=params.get("cooldown_seconds", 300),
+        note=params.get("note"),
+    )
+    return data, Meta(as_of=utc_iso(), source="alarm-engine", freshness=FRESHNESS_FRESH)
+
+
+async def list_alerts_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    alarm = _require_alarm_service(ctx)
+    data = await alarm.list_alerts()
+    return {"alerts": data}, Meta(as_of=utc_iso(), source="alarm-engine", freshness=FRESHNESS_FRESH)
+
+
+async def delete_alert_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    alarm = _require_alarm_service(ctx)
+    removed = await alarm.delete_alert(params["alert_id"])
+    return {"alert_id": params["alert_id"], "removed": removed}, Meta(
+        as_of=utc_iso(), source="alarm-engine", freshness=FRESHNESS_FRESH
+    )
+
+
+async def get_triggered_alerts_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    alarm = _require_alarm_service(ctx)
+    data = await alarm.get_triggered_alerts(
+        alert_id=params.get("alert_id"),
+        limit=params.get("limit", 50),
+        cursor=params.get("cursor"),
+    )
+    return data, Meta(as_of=utc_iso(), source="alarm-engine", freshness=FRESHNESS_FRESH)
+
+
 def build_dispatcher(ctx: dict) -> ToolDispatcher:
     from ..tools import REGISTRY
 
@@ -273,4 +336,9 @@ def build_dispatcher(ctx: dict) -> ToolDispatcher:
     dispatcher.register("get_chart_annotations", get_chart_annotations_handler)
     dispatcher.register("clear_annotations", clear_annotations_handler)
     dispatcher.register("scan_market", scan_market_handler)
+    dispatcher.register("create_alert", create_alert_handler)
+    dispatcher.register("create_composite_alert", create_composite_alert_handler)
+    dispatcher.register("list_alerts", list_alerts_handler)
+    dispatcher.register("delete_alert", delete_alert_handler)
+    dispatcher.register("get_triggered_alerts", get_triggered_alerts_handler)
     return dispatcher

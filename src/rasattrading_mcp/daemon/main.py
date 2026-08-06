@@ -114,6 +114,14 @@ class DaemonRunner:
         """HTTP IPC sunucusunu başlatır (localhost-only, bearer token)."""
         from .handlers import build_dispatcher
         from .server import build_site
+        from ..pa.analysis import PAEngine
+        from ..pa.alarms import AlarmService
+
+        pa_engine = PAEngine(self.db, pipeline=self.pipeline, config=self.config)
+        alarm_service = AlarmService(self.db, engine=pa_engine)
+        pa_engine.alarm_service = alarm_service
+        self.pa_engine = pa_engine
+        self.alarm_service = alarm_service
 
         ctx = {
             "config": self.config,
@@ -125,6 +133,8 @@ class DaemonRunner:
             "account_service": self.account_service,
             "accounts": self.account_service,
             "pipeline": self.pipeline,
+            "pa_engine": pa_engine,
+            "alarm_service": alarm_service,
         }
         self.dispatcher = build_dispatcher(ctx)
         self.http_site, self.http_runner = await build_site(
@@ -135,13 +145,33 @@ class DaemonRunner:
 
     async def run(self) -> int:
         watch = asyncio.create_task(self._ownership_watch())
+        alarm_watch = asyncio.create_task(self._alarm_eval_loop()) if self.alarm_service is not None else None
         try:
             await self._stop.wait()
         finally:
             watch.cancel()
-            await asyncio.gather(watch, return_exceptions=True)
+            if alarm_watch is not None:
+                alarm_watch.cancel()
+            tasks = [watch] + ([alarm_watch] if alarm_watch is not None else [])
+            await asyncio.gather(*tasks, return_exceptions=True)
         await self.stop()
         return 0
+
+    async def _alarm_eval_loop(self) -> None:
+        """Periyodik alarm değerlendirmesi: yalnızca verisi taze olan semboller tetiklenir."""
+        while True:
+            try:
+                await asyncio.sleep(self.config.alarm_eval_seconds)
+                pairs = await self.alarm_service.alert_symbols()
+                for symbol, timeframe in pairs:
+                    try:
+                        await self.alarm_service.evaluate_symbol(symbol, timeframe)
+                    except Exception:  # noqa: BLE001
+                        logger.exception("alarm değerlendirme hatası: %s %s", symbol, timeframe)
+            except asyncio.CancelledError:
+                return
+            except Exception:  # noqa: BLE001
+                logger.exception("alarm döngüsü hatası")
 
     async def _ownership_watch(self) -> None:
         """Kilit dosyası elimizde değilse (halef başladı / biri sildi) kapan."""
