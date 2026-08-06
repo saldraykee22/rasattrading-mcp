@@ -435,15 +435,17 @@ class OrderService:
         order_type: str,
         actor: str,
     ) -> dict:
+        # 3.12: idempotency kontrolü preflight'tan ÖNCE. Aynı key ile retry'de
+        # piyasa stale/credential sorunu olsa bile stored sonuç dönülür
+        # (aynı key = aynı sonuç); preflight tekrar çalıştırılmaz.
+        existing = await self.db.read(lambda conn: self._load_order(conn, account["account_id"], idempotency_key))
+        if existing is not None:
+            return await self._handle_existing(account, existing)
+
         is_real = await self._is_real(account)
         await self._accuracy_preflight(symbol, side, entry, stop_loss)
         quote_asset = "USDT"
         price = await self.market.price(symbol)
-
-        # Idempotency: bu anahtarla emir zaten var mı?
-        existing = await self.db.read(lambda conn: self._load_order(conn, account["account_id"], idempotency_key))
-        if existing is not None:
-            return await self._handle_existing(account, existing)
 
         # 1) Daemon'ın kendi taze bakiye snapshot'ı + equity + exchange filtreleri
         balances = await self.broker.get_balance(account_id=account["account_id"])
@@ -529,6 +531,13 @@ class OrderService:
         actor: str,
     ) -> dict:
         account = await self.accounts.get_account(account_id)
+
+        # 3.12: idempotency kontrolü preflight'tan önce — retry'de piyasa stale
+        # olsa bile stored sonuç dönülür (aynı key = aynı sonuç).
+        existing = await self.db.read(lambda conn: self._load_order(conn, account_id, idempotency_key))
+        if existing is not None:
+            return await self._handle_existing(account, existing)
+
         is_real = await self._is_real(account)
         if not await self.market.symbol_valid(symbol):
             raise RasatError(ErrorCode.INVALID_SYMBOL, f"evrende bilinmeyen sembol: {symbol}")
@@ -537,10 +546,6 @@ class OrderService:
         if price is None:
             price = market_price
         notional = quantity * price
-
-        existing = await self.db.read(lambda conn: self._load_order(conn, account_id, idempotency_key))
-        if existing is not None:
-            return await self._handle_existing(account, existing)
 
         # 3.8: serbest bakiye gate'i (BUY → USDT, SELL → base) — equity değil.
         filters = await self.market.filters(symbol)

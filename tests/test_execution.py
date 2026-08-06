@@ -163,6 +163,52 @@ async def test_timeout_unknown_no_blind_retry(ex_ctx):
     assert result["error"]["code"] == ErrorCode.ORDER_UNKNOWN
 
 
+# ---------- idempotency preflight'tan önce (3.12) ----------
+
+
+async def test_execute_retry_with_stale_price_returns_stored_result(ex_ctx):
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx)
+    service = ctx["service"]
+
+    first = await service.execute_on_accounts(
+        account_ids=[account_id], symbol="BTCUSDT", side="BUY", entry=100, stop_loss=95,
+        risk_pct=0.01, idempotency_key="retry-stale",
+    )
+    assert first["results"][0]["status"] == "FILLED"
+
+    # piyasa stale olsa bile aynı key → stored sonuç (STALE_DATA değil)
+    ctx["market"].stale.add("BTCUSDT")
+    second = await service.execute_on_accounts(
+        account_ids=[account_id], symbol="BTCUSDT", side="BUY", entry=100, stop_loss=95,
+        risk_pct=0.01, idempotency_key="retry-stale",
+    )
+    assert second["results"][0]["status"] == "FILLED"
+    assert second["results"][0]["order_id"] == first["results"][0]["order_id"]
+    assert len(ctx["broker"].placed) == 1  # çift emir yok
+
+
+async def test_place_order_retry_with_stale_price_returns_stored_result(ex_ctx):
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx)
+    service = ctx["service"]
+
+    first = await service.place_order(
+        account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="MARKET",
+        quantity=1.0, idempotency_key="retry-stale-direct",
+    )
+    assert first["status"] == "FILLED"
+
+    ctx["market"].stale.add("BTCUSDT")
+    second = await service.place_order(
+        account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="MARKET",
+        quantity=1.0, idempotency_key="retry-stale-direct",
+    )
+    assert second["status"] == "FILLED"
+    assert second["order_id"] == first["order_id"]
+    assert len(ctx["broker"].placed) == 1
+
+
 # ---------- serialization / concurrency ----------
 
 
