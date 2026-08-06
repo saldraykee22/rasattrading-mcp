@@ -136,6 +136,15 @@ class DaemonRunner:
         self.pa_engine = pa_engine
         self.alarm_service = alarm_service
 
+        # 2.8: arka plan PA worker'ı — bar kapanışlarında PA'yı otomatik yeniden hesaplar.
+        self._pa_worker_task = None
+        if self.pipeline is not None:
+            from ..pa.worker import PAWorker
+
+            self.pa_worker = PAWorker(pa_engine, self.pipeline.universe, self.config)
+            self._pa_worker_task = asyncio.create_task(self.pa_worker.run())
+            logger.info("arka plan PA worker başlatıldı")
+
         # Emir broker'ı: pipeline bütçesini ve hesap credential'larını kullanır.
         from ..data.order_broker import BinanceOrderBroker
         from ..storage.orders import OrderService, PipelineMarketFeed
@@ -229,6 +238,9 @@ class DaemonRunner:
 
     async def stop(self) -> None:
         logger.info("daemon kapanıyor")
+        if self._pa_worker_task is not None:
+            self._pa_worker_task.cancel()
+            await asyncio.gather(self._pa_worker_task, return_exceptions=True)
         if self.http_site is not None:
             try:
                 await self.http_site.stop()

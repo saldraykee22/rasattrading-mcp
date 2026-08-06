@@ -269,6 +269,11 @@ class Screener:
         candles = await self.engine._read_candles(symbol, timeframe, 300)
         if not candles:
             return None
+        from .swings import filter_closed_candles
+
+        candles = filter_closed_candles(candles, timeframe)
+        if not candles:
+            return None
         ctx: dict[str, Any] = {
             "symbol": symbol,
             "candles": candles,

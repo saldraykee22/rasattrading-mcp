@@ -29,6 +29,7 @@ from ..storage.db import Database
 from .analysis import PAEngine, _read_current
 from .liquidity import load_futures_series
 from .screener import _eval_node, validate_filters
+from .swings import filter_closed_candles
 
 logger = logging.getLogger("rasattrading.pa.alarms")
 
@@ -185,6 +186,9 @@ class AlarmService:
         candles = await self.engine._read_candles(symbol, timeframe, 300)
         if not candles:
             return None
+        candles = filter_closed_candles(candles, timeframe)
+        if not candles:
+            return None
         ms = await _read_current(self.db, "market_structure", symbol, timeframe)
         lz = await _read_current(self.db, "liquidity_zones", symbol, timeframe)
         ob = await _read_current(self.db, "order_blocks", symbol, timeframe)
@@ -212,9 +216,9 @@ class AlarmService:
         fr = await self._latest_futures(symbol, "funding_rate")
         if fr is not None:
             ctx["funding_rate"] = fr
-        oi = await self._latest_futures(symbol, "open_interest")
-        if oi is not None:
-            ctx["oi_series"] = [oi]
+        oi = await load_futures_series(self.db, symbol, "open_interest")
+        if oi:
+            ctx["oi_series"] = oi
         return ctx
 
     async def _latest_futures(self, symbol: str, ftype: str) -> dict | None:
@@ -222,16 +226,24 @@ class AlarmService:
         return series[-1] if series else None
 
     async def on_analysis_updated(self, symbol: str, timeframe: str, analysis: dict) -> list[dict]:
-        """PA analizi güncellendi → ilgili basit + kompozit alarmları değerlendir."""
+        """PA analizi güncellendi → ilgili basit + kompozit alarmları değerlendir.
+
+        Freshness kapısı (2.8): analiz snapshot'ı stale ise fail-closed — tetiklenmez.
+        Context kapanmış mumlardan kurulur; oluşmakta olan bar dahil edilmez.
+        """
+        as_of = analysis.get("as_of")
+        if PAEngine.freshness_for(timeframe, as_of) != FRESHNESS_FRESH:
+            return []  # stale analiz → tetikleme yok
         triggers: list[dict] = []
         candles = await self.engine._read_candles(symbol, timeframe, 300)
+        candles = filter_closed_candles(candles, timeframe)
         ctx = self._ctx_from_analysis(analysis, candles)
         fr = await self._latest_futures(symbol, "funding_rate")
         if fr is not None:
             ctx["funding_rate"] = fr
-        oi = await self._latest_futures(symbol, "open_interest")
-        if oi is not None:
-            ctx["oi_series"] = [oi]
+        oi = await load_futures_series(self.db, symbol, "open_interest")
+        if oi:
+            ctx["oi_series"] = oi
         alerts = await self._alerts_by_symbol(symbol, timeframe)
         for alert in alerts:
             definition = json.loads(alert["definition"])
@@ -254,13 +266,11 @@ class AlarmService:
         return triggers
 
     async def evaluate_symbol(self, symbol: str, timeframe: str) -> list[dict]:
-        """Talep üzerine değerlendirme: depolanmış analizden (daemon arka plan döngüsü için)."""
-        analysis = None
-        ms = await _read_current(self.db, "market_structure", symbol, timeframe)
-        if ms is not None:
-            analysis = {"as_of": ms["effective_from"]}
-        if analysis is None:
-            return []
+        """Talep üzerine değerlendirme: depolanmış analizden (daemon arka plan döngüsü için).
+
+        PA kaydı yoksa `_clause_context` analizi hesaplatır — alarm döngüsü,
+        agent tool çağırmadan güncel kayıtlara dayanır (boş dönmez).
+        """
         alerts = await self._alerts_by_symbol(symbol, timeframe)
         triggers: list[dict] = []
         for alert in alerts:
