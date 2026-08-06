@@ -18,10 +18,10 @@ import sys
 import time
 from pathlib import Path
 
-from .. import __version__
 from ..config import Config
-from ..daemon.lock import LockInfo, LockManager, owner_alive, read_lock
+from ..daemon.lock import LockInfo, owner_alive, read_lock
 from ..errors import ErrorCode, RasatError
+from .transport import DaemonClient
 
 logger = logging.getLogger("rasattrading.adapter.launcher")
 
@@ -78,28 +78,43 @@ async def _wait_for_lock(config: Config, timeout: float) -> LockInfo:
 
 
 async def _http_probe_ok(config: Config, token: str) -> bool:
-    """HTTP /health probu — 1.3'te gerçek aiohttp istemcisi ile doldurulur. Şimdilik False."""
-    return False
+    """HTTP /health probu: daemon canlı ve token sahibi mi?"""
+    try:
+        client = DaemonClient(config, token)
+        try:
+            health = await client.health()
+            return health.get("ok") is True
+        finally:
+            await client.close()
+    except Exception:  # noqa: BLE001
+        return False
 
 
-def _lock_based_ready(lock: LockInfo) -> bool:
-    """1.1 ara adımı: kilit dosyasındaki state'e göre readiness."""
-    return lock.state == "ready"
+async def _http_state(config: Config, token: str) -> str | None:
+    try:
+        client = DaemonClient(config, token)
+        try:
+            health = await client.health()
+            return health.get("data", {}).get("state")
+        finally:
+            await client.close()
+    except Exception:  # noqa: BLE001
+        return None
 
 
 async def _wait_until_ready(config: Config, lock: LockInfo, timeout: float) -> None:
+    """HTTP /health üzerinden `ready` beklenir (yetkili kanal)."""
     deadline = time.monotonic() + timeout
+    last_state: str | None = None
     while time.monotonic() < deadline:
-        current = read_lock(config.lock_path)
-        if current is not None and current.nonce == lock.nonce and owner_alive(current):
-            if _http_probe_ok(config, current.token):
-                # 1.3+: HTTP tarafından doğrulama ayrı; bekleyiş health state'ine göre.
-                pass
-            if current.state == "ready":
+        state = await _http_state(config, lock.token)
+        if state is not None:
+            last_state = state
+            if state == "ready":
                 return
         await asyncio.sleep(0.25)
     raise DaemonUnavailableError(
-        f"daemon {timeout}s içinde ready olmadı (son state={read_lock(config.lock_path).state if read_lock(config.lock_path) else None})",
+        f"daemon {timeout}s içinde ready olmadı (son state={last_state})",
         code=ErrorCode.NOT_READY,
     )
 

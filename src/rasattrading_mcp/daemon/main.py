@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
 import time
@@ -38,7 +39,9 @@ class DaemonRunner:
         self._stop = asyncio.Event()
         self.db = None  # 1.2'de doldurulur
         self.pipeline = None  # 1.4'te doldurulur
-        self.http_site = None  # 1.3'te doldurulur
+        self.http_site = None
+        self.http_runner = None
+        self.dispatcher = None
 
     # ---------- startup ----------
 
@@ -96,7 +99,21 @@ class DaemonRunner:
         """1.4'te gerçek veri pipeline'ı ile doldurulacak. Şimdilik no-op."""
 
     async def _start_http(self) -> None:
-        """1.3'te daemon/server.build_site ile doldurulur; şimdilik no-op."""
+        """HTTP IPC sunucusunu başlatır (localhost-only, bearer token)."""
+        from .handlers import build_dispatcher
+        from .server import build_site
+
+        ctx = {
+            "config": self.config,
+            "readiness": self.readiness,
+            "started_at": self.started_at,
+            "pid": os.getpid(),
+            "pipeline": self.pipeline,
+        }
+        self.dispatcher = build_dispatcher(ctx)
+        self.http_site, self.http_runner = await build_site(
+            self.config, self.readiness, self.lock_info.token, self.dispatcher, extra=ctx
+        )
 
     # ---------- main loop ----------
 
@@ -132,6 +149,11 @@ class DaemonRunner:
                 await self.http_site.stop()
             except Exception:  # noqa: BLE001
                 logger.exception("HTTP site durdurulamadı")
+        if self.http_runner is not None:
+            try:
+                await self.http_runner.cleanup()
+            except Exception:  # noqa: BLE001
+                logger.exception("HTTP runner temizlenemedi")
         if self.pipeline is not None:
             try:
                 await self.pipeline.stop()

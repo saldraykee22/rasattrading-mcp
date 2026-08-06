@@ -121,15 +121,27 @@ def read_lock(path: Path) -> LockInfo | None:
 
 def _write_atomic(path: Path, payload: dict) -> None:
     tmp = path.with_name(f"{path.name}.tmp.{secrets.token_hex(4)}")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f)
-        f.flush()
-        os.fsync(f.fileno())
     try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass  # Windows'ta best-effort
-    os.replace(tmp, path)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass  # Windows'ta best-effort
+        # Windows'ta hedef kısa süreli kilitlenebilir (okuyucu/AV) — retry
+        last_err: Exception | None = None
+        for _ in range(5):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError as exc:
+                last_err = exc
+                time.sleep(0.05)
+        raise last_err  # type: ignore[misc]
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 class LockManager:
@@ -144,16 +156,28 @@ class LockManager:
     def info(self) -> LockInfo | None:
         return self._info
 
-    def acquire(self, max_retries: int = 3) -> LockInfo:
+    def acquire(self, max_retries: int = 5) -> LockInfo:
         """Kilit dosyasını atomik oluşturur. Başka canlı daemon varsa LockHeldError fırlatır."""
         for _ in range(max_retries):
             existing = read_lock(self._path)
+
+            if existing is None and self._path.exists():
+                # Bozuk veya yazılma aşamasında olabilir (O_EXCL + JSON yazma arası boşluk).
+                # Rakip hâlâ yazıyorken silmeyelim: birkaç kez tekrar oku.
+                for _ in range(3):
+                    time.sleep(0.02)
+                    existing = read_lock(self._path)
+                    if existing is not None:
+                        break
+                if existing is None:
+                    # Hâlâ okunamıyor → gerçekten bozuk/stale, temizle
+                    self._path.unlink(missing_ok=True)
+
             if existing is not None and not owner_alive(existing):
                 self._path.unlink(missing_ok=True)
-            elif existing is None and self._path.exists():
-                # Bozuk/okunamaz kilit dosyası → stale kabul et ve temizle
-                self._path.unlink(missing_ok=True)
-            elif existing is not None:
+                continue
+
+            if existing is not None:
                 raise LockHeldError(existing)
 
             info = LockInfo.create(port=self._port)
