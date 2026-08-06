@@ -874,6 +874,88 @@ class OrderService:
              "executed_qty": found.executed_qty, "avg_price": found.avg_price}
         )
 
+    # ---------- startup reconcile (3.13) ----------
+
+    async def reconcile_open_orders(self) -> dict[str, Any]:
+        """Daemon açılışında NEW/PARTIALLY_FILLED'da takılı emirleri doğrular.
+
+        DB'ye NEW yazma ile broker çağrısı arasında crash olursa orphan NEW kaydı
+        kalır ve exposure'ı (`_current_exposure`/`_open_order_notional`) sonsuza dek
+        şişirir. Her kayıt Binance `query_order` ile gerçek duruma çekilir;
+        borsada doğrulanamayan `UNKNOWN` olur (körlemesine tekrar gönderim yok —
+        reconcile-before-retry sözleşmesi).
+        """
+        account_ids = [
+            acc["account_id"]
+            for acc in (await self.accounts.list_accounts())["accounts"]
+            if str(acc.get("trading_lock", "paper")) == "real"
+        ]
+        if not account_ids:
+            return {"scanned": 0, "reconciled": 0, "unchanged": 0, "errors": []}
+
+        def _stuck(conn: sqlite3.Connection) -> list[dict]:
+            marks = ",".join("?" for _ in account_ids)
+            rows = conn.execute(
+                "SELECT " + ", ".join(_ORDER_COLUMNS)
+                + f" FROM orders WHERE account_id IN ({marks}) AND status IN ('NEW', 'PARTIALLY_FILLED')",
+                tuple(account_ids),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+        stuck = await self.db.read(_stuck)
+        reconciled = 0
+        unchanged = 0
+        errors: list[dict] = []
+        for order in stuck:
+            try:
+                found = await self.broker.query_order(
+                    account_id=order["account_id"],
+                    symbol=order["symbol"],
+                    client_order_id=order["client_order_id"],
+                )
+            except RasatError as exc:
+                errors.append(
+                    {"order_id": order["order_id"], "symbol": order["symbol"],
+                     "error": {"code": exc.code, "message": exc.message}}
+                )
+                continue
+            if found is None or found.status == "UNKNOWN":
+                def _unknown(conn: sqlite3.Connection, oid: str = order["order_id"]) -> None:
+                    self._update_order(
+                        conn, oid, status="UNKNOWN", error_code=ErrorCode.ORDER_UNKNOWN,
+                        error_message="startup reconcile: emir Binance'te doğrulanamadı",
+                    )
+                    if self.audit is not None:
+                        self.audit.append_in_connection(
+                            conn, actor="system", action="order_reconciled_unknown",
+                            details={"account_id": order["account_id"], "order_id": order["order_id"],
+                                     "symbol": order["symbol"]},
+                        )
+
+                await self.db.write(_unknown)
+                reconciled += 1
+                continue
+            if found.status == order["status"]:
+                unchanged += 1
+                continue
+
+            def _apply(conn: sqlite3.Connection, oid: str = order["order_id"], f: Any = found) -> None:
+                self._update_order(
+                    conn, oid, status=f.status, exchange_order_id=f.exchange_order_id,
+                    executed_qty=f.executed_qty, avg_price=f.avg_price,
+                )
+                if self.audit is not None:
+                    self.audit.append_in_connection(
+                        conn, actor="system", action="order_reconciled",
+                        details={"account_id": order["account_id"], "order_id": order["order_id"],
+                                 "symbol": order["symbol"], "status": f.status},
+                    )
+
+            await self.db.write(_apply)
+            reconciled += 1
+
+        return {"scanned": len(stuck), "reconciled": reconciled, "unchanged": unchanged, "errors": errors}
+
     # ---------- kill switch: close_all_positions (3.5) ----------
 
     async def close_all_positions(self, *, account_id: str, actor: str = "mcp-agent") -> dict[str, Any]:

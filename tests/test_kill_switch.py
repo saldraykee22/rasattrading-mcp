@@ -229,6 +229,85 @@ async def test_close_all_positions_unknown_account(ex_ctx):
 # ---------- disable_real_trading ----------
 
 
+async def test_reconcile_open_orders_resolves_orphan_new(ex_ctx):
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
+    service = ctx["service"]
+
+    # DB'de NEW'de bir emir bırak (crash senaryosu); Binance'te FILLED olduğunu simüle et
+    cid = to_client_order_id("orphan-new")
+    ctx["broker"].place_result = {"status": "NEW"}
+    placed = await service.place_order(
+        account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="LIMIT",
+        quantity=0.5, price=80, idempotency_key="orphan-new",
+    )
+    assert placed["status"] == "NEW"
+    ctx["broker"].query_results[cid] = OrderResult(
+        status="FILLED", exchange_order_id="EX-ORPHAN", executed_qty=0.5, avg_price=80.0,
+    )
+
+    result = await service.reconcile_open_orders()
+    assert result["scanned"] >= 1
+    assert result["reconciled"] >= 1
+
+    def _q(conn):
+        return dict(conn.execute("SELECT * FROM orders WHERE order_id = ?", (placed["order_id"],)).fetchone())
+
+    row = await ctx["db"].read(_q)
+    assert row["status"] == "FILLED"
+    assert row["exchange_order_id"] == "EX-ORPHAN"
+    # exposure artık NEW emirle şişmez
+    exposure = await service.get_total_exposure()
+    assert exposure["by_symbol"].get("BTCUSDT", 0.0) == pytest.approx(1.0 * 100.0)  # sadece base holding
+
+
+async def test_reconcile_open_orders_orphan_new_not_on_exchange(ex_ctx):
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx)
+    service = ctx["service"]
+
+    # Crash: DB'ye NEW yazıldı ama broker'a hiç gitmedi → Binance'te yok
+    cid = to_client_order_id("orphan-crash")
+
+    def _insert(conn):
+        order = service._insert_order(
+            conn, account_id=account_id, idempotency_key="orphan-crash",
+            symbol="BTCUSDT", side="BUY", order_type="MARKET", quantity=0.5,
+            price=100.0, notional=50.0, reference_price=100.0, equity_snapshot=0.0,
+            status="NEW", client_order_id=cid,
+        )
+        return order["order_id"]
+
+    order_id = await ctx["db"].write(_insert)
+
+    result = await service.reconcile_open_orders()
+    assert result["scanned"] >= 1
+    assert result["reconciled"] >= 1
+
+    def _q(conn):
+        return dict(conn.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,)).fetchone())
+
+    row = await ctx["db"].read(_q)
+    assert row["status"] == "UNKNOWN"  # sonsuza dek NEW kalmaz
+    assert row["error_code"] == ErrorCode.ORDER_UNKNOWN
+
+
+async def test_reconcile_open_orders_skips_paper_accounts(ex_ctx):
+    ctx = ex_ctx
+    service = ctx["service"]
+
+    paper = await ctx["accounts"].add_account(label="paper-only")
+    ctx["broker"].balances[paper["account_id"]] = {"USDT": 10000.0}
+    ctx["broker"].place_result = {"status": "NEW"}
+    await service.place_order(
+        account_id=paper["account_id"], symbol="BTCUSDT", side="BUY", order_type="LIMIT",
+        quantity=0.5, price=80, idempotency_key="paper-new",
+    )
+    # paper hesap reconcile edilmez (borsada gerçek emir yok)
+    result = await service.reconcile_open_orders()
+    assert result["scanned"] == 0
+
+
 async def test_disable_real_trading(ex_ctx):
     ctx = ex_ctx
     account_id = await _add_real_account(ctx)

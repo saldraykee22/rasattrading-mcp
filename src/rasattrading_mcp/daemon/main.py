@@ -158,6 +158,15 @@ class DaemonRunner:
             )
             self.order_service = order_service
 
+            # 3.13: crash sonrası NEW'de takılı kalan emirleri açılışta
+            # Binance'ten doğrula — exposure şişmesini engeller.
+            try:
+                res = await order_service.reconcile_open_orders()
+                if res["scanned"]:
+                    logger.info("açık emir reconcile (3.13): %s", res)
+            except Exception:  # noqa: BLE001
+                logger.exception("açık emir reconcile edilemedi (3.13)")
+
         ctx = {
             "config": self.config,
             "readiness": self.readiness,
