@@ -83,10 +83,3 @@ def enforce_policy_caps(
                 ErrorCode.RISK_LIMIT_EXCEEDED,
                 f"toplam exposure cap'i aşıyor: {aggregate_exposure} > {agg_cap} (max_aggregate_exposure, tolerans uygulanmaz)",
             )
-
-
-def check_symbol_allowed(symbol: str, policy: dict) -> None:
-    """Sembol politikada allow-listed mı? (cap yoksa her zaman izinli)."""
-    allowed = policy.get("allowed_symbols")
-    if allowed and symbol not in allowed:
-        raise RasatError(ErrorCode.SYMBOL_NOT_ALLOWED, f"sembol risk politikasında yok: {symbol}")

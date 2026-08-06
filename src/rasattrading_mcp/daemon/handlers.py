@@ -148,14 +148,14 @@ def _require_pa_engine(ctx: dict):
     return engine
 
 
-def _pa_meta(timeframe: str, as_of: int | None) -> Meta:
+def _pa_meta(timeframe: str, as_of: int | None, algo_version: str | None) -> Meta:
     from ..pa.analysis import PAEngine
 
     return Meta(
         as_of=utc_iso(as_of) if as_of else utc_iso(),
         source="pa-engine",
         freshness=PAEngine.freshness_for(timeframe, as_of),
-        algo_version=None,
+        algo_version=algo_version,
     )
 
 
@@ -165,7 +165,7 @@ async def get_market_structure_handler(params: dict, ctx: dict) -> tuple[dict, M
     timeframe = params["timeframe"]
     lookback = params.get("lookback", 200)
     data = await engine.get_market_structure(symbol, timeframe, lookback)
-    return data, _pa_meta(timeframe, data["as_of"])
+    return data, _pa_meta(timeframe, data["as_of"], data["algo_version"])
 
 
 async def get_liquidity_zones_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
@@ -173,7 +173,7 @@ async def get_liquidity_zones_handler(params: dict, ctx: dict) -> tuple[dict, Me
     data = await engine.get_liquidity_zones(
         params["symbol"], params["timeframe"], params.get("include_mitigated", False), params.get("lookback", 200)
     )
-    return data, _pa_meta(params["timeframe"], data["as_of"])
+    return data, _pa_meta(params["timeframe"], data["as_of"], data["algo_version"])
 
 
 async def get_order_blocks_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
@@ -181,7 +181,7 @@ async def get_order_blocks_handler(params: dict, ctx: dict) -> tuple[dict, Meta]
     data = await engine.get_order_blocks(
         params["symbol"], params["timeframe"], params.get("include_mitigated", False), params.get("lookback", 200)
     )
-    return data, _pa_meta(params["timeframe"], data["as_of"])
+    return data, _pa_meta(params["timeframe"], data["as_of"], data["algo_version"])
 
 
 async def get_full_analysis_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
@@ -189,7 +189,7 @@ async def get_full_analysis_handler(params: dict, ctx: dict) -> tuple[dict, Meta
     data = await engine.get_full_analysis(
         params["symbol"], params["timeframe"], params.get("include_mitigated", False), params.get("lookback", 200)
     )
-    return data, _pa_meta(params["timeframe"], data["as_of"])
+    return data, _pa_meta(params["timeframe"], data["as_of"], data["algo_version"])
 
 
 def _require_annotations(ctx: dict):

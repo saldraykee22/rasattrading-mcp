@@ -212,6 +212,7 @@ class PAEngine:
             "symbol": symbol,
             "timeframe": timeframe,
             "as_of": result["as_of"],
+            "algo_version": result["structure"]["algo_version"],
             "structure": result["structure"],
         }
 
@@ -227,6 +228,7 @@ class PAEngine:
             "symbol": symbol,
             "timeframe": timeframe,
             "as_of": result["as_of"],
+            "algo_version": result["liquidity"]["algo_version"],
             "zones": zones,
             "score": result["liquidity"]["score"],
         }
@@ -245,6 +247,7 @@ class PAEngine:
             "symbol": symbol,
             "timeframe": timeframe,
             "as_of": result["as_of"],
+            "algo_version": result["order_blocks"]["algo_version"],
             "order_blocks": obs,
             "fvgs": fvgs,
         }
@@ -267,6 +270,7 @@ class PAEngine:
             "symbol": symbol,
             "timeframe": timeframe,
             "as_of": result["as_of"],
+            "algo_version": result["structure"]["algo_version"],
             "structure": result["structure"],
             "liquidity": {"zones": zones, "score": result["liquidity"]["score"]},
             "order_blocks": {"order_blocks": obs, "fvgs": fvgs},

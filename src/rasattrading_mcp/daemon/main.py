@@ -215,10 +215,16 @@ class DaemonRunner:
         return 0
 
     async def _alarm_eval_loop(self) -> None:
-        """Periyodik alarm değerlendirmesi: yalnızca verisi taze olan semboller tetiklenir."""
+        """Periyodik alarm değerlendirmesi (event-driven'ın arka plan yedeklemesi).
+
+        İlk değerlendirme anında yapılır (başlangıç 30s gecikme yok); asıl
+        tetikleme `PAEngine.analyze → on_analysis_updated` ile event-driven
+        çalışır. Her tur başında on-demand PA hesap bütçesi sıfırlanır (K3).
+        Alarm yoksa tur yalnızca tek ucuz DB sorgusudur.
+        """
         while True:
             try:
-                await asyncio.sleep(self.config.alarm_eval_seconds)
+                self.alarm_service.begin_evaluation_pass()
                 pairs = await self.alarm_service.alert_symbols()
                 for symbol, timeframe in pairs:
                     try:
@@ -229,6 +235,10 @@ class DaemonRunner:
                 return
             except Exception:  # noqa: BLE001
                 logger.exception("alarm döngüsü hatası")
+            try:
+                await asyncio.sleep(self.config.alarm_eval_seconds)
+            except asyncio.CancelledError:
+                return
 
     async def _ownership_watch(self) -> None:
         """Kilit dosyası elimizde değilse (halef başladı / biri sildi) kapan."""
