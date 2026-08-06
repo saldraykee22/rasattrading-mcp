@@ -49,13 +49,15 @@ class PAWorker:
 
         İşlenen sembol sayısını döndürür (gözlem/diagnostik). İlk turda her
         timeframe işlenir (soğuk evren warm-up'ı) — `_last_processed` boştur.
+        Marker yalnızca timeframe turu TAMAMEN başarılı olduğunda ilerler:
+        stale/hatalı/boş kalan bir sembol varsa aynı kapalı bar bir sonraki
+        turda tekrar denenir (2.12 fix).
         """
         processed = 0
         for tf in self.config.kline_intervals:
             latest_closed = self.latest_closed(tf)
             if self._last_processed.get(tf) == latest_closed:
                 continue
-            self._last_processed[tf] = latest_closed
             symbols = sorted(self.universe.snapshot())
             if not symbols:
                 continue
@@ -63,20 +65,23 @@ class PAWorker:
             results = await asyncio.gather(
                 *(self._process(symbol, tf) for symbol in symbols), return_exceptions=True
             )
-            processed += sum(1 for r in results if r is True)
+            successes = sum(1 for r in results if r is True)
+            processed += successes
+            if successes == len(symbols):
+                self._last_processed[tf] = latest_closed
         return processed
 
     async def _process(self, symbol: str, tf: str) -> bool:
-        try:
-            candles = await self.engine._load_candles(symbol, tf, 200)
-        except Exception:  # noqa: BLE001
-            return False
-        if not candles:
-            return False
-        if PAEngine.freshness_for(tf, candles[-1]["open_time"]) != FRESHNESS_FRESH:
-            # Mum verisi hedef kapalı bara yetişmedi → kline scheduler tamamlayınca işlenir.
-            return False
         async with self._sem:
+            try:
+                candles = await self.engine._load_candles(symbol, tf, 200)
+            except Exception:  # noqa: BLE001
+                return False
+            if not candles:
+                return False
+            if PAEngine.freshness_for(tf, candles[-1]["open_time"]) != FRESHNESS_FRESH:
+                # Mum verisi hedef kapalı bara yetişmedi → kline scheduler tamamlayınca işlenir.
+                return False
             try:
                 await self.engine.analyze(symbol, tf)
                 return True
