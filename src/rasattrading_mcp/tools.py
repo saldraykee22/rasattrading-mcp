@@ -188,6 +188,94 @@ register_tool(
     )
 )
 
+# ---------- Modül 3 / 3.2: trading kilidi + risk politikası ----------
+
+register_tool(
+    ToolSpec(
+        name="enable_real_trading",
+        description=(
+            "Hesabın trading kilidini kalıcı olarak `real`'e çevirir (tek yönlü; zaten real ise idempotent). "
+            "Credential'sız hesapta reddedilir; değişiklik audit_log'a yazılır."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "account_id": {"type": "string", "minLength": 1},
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["account_id"],
+            "additionalProperties": False,
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="set_risk_policy",
+        description=(
+            "Hesap için isteğe bağlı risk politikası tanımlar: max_notional_per_order, "
+            "max_aggregate_exposure, allowed_symbols. Varsayılan tamamen boş/limitsiz. "
+            "Cap'ler KATI üst sınırdır — tolerans uygulanmaz, yuvarlama sonrası nihai değer `<= cap` olmalıdır."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "account_id": {"type": "string", "minLength": 1},
+                "max_notional_per_order": {"type": "number", "exclusiveMinimum": 0},
+                "max_aggregate_exposure": {"type": "number", "exclusiveMinimum": 0},
+                "allowed_symbols": {"type": "array", "items": {"type": "string", "minLength": 1}},
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["account_id"],
+            "additionalProperties": False,
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="override_risk_policy",
+        description=(
+            "Tek kullanımlık, atomik risk politikası istisnası (scope='next_order'). "
+            "Yalnızca kullanıcı-tanımlı cap'leri bir emir için aşmaya izin verir; temel doğruluk "
+            "kontrollerini asla atlamaz. reason zorunludur, audit_log'a yazılır. "
+            "Aynı idempotency_key ile retry aynı override'a bağlanır, ikincil üretmez."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "account_id": {"type": "string", "minLength": 1},
+                "scope": {"type": "string", "enum": ["next_order"], "default": "next_order"},
+                "reason": {"type": "string", "minLength": 1},
+                "idempotency_key": {"type": "string", "minLength": 1},
+                "expires_at": {"type": "integer", "description": "unix zaman damgası (sn)"},
+                "request_id": {"type": "string"},
+            },
+            "required": ["account_id", "reason"],
+            "additionalProperties": False,
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="get_risk_policy",
+        description="Hesabın mevcut risk politikasını döner (configüre edilmemişse boş/limitsiz varsayılan).",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "account_id": {"type": "string", "minLength": 1},
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["account_id"],
+            "additionalProperties": False,
+        },
+    )
+)
+
 
 def describe_tools() -> list[dict[str, Any]]:
     return [

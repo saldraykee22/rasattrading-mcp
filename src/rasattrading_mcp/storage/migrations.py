@@ -162,9 +162,54 @@ def _m2_indexes(conn: sqlite3.Connection) -> None:
     )
 
 
+def _m3_risk_policy(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        -- Hesap bazlı opsiyonel risk politikası (v1: spot long-only)
+        -- max_notional_per_order / max_aggregate_exposure cap'leri:
+        --   REAL NULL = sınırsız; varsa KATI üst sınırdır (tolerans uygulanmaz).
+        -- allowed_symbols: JSON string listesi; boş [] = tüm semboller serbest.
+        CREATE TABLE risk_policy (
+          account_id TEXT PRIMARY KEY,
+          max_notional_per_order REAL,
+          max_aggregate_exposure REAL,
+          allowed_symbols TEXT NOT NULL DEFAULT '[]',
+          policy_version INTEGER NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+
+        -- Tek kullanımlık override state machine: reserved -> applied|reconciled
+        -- (account_id, policy_version, idempotency_key, actor, expires_at) taşır.
+        -- consumed_by_idem = override'ı tüketen emir isteğinin idempotency key'i.
+        CREATE TABLE risk_override (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          override_id TEXT NOT NULL UNIQUE,
+          account_id TEXT NOT NULL,
+          policy_version INTEGER NOT NULL,
+          idempotency_key TEXT NOT NULL,
+          actor TEXT NOT NULL,
+          reason TEXT NOT NULL,
+          scope TEXT NOT NULL DEFAULT 'next_order',
+          state TEXT NOT NULL DEFAULT 'reserved',
+          created_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL,
+          applied_at INTEGER,
+          consumed_by_idem TEXT,
+          reconciled_at INTEGER,
+          reconcile_reason TEXT,
+          UNIQUE (account_id, idempotency_key)
+        );
+
+        CREATE INDEX idx_risk_override_account ON risk_override (account_id, state, expires_at);
+        """
+    )
+
+
 MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (1, "initial_schema", _m1_initial_schema),
     (2, "indexes", _m2_indexes),
+    (3, "risk_policy_override", _m3_risk_policy),
 ]
 
 

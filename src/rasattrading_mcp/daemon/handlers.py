@@ -128,6 +128,62 @@ async def remove_account_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
     return data, Meta(as_of=utc_iso(), source="sqlite-accounts", freshness=FRESHNESS_FRESH)
 
 
+def _require_risk_service(ctx: dict):
+    """Return the daemon-owned risk policy service, creating a test-context one lazily."""
+
+    service = ctx.get("risk_service") or ctx.get("risk_policy_service") or ctx.get("risk")
+    if service is not None:
+        return service
+    db = ctx.get("db")
+    if db is None:
+        raise RasatError(ErrorCode.NOT_IMPLEMENTED, "risk politikası servisi bu daemon'da başlatılmamış")
+    from ..storage.risk_policy import RiskPolicyService
+
+    service = RiskPolicyService(db, audit=ctx.get("audit"))
+    ctx["risk_service"] = service
+    return service
+
+
+async def enable_real_trading_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    service = _require_account_service(ctx)
+    data = await service.enable_real_trading(
+        params.get("account_id"),
+        actor=str(ctx.get("actor", "mcp-agent")),
+    )
+    return data, Meta(as_of=utc_iso(), source="sqlite-accounts", freshness=FRESHNESS_FRESH)
+
+
+async def set_risk_policy_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    service = _require_risk_service(ctx)
+    data = await service.set_risk_policy(
+        params.get("account_id"),
+        max_notional_per_order=params.get("max_notional_per_order"),
+        max_aggregate_exposure=params.get("max_aggregate_exposure"),
+        allowed_symbols=params.get("allowed_symbols"),
+        actor=str(ctx.get("actor", "mcp-agent")),
+    )
+    return data, Meta(as_of=utc_iso(), source="sqlite-risk-policy", freshness=FRESHNESS_FRESH)
+
+
+async def override_risk_policy_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    service = _require_risk_service(ctx)
+    data = await service.create_override(
+        params.get("account_id"),
+        reason=params.get("reason"),
+        scope=params.get("scope", "next_order"),
+        idempotency_key=params.get("idempotency_key"),
+        actor=str(ctx.get("actor", "mcp-agent")),
+        expires_at=params.get("expires_at"),
+    )
+    return data, Meta(as_of=utc_iso(), source="sqlite-risk-policy", freshness=FRESHNESS_FRESH)
+
+
+async def get_risk_policy_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    service = _require_risk_service(ctx)
+    data = await service.get_policy(params.get("account_id"))
+    return data, Meta(as_of=utc_iso(), source="sqlite-risk-policy", freshness=FRESHNESS_FRESH)
+
+
 def build_dispatcher(ctx: dict) -> ToolDispatcher:
     from ..tools import REGISTRY
 
@@ -140,4 +196,8 @@ def build_dispatcher(ctx: dict) -> ToolDispatcher:
     dispatcher.register("add_account", add_account_handler)
     dispatcher.register("list_accounts", list_accounts_handler)
     dispatcher.register("remove_account", remove_account_handler)
+    dispatcher.register("enable_real_trading", enable_real_trading_handler)
+    dispatcher.register("set_risk_policy", set_risk_policy_handler)
+    dispatcher.register("override_risk_policy", override_risk_policy_handler)
+    dispatcher.register("get_risk_policy", get_risk_policy_handler)
     return dispatcher

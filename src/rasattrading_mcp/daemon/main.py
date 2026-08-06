@@ -40,6 +40,7 @@ class DaemonRunner:
         self.db = None  # 1.2'de doldurulur
         self.audit = None
         self.account_service = None
+        self.risk_service = None
         self.pipeline = None  # 1.4'te doldurulur
         self.http_site = None
         self.http_runner = None
@@ -99,6 +100,10 @@ class DaemonRunner:
             logger.info("migration uygulandı: %s", applied)
         self.audit = AuditLog(self.db)
         self.account_service = AccountService(self.db, secret_store=SecretStore(), audit=self.audit)
+        from ..storage.risk_policy import RiskPolicyService
+
+        self.risk_service = RiskPolicyService(self.db, audit=self.audit)
+        await self.risk_service.reconcile_overrides()
         self.readiness.set_state("warming_up")
         self.lock_mgr.update_state(self.readiness.state)
 
@@ -124,6 +129,8 @@ class DaemonRunner:
             "audit": self.audit,
             "account_service": self.account_service,
             "accounts": self.account_service,
+            "risk_service": self.risk_service,
+            "risk_policy_service": self.risk_service,
             "pipeline": self.pipeline,
         }
         self.dispatcher = build_dispatcher(ctx)
