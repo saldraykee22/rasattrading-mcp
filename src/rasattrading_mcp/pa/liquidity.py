@@ -60,6 +60,7 @@ def _make_zone(cluster: list[dict], kind: str) -> dict[str, Any]:
         "swing_count": len(cluster),
         "formed_at": max(indices),
         "swept_at": None,
+        "swept_at_time": None,
         "mitigated": False,
         "tested": False,
     }
@@ -77,6 +78,7 @@ def compute_liquidity_zones(
     swings = structure.get("swings", [])
     highs = [c["high"] for c in candles]
     lows = [c["low"] for c in candles]
+    times = [c["open_time"] for c in candles]
     n = len(candles)
 
     zones: list[dict[str, Any]] = []
@@ -86,14 +88,14 @@ def compute_liquidity_zones(
     ):
         for cluster in _cluster_swings(swings, pivot_kind, tolerance_pct):
             zone = _make_zone(cluster, kind)
-            _mark_status(zone, sweep_dir, highs, lows, n)
+            _mark_status(zone, sweep_dir, times, highs, lows, n)
             zones.append(zone)
 
     score = liquidity_score(zones, futures)
     return {"algo_version": algo_version, "zones": zones, "score": score}
 
 
-def _mark_status(zone: dict, sweep_dir: str, highs: list[float], lows: list[float], n: int) -> None:
+def _mark_status(zone: dict, sweep_dir: str, times: list[int], highs: list[float], lows: list[float], n: int) -> None:
     formed = zone["formed_at"]
     band = zone["range"]
     exceed = 1.0 + SWEEP_EXCEED_PCT / 100.0
@@ -101,12 +103,14 @@ def _mark_status(zone: dict, sweep_dir: str, highs: list[float], lows: list[floa
         if sweep_dir == "high":
             if zone["swept_at"] is None and highs[i] > band["high"] * exceed:
                 zone["swept_at"] = i
+                zone["swept_at_time"] = times[i]
                 zone["mitigated"] = True
             if highs[i] >= band["low"]:
                 zone["tested"] = True
         else:
             if zone["swept_at"] is None and lows[i] < band["low"] * (1.0 / exceed):
                 zone["swept_at"] = i
+                zone["swept_at_time"] = times[i]
                 zone["mitigated"] = True
             if lows[i] <= band["high"]:
                 zone["tested"] = True

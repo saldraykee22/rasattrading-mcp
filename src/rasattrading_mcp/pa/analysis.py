@@ -27,6 +27,12 @@ logger = logging.getLogger("rasattrading.pa.analysis")
 
 MAX_VWAP_POINTS = 20
 
+# PA analizinde kullanılan varsayılan kapanmış mum penceresi. Screener
+# (`_build_context`) da aynı pencereyi kullanır; aksi halde yapı/sweep event
+# indeksleri (bu pencereye göre) screener context'inin mum sayısıyla hizasız
+# kalır ve gerçek son olaylar `since_bars` filtreleriyle kaçırılır (2.16 fix).
+PA_LOOKBACK = 200
+
 IMMUTABLE_TABLES = ("market_structure", "liquidity_zones", "order_blocks")
 
 
@@ -168,7 +174,7 @@ class PAEngine:
 
     # ---------- analiz ----------
 
-    async def analyze(self, symbol: str, timeframe: str, lookback: int = 200) -> dict[str, Any]:
+    async def analyze(self, symbol: str, timeframe: str, lookback: int = PA_LOOKBACK) -> dict[str, Any]:
         if timeframe not in TIMEFRAME_SECONDS:
             raise RasatError(ErrorCode.INVALID_REQUEST, f"geçersiz timeframe: {timeframe}")
         candles = await self._load_candles(symbol, timeframe, lookback)
@@ -206,7 +212,7 @@ class PAEngine:
 
     # ---------- sorgular ----------
 
-    async def get_market_structure(self, symbol: str, timeframe: str, lookback: int = 200) -> dict[str, Any]:
+    async def get_market_structure(self, symbol: str, timeframe: str, lookback: int = PA_LOOKBACK) -> dict[str, Any]:
         result = await self.analyze(symbol, timeframe, lookback)
         return {
             "symbol": symbol,
@@ -217,7 +223,7 @@ class PAEngine:
         }
 
     async def get_liquidity_zones(
-        self, symbol: str, timeframe: str, include_mitigated: bool = False, lookback: int = 200
+        self, symbol: str, timeframe: str, include_mitigated: bool = False, lookback: int = PA_LOOKBACK
     ) -> dict[str, Any]:
         result = await self.analyze(symbol, timeframe, lookback)
         if include_mitigated:
@@ -234,7 +240,7 @@ class PAEngine:
         }
 
     async def get_order_blocks(
-        self, symbol: str, timeframe: str, include_mitigated: bool = False, lookback: int = 200
+        self, symbol: str, timeframe: str, include_mitigated: bool = False, lookback: int = PA_LOOKBACK
     ) -> dict[str, Any]:
         result = await self.analyze(symbol, timeframe, lookback)
         if include_mitigated:
@@ -253,7 +259,7 @@ class PAEngine:
         }
 
     async def get_full_analysis(
-        self, symbol: str, timeframe: str, include_mitigated: bool = False, lookback: int = 200
+        self, symbol: str, timeframe: str, include_mitigated: bool = False, lookback: int = PA_LOOKBACK
     ) -> dict[str, Any]:
         result = await self.analyze(symbol, timeframe, lookback)
         if include_mitigated:

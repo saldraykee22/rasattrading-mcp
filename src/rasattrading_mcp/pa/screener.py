@@ -27,7 +27,7 @@ from typing import Any
 from ..envelope import FRESHNESS_FRESH, FRESHNESS_STALE
 from ..errors import ErrorCode, RasatError
 from ..storage.db import Database
-from .analysis import PAEngine, _read_current
+from .analysis import PAEngine, PA_LOOKBACK, _read_current
 from .liquidity import load_futures_series
 from .vwap_sessions import compute_vwap
 
@@ -175,10 +175,17 @@ def _eval_structure_event(f: dict, ctx: dict) -> bool:
     structure = ctx.get("structure")
     if not structure:
         return False
-    n = len(ctx["candles"])
+    candles = ctx["candles"]
     since = f["since_bars"]
+    cutoff = candles[max(0, len(candles) - since)]["open_time"]
     for ev in structure.get("events", []):
-        if ev["type"] == f["event"] and ev["index"] >= n - since:
+        if ev["type"] != f["event"]:
+            continue
+        t = ev.get("time")
+        if t is not None:
+            if t >= cutoff:
+                return True
+        elif ev["index"] >= len(candles) - since:
             return True
     return False
 
@@ -187,10 +194,17 @@ def _eval_liquidity_sweep(f: dict, ctx: dict) -> bool:
     zones = ctx.get("liquidity_zones")
     if not zones:
         return False
-    n = len(ctx["candles"])
+    candles = ctx["candles"]
     since = f["since_bars"]
+    cutoff = candles[max(0, len(candles) - since)]["open_time"]
     for z in zones:
-        if z.get("mitigated") and z.get("swept_at") is not None and z["swept_at"] >= n - since:
+        if not z.get("mitigated"):
+            continue
+        st = z.get("swept_at_time")
+        if st is not None:
+            if st >= cutoff:
+                return True
+        elif z.get("swept_at") is not None and z["swept_at"] >= len(candles) - since:
             return True
     return False
 
@@ -287,7 +301,10 @@ class Screener:
         return await self.db.read(_q)
 
     async def _build_context(self, symbol: str, timeframe: str, needs_analysis: bool, filter_types: list[str]) -> dict | None:
-        candles = await self.engine._read_candles(symbol, timeframe, 300)
+        # PA engine'in yapı/likidite payload'ıyla AYNI pencere (2.16 fix): event
+        # indeksleri bu pencereye göre üretilir; farklı mum sayısı event/sweep
+        # indekslerini hizasız bırakıp gerçek son olayları kaçırıyordu.
+        candles = await self.engine._read_candles(symbol, timeframe, PA_LOOKBACK)
         if not candles:
             return None
         from .swings import filter_closed_candles
