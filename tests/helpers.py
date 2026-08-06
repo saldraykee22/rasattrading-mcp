@@ -166,5 +166,15 @@ class FakeOrderBroker:
 
         return OrderResult(status="CANCELED", exchange_order_id=f"CX{len(self.cancelled)}")
 
+    async def get_all_open_orders(self, *, account_id):
+        return [
+            {"symbol": "BTCUSDT", "order_id": "O1", "client_order_id": "open-1", "side": "BUY", "quantity": 0.5}
+        ]
+
+    async def cancel_all_open_orders(self, *, account_id, symbol):
+        self.cancelled_all = getattr(self, "cancelled_all", [])
+        self.cancelled_all.append({"account_id": account_id, "symbol": symbol})
+        return 1
+
     async def get_balance(self, *, account_id):
         return dict(self.balances.get(account_id, {"USDT": 10000.0}))

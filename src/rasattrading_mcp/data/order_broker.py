@@ -79,6 +79,10 @@ class OrderBroker(Protocol):
         client_order_id: str,
     ) -> OrderResult | None: ...
 
+    async def get_all_open_orders(self, *, account_id: str) -> list[dict]: ...
+
+    async def cancel_all_open_orders(self, *, account_id: str, symbol: str) -> int: ...
+
     async def get_balance(self, *, account_id: str) -> dict[str, float]: ...
 
 
@@ -238,6 +242,39 @@ class BinanceOrderBroker:
                 return None
             raise
         return self._order_result(data)
+
+    async def get_all_open_orders(self, *, account_id: str) -> list[dict]:
+        """Spot'taki tüm açık emirleri döner (sembol bazlı değil, global)."""
+        data = await self._request("GET", "/api/v3/openOrders", account_id, {})
+        if not isinstance(data, list):
+            return []
+        return [
+            {
+                "symbol": str(o.get("symbol", "")),
+                "order_id": str(o.get("orderId")) if o.get("orderId") is not None else None,
+                "client_order_id": str(o.get("clientOrderId")) if o.get("clientOrderId") else None,
+                "side": str(o.get("side", "")),
+                "quantity": float(o.get("origQty", 0) or 0),
+                "raw": o,
+            }
+            for o in data
+        ]
+
+    async def cancel_all_open_orders(self, *, account_id: str, symbol: str) -> int:
+        """Bir semboldeki tüm açık emirleri iptal eder; iptal edilen sayıyı döner."""
+        try:
+            data = await self._request(
+                "DELETE",
+                "/api/v3/openOrders",
+                account_id,
+                {"symbol": symbol},
+            )
+        except RasatError as exc:
+            # -2011 açık emir yok → 0
+            if exc.code == ErrorCode.ORDER_REJECTED and exc.details and exc.details.get("binance_code") == -2011:
+                return 0
+            raise
+        return len(data) if isinstance(data, list) else 0
 
     async def get_balance(self, *, account_id: str) -> dict[str, float]:
         data = await self._request("GET", "/api/v3/account", account_id, {})

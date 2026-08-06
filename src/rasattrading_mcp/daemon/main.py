@@ -105,6 +105,13 @@ class DaemonRunner:
 
         self.risk_service = RiskPolicyService(self.db, audit=self.audit)
         await self.risk_service.reconcile_overrides()
+        # Daemon çökmüşken çalışan emergency_stop log'unu audit_log'a mutabakat et (3.6)
+        from ..storage.emergency_log import EmergencyLog, reconcile_emergency_log
+
+        try:
+            await reconcile_emergency_log(self.db, self.audit, EmergencyLog(self.config.data_dir / "emergency_stop.log"))
+        except Exception:  # noqa: BLE001
+            logger.exception("emergency_stop log reconcile edilemedi")
         self.readiness.set_state("warming_up")
         self.lock_mgr.update_state(self.readiness.state)
 

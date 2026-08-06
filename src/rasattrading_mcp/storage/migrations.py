@@ -244,11 +244,27 @@ def _m4_orders(conn: sqlite3.Connection) -> None:
     )
 
 
+def _m5_emergency_reconciled(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        -- emergency_stop log dosyasından audit_log'a reconcile edilen entry'ler.
+        -- entry_hash UNIQUE -> daemon açılışında aynı emergency entry ikinci kez
+        -- audit_log'a yazılmaz (idempotent reconcile).
+        CREATE TABLE emergency_reconciled (
+          entry_hash TEXT PRIMARY KEY,
+          seq INTEGER NOT NULL,
+          reconciled_at INTEGER NOT NULL
+        );
+        """
+    )
+
+
 MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (1, "initial_schema", _m1_initial_schema),
     (2, "indexes", _m2_indexes),
     (3, "risk_policy_override", _m3_risk_policy),
     (4, "orders", _m4_orders),
+    (5, "emergency_reconciled", _m5_emergency_reconciled),
 ]
 
 
