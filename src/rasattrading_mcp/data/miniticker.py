@@ -34,21 +34,40 @@ class TickerUpdate:
 
 
 def parse_miniticker_arr(raw: str | bytes) -> list[TickerUpdate]:
-    """`!miniTicker@arr` payload'unu TickerUpdate listesine çevirir."""
-    data = json.loads(raw)
+    """`!miniTicker@arr` payload'unu TickerUpdate listesine çevirir.
+
+    Binance combined stream (`/stream?streams=!miniTicker@arr`) her mesajı
+    `{"stream": "<name>", "data": [...]}` sarmalıyla gönderir; düz dizi formu
+    (tek akış) da kabul edilir.
+    """
+    data = None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    if isinstance(data, dict):
+        data = data.get("data", [])
+    if not isinstance(data, list):
+        return []
     updates: list[TickerUpdate] = []
     for item in data:
         try:
+            close = float(item["c"])
+            open24h = float(item["o"])
+            pct = item.get("P")
+            # `!miniTicker@arr` öğeleri `P` (price change %) taşımaz; o/c'den hesaplanır.
+            # `P` yalnızca 24hr ticker stream'inde bulunur (uyumluluk için kabul edilir).
+            price_change_pct = float(pct) if pct is not None else ((close - open24h) / open24h * 100.0 if open24h else 0.0)
             updates.append(
                 TickerUpdate(
                     symbol=str(item["s"]),
-                    last=float(item["c"]),
-                    open24h=float(item["o"]),
+                    last=close,
+                    open24h=open24h,
                     high24h=float(item["h"]),
                     low24h=float(item["l"]),
                     volume=float(item["v"]),
                     quote_volume=float(item["q"]),
-                    price_change_pct=float(item["P"]),
+                    price_change_pct=price_change_pct,
                     event_time=float(item.get("E", 0)) / 1000.0,
                 )
             )
@@ -72,9 +91,13 @@ class TickerCache:
             self._data[u.symbol] = u
         if updates:
             self._last_message_at = time.time()
-            if self._status != "connected":
-                self._status = "connected"
-                self._status_reason = None
+            self.mark_connected()
+
+    def mark_connected(self) -> None:
+        """WS bağlantısı kurulduğunda çağrılır — mesaj henüz gelmemiş olsa bile
+        watchdog staleness'i izleyebilsin (hiç mesaj gelmeyen bağlantı da reconnect edilir)."""
+        self._status = "connected"
+        self._status_reason = None
 
     def mark_stale(self, reason: str) -> None:
         self._status = "disconnected"
@@ -144,6 +167,7 @@ class MiniTickerClient:
             try:
                 async with websockets.connect(self._url, ping_interval=20, ping_timeout=20, max_size=16 * 1024 * 1024) as ws:
                     logger.info("miniTicker WS bağlandı")
+                    self._cache.mark_connected()
                     backoff = 1.0
                     async for raw in ws:
                         updates = parse_miniticker_arr(raw)

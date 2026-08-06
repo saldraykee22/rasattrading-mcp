@@ -78,12 +78,13 @@ async def test_binance_rest_401_maps_to_unauthorized():
 
     app.router.add_get("/x", handler)
     async with TestServer(app) as server:
-        from rasattrading_mcp.data.binance_client import FUTURES_REST_BASE
-
         client = BinanceREST(server.make_url("/").human_repr(), RateLimitBudget(1000), retries=1)
-        with pytest.raises(RasatError) as exc:
-            await client.get("/x")
-        assert exc.value.code == ErrorCode.UNAUTHORIZED
+        try:
+            with pytest.raises(RasatError) as exc:
+                await client.get("/x")
+            assert exc.value.code == ErrorCode.UNAUTHORIZED
+        finally:
+            await client.close()
 
 
 # ---------- universe ----------
@@ -122,17 +123,47 @@ async def test_universe_ensure_contains_unknown(cfg, db):
 MINI_PAYLOAD = json.dumps(
     [
         {"e": "24hrMiniTicker", "s": "BTCUSDT", "c": "100.5", "o": "99.0", "h": "101.0", "l": "98.0",
-         "v": "1000", "q": "100000", "P": "1.52", "E": 1700000000000}
+         "v": "1000", "q": "100000", "E": 1700000000000}
     ]
+)
+
+MINI_PAYLOAD_COMBINED = json.dumps(
+    {"stream": "!miniTicker@arr", "data": json.loads(MINI_PAYLOAD)}
 )
 
 
 def test_parse_miniticker():
+    """Gerçek miniTicker öğesi P (price change %) taşımaz — o/c'den hesaplanmalı."""
     updates = parse_miniticker_arr(MINI_PAYLOAD)
     assert len(updates) == 1
     assert updates[0].symbol == "BTCUSDT"
     assert updates[0].last == 100.5
+    # (100.5 - 99.0) / 99.0 * 100 ≈ 1.5151
+    assert abs(updates[0].price_change_pct - 1.5151) < 0.001
+
+
+def test_parse_miniticker_with_p_field():
+    """24hr ticker stream'inden gelen P alanı da kabul edilir."""
+    payload = json.dumps(
+        [{"e": "24hrTicker", "s": "BTCUSDT", "c": "100.5", "o": "99.0", "h": "101.0", "l": "98.0",
+          "v": "1000", "q": "100000", "P": "1.52", "E": 1700000000000}]
+    )
+    updates = parse_miniticker_arr(payload)
     assert updates[0].price_change_pct == 1.52
+
+
+def test_parse_miniticker_combined_stream_envelope():
+    """Binance combined stream sarmalı ({stream, data}) ayrıştırılmalı (smoke test bulgusu)."""
+    updates = parse_miniticker_arr(MINI_PAYLOAD_COMBINED)
+    assert len(updates) == 1
+    assert updates[0].symbol == "BTCUSDT"
+    assert updates[0].last == 100.5
+    assert updates[0].event_time == 1700000000.0
+
+
+def test_parse_miniticker_garbage():
+    assert parse_miniticker_arr(json.dumps({"stream": "x"})) == []
+    assert parse_miniticker_arr("not json") == []
 
 
 def test_ticker_cache_freshness():
@@ -153,7 +184,8 @@ async def test_miniticker_ws_reconnect_marks_stale():
     frame = [dict(s="BTCUSDT", c="100.5", o="99", h="101", l="98", v="100", q="10000", P="1.5", E=0)]
 
     async def handler(ws):
-        await ws.send(json.dumps(frame))
+        # Gerçek Binance gibi combined-stream sarmalı gönder
+        await ws.send(json.dumps({"stream": "!miniTicker@arr", "data": frame}))
         await asyncio.sleep(30)
 
     server = await websockets.serve(handler, "127.0.0.1", 0)
