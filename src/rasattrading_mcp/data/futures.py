@@ -148,10 +148,36 @@ class FuturesContextPoller:
 
         await self._db.write(_write)
 
+    async def age_stale_rows(self, now: float | None = None) -> int:
+        """`fresh` satırları yaşlandırır: `futures_stale_after_seconds` süredir
+        yenilenmeyenler `stale` olur.
+
+        Poll başarısız olsa bile çalışır — eski futures verisi süresiz `fresh`
+        kalamaz (2.10 fix). Dönen değer yaşlandırılan satır sayısıdır.
+        """
+        now = now if now is not None else time.time()
+        cutoff = int(now) - int(self._config.futures_stale_after_seconds)
+
+        def _w(conn) -> int:
+            cur = conn.execute(
+                "UPDATE futures_context SET freshness='stale' WHERE freshness='fresh' AND fetched_at < ?",
+                (cutoff,),
+            )
+            return cur.rowcount
+
+        aged = await self._db.write(_w)
+        if aged:
+            logger.info("futures_context yaşlandırıldı: %d satır", aged)
+        return aged
+
     async def run_loop(self, stop: asyncio.Event) -> None:
         """Funding + OI `futures_poll_seconds`'ta, liquidation `liquidation_poll_seconds`'ta."""
         while not stop.is_set():
             try:
+                try:
+                    await self.age_stale_rows()
+                except Exception:  # noqa: BLE001
+                    logger.exception("futures aging hatası")
                 try:
                     await self.poll_funding()
                 except RasatError as exc:

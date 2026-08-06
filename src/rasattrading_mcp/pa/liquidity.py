@@ -191,18 +191,19 @@ async def load_futures_context(db: Database, symbol: str) -> dict[str, dict]:
 
 
 async def load_futures_series(db: Database, symbol: str, ftype: str, limit: int = 20) -> list[dict]:
-    """Bir türün zaman sıralı futures_context kayıtlarını döndürür (eski→yeni).
+    """Bir türün zaman sıralı (eski→yeni) EN YENİ `limit` kaydını döndürür.
 
     `oi_change` gibi değişim filtreleri için türün geçmişine ihtiyaç duyulur;
-    tür bilinmiyorsa boş liste döner (hata değil).
+    tür bilinmiyorsa boş liste döner (hata değil). En yeni kayıtlar seçilir
+    (ASC+LIMIT eskileri dönüyordu — 2.10 fix), sonra kronolojik sıraya çevrilir.
     """
 
     def _q(conn):
         rows = conn.execute(
             "SELECT type, value, event_time, freshness, fetched_at FROM futures_context "
-            "WHERE symbol=? AND type=? ORDER BY event_time ASC LIMIT ?",
+            "WHERE symbol=? AND type=? ORDER BY event_time DESC LIMIT ?",
             (symbol, ftype, limit),
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [dict(r) for r in reversed(rows)]
 
     return await db.read(_q)
