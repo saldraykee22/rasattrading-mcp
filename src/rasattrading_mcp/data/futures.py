@@ -4,8 +4,11 @@ REST periyodik çekim. Her kayıt Binance'in `event_time`'ı ve daemon'un `fetch
 ayrı ayrı saklanır — ikisi arasındaki fark gecikmeyi gösterir. `freshness` alanı
 fresh|stale|unknown olabilir; `unknown` sembol girdisi likidite skoruna katılmaz.
 
-Liquidation (allForceOrders) API key isteyebilir; 401 alınırsa `_liquidation_available=False`
-ile sessizce devre dışı kalır (veri eksikliği `unknown` olarak görünür, sistemi durdurmaz).
+Liquidation (`/fapi/v1/forceOrders`, signed USER_DATA) API key ister; anahtar yoksa
+Binance 401 döner → `_liquidation_available=False` ile sessizce devre dışı kalır ve
+durum `not_configured` olur (hata değil — veri eksikliği `unknown` olarak görünür,
+sistemi durdurmaz). 1.6: eski path `/fapi/v1/allForceOrders` canlı API'de 404
+dönüyordu (path mevcut değil) → kalıcı `error`; doğru path `/fapi/v1/forceOrders`.
 """
 
 from __future__ import annotations
@@ -91,12 +94,12 @@ class FuturesContextPoller:
         if self._last_liquidation_ts:
             params["startTime"] = self._last_liquidation_ts
         try:
-            data = await self._rest.get("/fapi/v1/allForceOrders", params=params, weight=10)
+            data = await self._rest.get("/fapi/v1/forceOrders", params=params, weight=10)
         except RasatError as exc:
             if exc.code == ErrorCode.UNAUTHORIZED:
                 self._liquidation_available = False
-                self._last_status["liquidation"] = "unavailable"
-                logger.info("liquidation verisi API key gerektiriyor — devre dışı (v1 kabul)")
+                self._last_status["liquidation"] = "not_configured"
+                logger.info("liquidation verisi API key gerektiriyor — devre dışı (not_configured)")
                 return 0
             raise
 

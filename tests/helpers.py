@@ -61,7 +61,7 @@ class FakeRest:
             ]
         if path == "/fapi/v1/openInterest":
             return {"openInterest": "1234.5", "time": int(time.time() * 1000)}
-        if path == "/fapi/v1/allForceOrders":
+        if path == "/fapi/v1/forceOrders":
             return [
                 {
                     "symbol": "BTCUSDT",

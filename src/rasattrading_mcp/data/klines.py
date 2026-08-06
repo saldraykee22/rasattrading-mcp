@@ -5,6 +5,10 @@
 - Agent'ın o an istediği symbol/timeframe **öncelikli** doldurulur (lazy/öncelikli warm-up).
 - Tüm REST çağrıları weight bütçesinden geçer; limit dolarsa kuyruklanır, sistem durmaz.
 - Veri `candles` tablosuna upsert edilir (batch).
+- **Kapalı mum kuralı (plan 2.7/1.4, 1.6):** Binance `/klines` oluşmakta olan barı da
+  döndürür; o bar saklanmaz. Kısmi hacimli forming bar kaydedilseydi, kapanınca
+  `MAX(open_time) == last_closed` olduğu için catchup tetiklenmez ve son "kapalı" mum
+  kısmi hacimle kalırdı. `_store` yalnızca kapanmış barları yazar.
 """
 
 from __future__ import annotations
@@ -144,7 +148,22 @@ class KlineService:
             "volume=excluded.volume, quote_volume=excluded.quote_volume, trades=excluded.trades, updated_at=excluded.updated_at"
         )
 
+    @staticmethod
+    def _closed_only(rows: list[dict], tf: str) -> list[dict]:
+        """Hâlâ oluşmakta olan son barı atar (kapalı mum kuralı).
+
+        Binance `/klines` oluşmakta olan barı da döndürür; kısmi hacimle
+        saklanmamalı (1.6: forming bar kaydedilirse kapanınca catchup tetiklenmez
+        ve son "kapalı" mum kısmi hacimle kalır).
+        """
+        period = TIMEFRAME_SECONDS[tf]
+        latest_closed = int(time.time() // period) * period - period
+        return [r for r in rows if r["open_time"] <= latest_closed]
+
     async def _store(self, symbol: str, tf: str, source: str, rows: list[dict]) -> None:
+        rows = self._closed_only(rows, tf)
+        if not rows:
+            return
         now = int(time.time())
         sql = self._upsert_sql()
 
