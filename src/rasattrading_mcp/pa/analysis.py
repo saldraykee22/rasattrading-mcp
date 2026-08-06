@@ -266,15 +266,36 @@ class PAEngine:
             fvgs = [z for z in result["order_blocks"]["fvgs"] if not z["mitigated"]]
 
         vwap_points = result["vwap"].get("points", [])[-MAX_VWAP_POINTS:]
+        versions = {
+            "structure": result["structure"]["algo_version"],
+            "liquidity": result["liquidity"]["algo_version"],
+            "order_blocks": result["order_blocks"]["algo_version"],
+            "vwap": result["vwap"]["algo_version"],
+            "sessions": result["sessions"]["algo_version"],
+        }
         return {
             "symbol": symbol,
             "timeframe": timeframe,
             "as_of": result["as_of"],
-            "algo_version": result["structure"]["algo_version"],
+            "algo_version": ",".join(versions.values()),
+            "versions": versions,
             "structure": result["structure"],
-            "liquidity": {"zones": zones, "score": result["liquidity"]["score"]},
-            "order_blocks": {"order_blocks": obs, "fvgs": fvgs},
-            "vwap": {"current": result["vwap"]["current"], "anchored_at": result["vwap"]["anchored_at"], "points": vwap_points},
+            "liquidity": {
+                "algo_version": result["liquidity"]["algo_version"],
+                "zones": zones,
+                "score": result["liquidity"]["score"],
+            },
+            "order_blocks": {
+                "algo_version": result["order_blocks"]["algo_version"],
+                "order_blocks": obs,
+                "fvgs": fvgs,
+            },
+            "vwap": {
+                "algo_version": result["vwap"]["algo_version"],
+                "current": result["vwap"]["current"],
+                "anchored_at": result["vwap"]["anchored_at"],
+                "points": vwap_points,
+            },
             "sessions": result["sessions"],
         }
 

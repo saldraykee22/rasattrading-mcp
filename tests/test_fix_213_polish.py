@@ -94,7 +94,7 @@ async def test_m5_pa_meta_carries_real_algo_version(db, cfg):
         ("get_market_structure", {"symbol": "BTCUSDT", "timeframe": TF}, "swing-v1"),
         ("get_liquidity_zones", {"symbol": "BTCUSDT", "timeframe": TF}, "liquidity-v1"),
         ("get_order_blocks", {"symbol": "BTCUSDT", "timeframe": TF}, "obfvg-v1"),
-        ("get_full_analysis", {"symbol": "BTCUSDT", "timeframe": TF}, "swing-v1"),
+        ("get_full_analysis", {"symbol": "BTCUSDT", "timeframe": TF}, "swing-v1,liquidity-v1,obfvg-v1,vwap-v1,session-v1"),
     ]
     for tool, params, expected in cases:
         data, meta = await dispatcher.dispatch(tool, params, ctx)

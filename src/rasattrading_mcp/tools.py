@@ -544,7 +544,10 @@ register_tool(
         name="get_full_analysis",
         description=(
             "Tek çağrıda tüm PA özeti: yapı + likidite + order block/FVG + VWAP + session "
-            "seviyeleri. Context şişmesin diye vwap noktaları sınırlıdır."
+            "seviyeleri. Context şişmesin diye vwap noktaları sınırlıdır. meta.algo_version ve "
+            "data.algo_version tüm bileşen sürümlerini taşır; data.versions her bileşeni ayrı "
+            "verir. Likidite skorunun equal_levels açıklamasındaki zones toplamıdır; aktif "
+            "(mitigasyonsuz) sayı varsayılan zones listesiyle birebir örtüşür."
         ),
         input_schema=_pa_schema({"include_mitigated": {"type": "boolean", "default": False}}),
     )

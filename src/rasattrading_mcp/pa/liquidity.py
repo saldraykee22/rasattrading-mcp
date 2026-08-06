@@ -127,11 +127,20 @@ def liquidity_score(zones: list[dict], futures: dict[str, Any] | None) -> dict[s
     futures = futures or {}
     w = LIQUIDITY_WEIGHTS
 
-    eq_count = sum(1 for z in zones if z["kind"] in ("equal_highs", "equal_lows"))
+    eq_zones = [z for z in zones if z["kind"] in ("equal_highs", "equal_lows")]
+    eq_count = len(eq_zones)
+    eq_mitigated = sum(1 for z in eq_zones if z.get("mitigated"))
+    eq_active = eq_count - eq_mitigated
     components: dict[str, Any] = {
         "equal_levels": {
             "status": "fresh",
             "zones": eq_count,
+            "active_zones": eq_active,
+            "mitigated_zones": eq_mitigated,
+            "note": (
+                f"analizde {eq_count} eşit-seviye bölge; {eq_active} aktif (mitigasyonsuz), "
+                f"{eq_mitigated} mitigasyonlu — varsayılan listede yalnızca aktifler görünür"
+            ),
             "included": True,
             "points": round(min(eq_count, 10) / 10.0 * w["equal_levels"], 1),
         }
