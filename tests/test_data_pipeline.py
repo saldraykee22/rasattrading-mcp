@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from rasattrading_mcp.config import Config
+from rasattrading_mcp.config import Config, TIMEFRAME_SECONDS
 from rasattrading_mcp.data.binance_client import BinanceREST, kline_weight
 from rasattrading_mcp.data.futures import FuturesContextPoller
 from rasattrading_mcp.data.klines import KlineService, parse_klines
@@ -488,6 +488,87 @@ async def test_get_candles_fetch_error_raises_stale(cfg, db):
         await service.stop()
 
 
+async def test_store_drops_forming_bar(cfg, db):
+    """Kapalı mum kuralı (1.6): oluşmakta olan (kapanmamış) bar `candles`'a yazılmaz.
+
+    Binance `/klines` son bar olarak hâlâ oluşmakta olan barı döndürür; kısmi
+    hacimle saklanırsa kapanınca `MAX(open_time)==last_closed` olduğu için
+    catchup tetiklenmez ve son "kapalı" mum kısmi hacimle kalır (90 vs 400-870).
+    """
+    from tests.helpers import FakeRest
+
+    class _FormingRest(FakeRest):
+        async def get(self, path, params=None, weight=1):
+            if path == "/api/v3/klines":
+                raw = self._gen_klines(params.get("symbol"), params.get("interval", "1h"), int(params.get("limit", 100)))
+                period = TIMEFRAME_SECONDS[params.get("interval", "1h")]
+                latest_closed = int(time.time() // period) * period - period
+                forming = latest_closed + period
+                raw.append([forming, "100", "101", "99", "100.5", "90", forming + period, "9000", 3, "0", "0", "0"])
+                return raw
+            return await super().get(path, params, weight)
+
+    period = TIMEFRAME_SECONDS["1h"]
+    latest_closed = int(time.time() // period) * period - period
+    forming = latest_closed + period  # şu an oluşmakta olan bar
+
+    fake = _FormingRest(["BTCUSDT"])
+    universe, service = await _make_klines(cfg, db, fake)
+    try:
+        rows = await service.get_candles("BTCUSDT", "1h", 10)
+        # forming bar dönmez — son bar kapanmış olan olmalı
+        assert all(r["open_time"] <= latest_closed for r in rows)
+        assert rows[-1]["volume"] == 1000.0  # kısmi hacim (90) saklanmadı
+
+        def _q(conn):
+            row = conn.execute(
+                "SELECT MAX(open_time) AS m FROM candles WHERE symbol='BTCUSDT' AND timeframe='1h'"
+            ).fetchone()
+            return int(row["m"]) if row["m"] is not None else None
+
+        max_open = await db.read(_q)
+        assert max_open == latest_closed
+        assert max_open != forming
+    finally:
+        await service.stop()
+
+
+async def test_scheduler_catchup_does_not_store_forming_bar(cfg, db):
+    """1.6 yarış durumu: scheduler kapanış tetiklemesi forming bar'ı saklamamalı.
+
+    Kapanış tetiklendiğinde Binance'ten limit'lik kline gelir; en son bar hâlâ
+    oluşmakta olabilir. `_store` onu atmalı — aksi halde o bar kapanınca
+    `_needs_catchup` yanlışlıkla "güncel" sanır ve tam hacim hiç çekilmez.
+    """
+    from tests.helpers import FakeRest
+
+    period = 3600
+    latest_closed = int(time.time() // period) * period - period
+
+    fake = FakeRest(["BTCUSDT"])
+    universe, service = await _make_klines(cfg, db, fake)
+    try:
+        # Scheduler kapalı mum yakalama: hedef open_time = latest_closed
+        await service._enqueue_closed_bar_pass("1h", latest_closed)
+        # worker'ların bitmesini bekle
+        for _ in range(200):
+            if service._queue.qsize() == 0 and not service._in_flight:
+                break
+            await asyncio.sleep(0.05)
+
+        def _q(conn):
+            row = conn.execute(
+                "SELECT MAX(open_time) AS m FROM candles WHERE symbol='BTCUSDT' AND timeframe='1h'"
+            ).fetchone()
+            return int(row["m"]) if row["m"] is not None else None
+
+        max_open = await db.read(_q)
+        assert max_open == latest_closed
+        assert max_open != latest_closed + period
+    finally:
+        await service.stop()
+
+
 # ---------- futures ----------
 
 async def test_futures_pollers_write_context(cfg, db):
@@ -514,6 +595,56 @@ async def test_futures_pollers_write_context(cfg, db):
     # event_time ile fetched_at ayrı saklanır
     liq = next(r for r in rows if r["type"] == "liquidation")
     assert liq["value"] == 90000.0 * 0.5
+
+
+async def test_liquidation_polls_correct_endpoint(cfg, db):
+    """1.6: `/fapi/v1/allForceOrders` canlı API'de 404 — doğru path `/fapi/v1/forceOrders`."""
+    from tests.helpers import FakeRest
+
+    fake = FakeRest(["BTCUSDT"])
+    universe = UniverseService(fake, cfg)
+    await universe.sync()
+    poller = FuturesContextPoller(fake, db, universe, cfg)
+
+    await poller.poll_liquidations()
+    paths = [c[0] for c in fake.calls]
+    assert any(p == "/fapi/v1/forceOrders" for p in paths)
+    assert not any("allForceOrders" in p for p in paths)
+    assert poller.status()["liquidation"] == "ok"
+
+
+async def test_liquidation_unauthorized_reports_not_configured(cfg, db):
+    """1.6: 401 (API key yok) → `error` değil `not_configured` — kalıcı hata görünmez."""
+    from tests.helpers import FakeRest
+
+    class _AuthRest(FakeRest):
+        def __init__(self, symbols):
+            super().__init__(symbols)
+            self.fail_liquidation = False
+
+        async def get(self, path, params=None, weight=1):
+            if path == "/fapi/v1/forceOrders" and self.fail_liquidation:
+                raise RasatError(ErrorCode.UNAUTHORIZED, "API key gerekiyor")
+            return await super().get(path, params, weight)
+
+    fake = _AuthRest(["BTCUSDT"])
+    universe = UniverseService(fake, cfg)
+    await universe.sync()
+    poller = FuturesContextPoller(fake, db, universe, cfg)
+
+    fake.fail_liquidation = True
+    n = await poller.poll_liquidations()
+    assert n == 0
+    assert poller.status()["liquidation"] == "not_configured"
+    # devre dışı kaldıktan sonra tekrar poll edilse bile hata yükselmez
+    n2 = await poller.poll_liquidations()
+    assert n2 == 0
+    assert poller.status()["liquidation"] == "not_configured"
+    # likidite skoruna veri yok → unknown bileşeni
+    from rasattrading_mcp.pa.liquidity import liquidity_score
+
+    score = liquidity_score([], None)
+    assert score["components"]["liquidation"]["status"] == "unknown"
 
 
 # ---------- pipeline ----------
