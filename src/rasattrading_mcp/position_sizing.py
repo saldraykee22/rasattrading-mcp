@@ -58,7 +58,7 @@ class SymbolFilters:
             step_size=_num("LOT_SIZE", "stepSize"),
             min_qty=_num("LOT_SIZE", "minQty"),
             max_qty=_num("LOT_SIZE", "maxQty", default=math.inf),
-            min_notional=_num("MIN_NOTIONAL", "minNotional"),
+            min_notional=_num("NOTIONAL", "minNotional") or _num("MIN_NOTIONAL", "minNotional"),
             tick_size=_num("PRICE_FILTER", "tickSize"),
             min_price=_num("PRICE_FILTER", "minPrice"),
             max_price=_num("PRICE_FILTER", "maxPrice", default=math.inf),

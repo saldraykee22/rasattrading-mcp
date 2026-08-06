@@ -271,6 +271,38 @@ async def test_get_symbol_info_dispatches(pipeline_ctx):
     assert meta.source == "binance-rest-exchangeinfo"
 
 
+def test_symbol_filters_spot_notional_format():
+    """Canlı Binance spot exchangeInfo 'NOTIONAL' filterType kullanır (futures 'MIN_NOTIONAL').
+
+    Kod yalnızca MIN_NOTIONAL ararsa spot sembollerde min_notional hep 0 kalır
+    ve notional tabanı uygulanmaz (fail-open) — canlı API doğrulamasında yakalandı.
+    """
+    from rasattrading_mcp.position_sizing import SymbolFilters
+
+    spot_entry = {
+        "symbol": "BTCUSDT",
+        "baseAsset": "BTC",
+        "quoteAsset": "USDT",
+        "status": "TRADING",
+        "filters": [
+            {"filterType": "LOT_SIZE", "minQty": "0.00001000", "maxQty": "9000.00000000", "stepSize": "0.00001000"},
+            {"filterType": "NOTIONAL", "minNotional": "5.00000000", "applyToMarket": True, "avgPriceMins": 5},
+            {"filterType": "PRICE_FILTER", "minPrice": "0.01000000", "maxPrice": "1000000.00000000", "tickSize": "0.01000000"},
+        ],
+    }
+    parsed = SymbolFilters.from_exchange_info(spot_entry)
+    assert parsed.min_notional == 5.0
+
+    futures_entry = {
+        "symbol": "BTCUSDT",
+        "baseAsset": "BTC",
+        "quoteAsset": "USDT",
+        "status": "TRADING",
+        "filters": [{"filterType": "MIN_NOTIONAL", "minNotional": "5.0", "applyToMarket": True}],
+    }
+    assert SymbolFilters.from_exchange_info(futures_entry).min_notional == 5.0
+
+
 async def test_get_symbol_info_unknown_symbol(pipeline_ctx):
     dispatcher, ctx, _ = pipeline_ctx
     with pytest.raises(RasatError) as exc_info:
