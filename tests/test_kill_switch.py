@@ -352,6 +352,73 @@ async def test_reconcile_open_orders_skips_paper_accounts(ex_ctx):
     assert result["scanned"] == 0
 
 
+async def test_reconcile_open_orders_same_status_partial_fill_syncs(ex_ctx):
+    # 3.18: durum aynı (PARTIALLY_FILLED) kalsa bile executed_qty/avg_price
+    # ilerlemişse reconcile bunları güncellemeli — status eşit diye skip yok.
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx)
+    service = ctx["service"]
+    cid = to_client_order_id("partial-fill")
+
+    def _insert(conn):
+        order = service._insert_order(
+            conn, account_id=account_id, idempotency_key="partial-fill",
+            symbol="BTCUSDT", side="BUY", order_type="LIMIT", quantity=1.0,
+            price=100.0, notional=100.0, reference_price=100.0, equity_snapshot=0.0,
+            status="PARTIALLY_FILLED", client_order_id=cid,
+        )
+        return order["order_id"]
+
+    order_id = await ctx["db"].write(_insert)
+
+    # broker: aynı PARTIALLY_FILLED ama executed_qty 0.5→1.0, avg 100→101 ilerledi
+    ctx["broker"].query_results[cid] = OrderResult(
+        status="PARTIALLY_FILLED", exchange_order_id="EX-PF",
+        executed_qty=1.0, avg_price=101.0,
+    )
+
+    result = await service.reconcile_open_orders()
+    assert result["scanned"] >= 1
+    assert result["unchanged"] == 0  # status eşit olsa da fill alanları değişti
+    assert result["reconciled"] >= 1
+
+    def _q(conn):
+        return dict(conn.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,)).fetchone())
+
+    row = await ctx["db"].read(_q)
+    assert row["status"] == "PARTIALLY_FILLED"
+    assert row["executed_qty"] == pytest.approx(1.0)
+    assert row["avg_price"] == pytest.approx(101.0)
+    assert row["exchange_order_id"] == "EX-PF"
+
+
+async def test_reconcile_open_orders_same_fields_counts_unchanged(ex_ctx):
+    # 3.18: tüm alanlar gerçekten aynıysa unchanged sayılır (gereksiz yazma yok).
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx)
+    service = ctx["service"]
+    cid = to_client_order_id("partial-unchanged")
+
+    def _insert(conn):
+        order = service._insert_order(
+            conn, account_id=account_id, idempotency_key="partial-unchanged",
+            symbol="BTCUSDT", side="BUY", order_type="LIMIT", quantity=1.0,
+            price=100.0, notional=100.0, reference_price=100.0, equity_snapshot=0.0,
+            status="PARTIALLY_FILLED", client_order_id=cid,
+        )
+        return order["order_id"]
+
+    await ctx["db"].write(_insert)
+
+    ctx["broker"].query_results[cid] = OrderResult(
+        status="PARTIALLY_FILLED", exchange_order_id=None, executed_qty=0.0, avg_price=0.0,
+    )
+
+    result = await service.reconcile_open_orders()
+    assert result["scanned"] >= 1
+    assert result["unchanged"] >= 1
+
+
 async def test_disable_real_trading(ex_ctx):
     ctx = ex_ctx
     account_id = await _add_real_account(ctx)
