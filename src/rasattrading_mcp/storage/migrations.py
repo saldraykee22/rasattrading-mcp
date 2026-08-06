@@ -168,10 +168,110 @@ def _m3_alert_cooldown(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_state ON alerts (state, updated_at)")
 
 
+def _m4_risk_policy(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        -- Hesap bazlı opsiyonel risk politikası (v1: spot long-only)
+        -- max_notional_per_order / max_aggregate_exposure cap'leri:
+        --   REAL NULL = sınırsız; varsa KATI üst sınırdır (tolerans uygulanmaz).
+        -- allowed_symbols: JSON string listesi; boş [] = tüm semboller serbest.
+        CREATE TABLE risk_policy (
+          account_id TEXT PRIMARY KEY,
+          max_notional_per_order REAL,
+          max_aggregate_exposure REAL,
+          allowed_symbols TEXT NOT NULL DEFAULT '[]',
+          policy_version INTEGER NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+
+        -- Tek kullanımlık override state machine: reserved -> applied|reconciled
+        -- (account_id, policy_version, idempotency_key, actor, expires_at) taşır.
+        -- consumed_by_idem = override'ı tüketen emir isteğinin idempotency key'i.
+        CREATE TABLE risk_override (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          override_id TEXT NOT NULL UNIQUE,
+          account_id TEXT NOT NULL,
+          policy_version INTEGER NOT NULL,
+          idempotency_key TEXT NOT NULL,
+          actor TEXT NOT NULL,
+          reason TEXT NOT NULL,
+          scope TEXT NOT NULL DEFAULT 'next_order',
+          state TEXT NOT NULL DEFAULT 'reserved',
+          created_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL,
+          applied_at INTEGER,
+          consumed_by_idem TEXT,
+          reconciled_at INTEGER,
+          reconcile_reason TEXT,
+          UNIQUE (account_id, idempotency_key)
+        );
+
+        CREATE INDEX idx_risk_override_account ON risk_override (account_id, state, expires_at);
+        """
+    )
+
+
+def _m5_orders(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        -- Emir kayıtları: idempotency + gerçek Binance state machine + aggregate exposure.
+        -- status: NEW | PARTIALLY_FILLED | FILLED | CANCELED | REJECTED | EXPIRED | UNKNOWN | PAPER
+        -- (account_id, idempotency_key) UNIQUE -> aynı anahtarla retry çift emir üretmez,
+        --   stored emir döner / durum reconcile edilir.
+        CREATE TABLE orders (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          order_id TEXT NOT NULL UNIQUE,
+          account_id TEXT NOT NULL,
+          idempotency_key TEXT NOT NULL,
+          symbol TEXT NOT NULL,
+          side TEXT NOT NULL,
+          order_type TEXT NOT NULL,
+          quantity REAL NOT NULL,
+          price REAL,
+          status TEXT NOT NULL,
+          exchange_order_id TEXT,
+          client_order_id TEXT,
+          executed_qty REAL,
+          avg_price REAL,
+          fee REAL,
+          notional REAL,
+          reference_price REAL,
+          error_code TEXT,
+          error_message TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          UNIQUE (account_id, idempotency_key)
+        );
+
+        CREATE INDEX idx_orders_account ON orders (account_id, status);
+        CREATE INDEX idx_orders_open ON orders (account_id, status, created_at);
+        """
+    )
+
+
+def _m6_emergency_reconciled(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        -- emergency_stop log dosyasından audit_log'a reconcile edilen entry'ler.
+        -- entry_hash UNIQUE -> daemon açılışında aynı emergency entry ikinci kez
+        -- audit_log'a yazılmaz (idempotent reconcile).
+        CREATE TABLE emergency_reconciled (
+          entry_hash TEXT PRIMARY KEY,
+          seq INTEGER NOT NULL,
+          reconciled_at INTEGER NOT NULL
+        );
+        """
+    )
+
+
 MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (1, "initial_schema", _m1_initial_schema),
     (2, "indexes", _m2_indexes),
     (3, "alert_cooldown", _m3_alert_cooldown),
+    (4, "risk_policy_override", _m4_risk_policy),
+    (5, "orders", _m5_orders),
+    (6, "emergency_reconciled", _m6_emergency_reconciled),
 ]
 
 
@@ -181,15 +281,27 @@ def applied_versions(conn: sqlite3.Connection) -> set[int]:
     return {int(r["version"]) for r in rows}
 
 
+def applied_names(conn: sqlite3.Connection) -> set[str]:
+    conn.execute(SCHEMA_BOOTSTRAP)
+    rows = conn.execute("SELECT name FROM schema_migrations").fetchall()
+    return {str(r["name"]) for r in rows}
+
+
 async def run_migrations(db: Database) -> list[int]:
-    """Uygulanmamış migration'ları sırayla uygular; uygulanan sürümleri döner."""
+    """Uygulanmamış migration'ları sırayla uygular; uygulanan sürümleri döner.
+
+    Atlama ölçütü: sürüm numarası VEYA isim daha önce uygulanmışsa atlanır.
+    İsim kontrolü, numaralandırmanın değiştiği durumlarda (örn. branch merge'i
+    sonrası yeniden numaralandırma) aynı migration'ın çift uygulanmasını engeller.
+    """
 
     def _run(conn: sqlite3.Connection) -> list[int]:
         conn.execute(SCHEMA_BOOTSTRAP)
-        existing = applied_versions(conn)
+        existing_versions = applied_versions(conn)
+        existing_names = applied_names(conn)
         applied: list[int] = []
         for version, name, fn in MIGRATIONS:
-            if version in existing:
+            if version in existing_versions or name in existing_names:
                 continue
             with conn:  # her migration tek transaction
                 fn(conn)

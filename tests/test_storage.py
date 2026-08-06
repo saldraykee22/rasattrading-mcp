@@ -31,13 +31,14 @@ def _tables(conn):
 
 async def test_migrations_on_empty_db(cfg, db):
     applied = await run_migrations(db)
-    assert applied == [1, 2, 3]
-    assert await current_version(db) == 3
+    assert applied == [1, 2, 3, 4, 5, 6]
+    assert await current_version(db) == 6
     tables = await db.read(_tables)
     expected = {
         "candles", "futures_context", "market_structure", "liquidity_zones",
         "order_blocks", "annotations", "alerts", "triggered_alerts",
         "accounts", "audit_log", "schema_migrations",
+        "risk_policy", "risk_override", "orders", "emergency_reconciled",
     }
     assert expected.issubset(tables)
 

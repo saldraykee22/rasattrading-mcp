@@ -25,6 +25,7 @@ dev = [
 [project.scripts]
 rasattrading-mcp = "rasattrading_mcp.adapter.main:main"
 rasattrading-daemon = "rasattrading_mcp.daemon.main:main"
+rasattrading-emergency-stop = "rasattrading_mcp.emergency_stop:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

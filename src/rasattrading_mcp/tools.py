@@ -188,6 +188,285 @@ register_tool(
     )
 )
 
+# ---------- Modül 3 / 3.2: trading kilidi + risk politikası ----------
+
+register_tool(
+    ToolSpec(
+        name="enable_real_trading",
+        description=(
+            "Hesabın trading kilidini kalıcı olarak `real`'e çevirir (tek yönlü; zaten real ise idempotent). "
+            "Credential'sız hesapta reddedilir; değişiklik audit_log'a yazılır."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "account_id": {"type": "string", "minLength": 1},
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["account_id"],
+            "additionalProperties": False,
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="set_risk_policy",
+        description=(
+            "Hesap için isteğe bağlı risk politikası tanımlar: max_notional_per_order, "
+            "max_aggregate_exposure, allowed_symbols. Varsayılan tamamen boş/limitsiz. "
+            "Cap'ler KATI üst sınırdır — tolerans uygulanmaz, yuvarlama sonrası nihai değer `<= cap` olmalıdır."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "account_id": {"type": "string", "minLength": 1},
+                "max_notional_per_order": {"type": "number", "exclusiveMinimum": 0},
+                "max_aggregate_exposure": {"type": "number", "exclusiveMinimum": 0},
+                "allowed_symbols": {"type": "array", "items": {"type": "string", "minLength": 1}},
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["account_id"],
+            "additionalProperties": False,
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="override_risk_policy",
+        description=(
+            "Tek kullanımlık, atomik risk politikası istisnası (scope='next_order'). "
+            "Yalnızca kullanıcı-tanımlı cap'leri bir emir için aşmaya izin verir; temel doğruluk "
+            "kontrollerini asla atlamaz. reason zorunludur, audit_log'a yazılır. "
+            "Aynı idempotency_key ile retry aynı override'a bağlanır, ikincil üretmez."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "account_id": {"type": "string", "minLength": 1},
+                "scope": {"type": "string", "enum": ["next_order"], "default": "next_order"},
+                "reason": {"type": "string", "minLength": 1},
+                "idempotency_key": {"type": "string", "minLength": 1},
+                "expires_at": {"type": "integer", "description": "unix zaman damgası (sn)"},
+                "request_id": {"type": "string"},
+            },
+            "required": ["account_id", "reason"],
+            "additionalProperties": False,
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="get_risk_policy",
+        description="Hesabın mevcut risk politikasını döner (configüre edilmemişse boş/limitsiz varsayılan).",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "account_id": {"type": "string", "minLength": 1},
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["account_id"],
+            "additionalProperties": False,
+        },
+    )
+)
+
+# ---------- Modül 3 / 3.3: doğruluk kontrolleri + position sizing ----------
+
+register_tool(
+    ToolSpec(
+        name="get_symbol_info",
+        description=(
+            "Binance exchangeInfo filtrelerini döner: LOT_SIZE (step_size/min_qty/max_qty), "
+            "MIN_NOTIONAL, PRICE_FILTER (tick_size/min_price/max_price) + sembol durumu. "
+            "meta.freshness exchangeInfo'nun güncelliğini gösterir."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string", "description": "Spot USDT çifti, örn. BTCUSDT"},
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["symbol"],
+            "additionalProperties": False,
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="calculate_position_size",
+        description=(
+            "Risk-bazlı pozisyon boyutu hesaplar (base asset): account_balance * risk_pct risk tutarı, "
+            "|entry - stop| risk-per-unit'e bölünür; fee düşülür; LOT_SIZE/MIN_NOTIONAL/PRICE_FILTER'e göre "
+            "aşağı yuvarlanır. Borsa filtreleri karşılanamıyorsa FILTER_VIOLATION döner (fail-closed). "
+            "Temel doğruluk kontrolleri her zaman aktiftir: stale fiyat / yanlış stop yönü / bilinmeyen "
+            "sembol / yetersiz bakiye reddedilir."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string", "description": "Spot USDT çifti, örn. BTCUSDT"},
+                "account_balance": {"type": "number", "exclusiveMinimum": 0, "description": "Kotasyon (USDT) bakiyesi"},
+                "risk_pct": {"type": "number", "exclusiveMinimum": 0, "maximum": 1, "description": "Hesap equity yüzdesi (0.02 = %2)"},
+                "entry": {"type": "number", "exclusiveMinimum": 0},
+                "stop_loss": {"type": "number", "exclusiveMinimum": 0},
+                "side": {"type": "string", "enum": ["BUY", "SELL"], "default": "BUY"},
+                "fee_rate": {"type": "number", "minimum": 0, "default": 0.001, "description": "Komisyon oranı"},
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["symbol", "account_balance", "risk_pct", "entry", "stop_loss"],
+            "additionalProperties": False,
+        },
+    )
+)
+
+# ---------- Modül 3 / 3.4: emir yürütme ----------
+
+register_tool(
+    ToolSpec(
+        name="execute_on_accounts",
+        description=(
+            "Birden çok hesapta pozisyon açar. account_ids + tags birlikte verilirse UNION'dur; "
+            "ikisi de boşsa reddedilir. Emir boyutu daemon'ın kendi taze bakiye/equity/fiyat "
+            "snapshot'ından hesaplanır (agent rakamlarına güvenilmez). Idempotency: aynı "
+            "idempotency_key retry'i çift emir üretmez. Kısmi başarı: hesap başına ayrı sonuç döner. "
+            "Temel doğruluk kontrolleri (bakiye/stale/stop yönü/sembol) her zaman aktiftir."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "account_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "description": "Hedef account_id'ler (tags ile UNION)"},
+                "tags": {"type": "array", "items": {"type": "string", "minLength": 1}, "description": "Hedef tag'ler (account_ids ile UNION)"},
+                "symbol": {"type": "string", "description": "Spot USDT çifti, örn. BTCUSDT"},
+                "side": {"type": "string", "enum": ["BUY", "SELL"], "default": "BUY"},
+                "entry": {"type": "number", "exclusiveMinimum": 0},
+                "stop_loss": {"type": "number", "exclusiveMinimum": 0},
+                "risk_pct": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+                "order_type": {"type": "string", "enum": ["MARKET", "LIMIT"], "default": "MARKET"},
+                "idempotency_key": {"type": "string", "minLength": 1},
+                "request_id": {"type": "string"},
+            },
+            "required": ["symbol", "side", "entry", "stop_loss", "risk_pct", "idempotency_key"],
+            "additionalProperties": False,
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="place_order",
+        description=(
+            "Tek hesapta doğrudan emir gönderir (order_type: MARKET|LIMIT, miktar base asset). "
+            "Aynı idempotency_key ile retry çift emir üretmez; ağ zaman aşımında Binance'ten "
+            "gerçek durum reconcile edilir. Temel doğruluk kontrolleri her zaman aktiftir."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "account_id": {"type": "string", "minLength": 1},
+                "symbol": {"type": "string", "description": "Spot USDT çifti, örn. BTCUSDT"},
+                "side": {"type": "string", "enum": ["BUY", "SELL"]},
+                "order_type": {"type": "string", "enum": ["MARKET", "LIMIT"], "default": "MARKET"},
+                "quantity": {"type": "number", "exclusiveMinimum": 0, "description": "Base asset miktarı"},
+                "price": {"type": "number", "exclusiveMinimum": 0, "description": "LIMIT emir için zorunlu"},
+                "idempotency_key": {"type": "string", "minLength": 1},
+                "request_id": {"type": "string"},
+            },
+            "required": ["account_id", "symbol", "side", "quantity", "idempotency_key"],
+            "additionalProperties": False,
+        },
+    )
+)
+
+# ---------- Modül 3 / 3.5: kill switch + exposure + audit ----------
+
+register_tool(
+    ToolSpec(
+        name="close_all_positions",
+        description=(
+            "Hesabın (veya account_id='all' ise tüm hesapların) açık emirlerini iptal edip "
+            "base asset bakiyelerini market fiyatından satar. Kısmi başarıda hangi hesabın "
+            "kapandığı/kapanamadığı açıkça raporlanır; idempotenttir (tekrar çalıştırma çift "
+            "satış yapmaz)."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "account_id": {"type": "string", "description": "Hedef account_id veya 'all'"},
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["account_id"],
+            "additionalProperties": False,
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="disable_real_trading",
+        description=(
+            "Kill switch: hesabın (veya 'all') trading kilidini `real`'den `paper`'a çevirir; "
+            "yeni emirler gönderilmez. Audit log'a yazılır; zaten paper ise idempotent."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "account_id": {"type": "string", "description": "Hedef account_id veya 'all'"},
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["account_id"],
+            "additionalProperties": False,
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="get_total_exposure",
+        description=(
+            "Tüm hesapların toplam exposure'ını döner: sembol bazlı (açık emir notional + base "
+            "bakiye değeri, daemon'ın taze fiyatıyla) ve hesap bazlı özet."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="get_audit_log",
+        description=(
+            "Hash-chain doğrulamalı audit log sorgusu. verified=true ise zincir sağlam; "
+            "değilse broken kırık satırları içerir."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50},
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+    )
+)
+
 
 # ---------- Modül 2 / 2.4: PA tool'ları + annotation ----------
 

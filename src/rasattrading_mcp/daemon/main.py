@@ -40,6 +40,8 @@ class DaemonRunner:
         self.db = None  # 1.2'de doldurulur
         self.audit = None
         self.account_service = None
+        self.risk_service = None
+        self.order_service = None
         self.pipeline = None  # 1.4'te doldurulur
         self.http_site = None
         self.http_runner = None
@@ -99,6 +101,17 @@ class DaemonRunner:
             logger.info("migration uygulandı: %s", applied)
         self.audit = AuditLog(self.db)
         self.account_service = AccountService(self.db, secret_store=SecretStore(), audit=self.audit)
+        from ..storage.risk_policy import RiskPolicyService
+
+        self.risk_service = RiskPolicyService(self.db, audit=self.audit)
+        await self.risk_service.reconcile_overrides()
+        # Daemon çökmüşken çalışan emergency_stop log'unu audit_log'a mutabakat et (3.6)
+        from ..storage.emergency_log import EmergencyLog, reconcile_emergency_log
+
+        try:
+            await reconcile_emergency_log(self.db, self.audit, EmergencyLog(self.config.data_dir / "emergency_stop.log"))
+        except Exception:  # noqa: BLE001
+            logger.exception("emergency_stop log reconcile edilemedi")
         self.readiness.set_state("warming_up")
         self.lock_mgr.update_state(self.readiness.state)
 
@@ -123,6 +136,28 @@ class DaemonRunner:
         self.pa_engine = pa_engine
         self.alarm_service = alarm_service
 
+        # Emir broker'ı: pipeline bütçesini ve hesap credential'larını kullanır.
+        from ..data.order_broker import BinanceOrderBroker
+        from ..storage.orders import OrderService, PipelineMarketFeed
+
+        order_broker = None
+        order_service = None
+        if self.pipeline is not None and self.account_service is not None:
+            order_broker = BinanceOrderBroker(
+                self.config.rest_spot_base,
+                credentials=lambda account_id: self.account_service.get_credentials(account_id),
+                budget=self.pipeline.budget,
+            )
+            order_service = OrderService(
+                self.db,
+                accounts=self.account_service,
+                risk=self.risk_service,
+                broker=order_broker,
+                market=PipelineMarketFeed(self.pipeline),
+                audit=self.audit,
+            )
+            self.order_service = order_service
+
         ctx = {
             "config": self.config,
             "readiness": self.readiness,
@@ -132,6 +167,10 @@ class DaemonRunner:
             "audit": self.audit,
             "account_service": self.account_service,
             "accounts": self.account_service,
+            "risk_service": self.risk_service,
+            "risk_policy_service": self.risk_service,
+            "order_service": order_service,
+            "order_broker": order_broker,
             "pipeline": self.pipeline,
             "pa_engine": pa_engine,
             "alarm_service": alarm_service,
