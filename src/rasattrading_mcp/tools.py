@@ -313,6 +313,39 @@ register_tool(
 )
 
 
+register_tool(
+    ToolSpec(
+        name="scan_market",
+        description=(
+            "Sembol evrenini allowlisted filtre AST'si ile tarar (serbest SQL değil). "
+            "Filtre türleri: volume_change, price_change, structure_event, "
+            "liquidity_sweep_occurred, near_order_block, funding_rate, oi_change, "
+            "above_below_vwap; and/or düğümleriyle iç içe kullanılabilir. "
+            "Sonuç veri güncelliğini (freshness) ve stale sembolleri açıkça taşır."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "filters": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "Filtre AST'si, örn. [{\"type\": \"price_change\", \"min\": 3}]",
+                },
+                "combine": {"type": "string", "enum": ["AND", "OR"], "default": "AND"},
+                "sort_by": {"type": "string", "enum": ["symbol", "price_change", "volume_change"], "default": "symbol"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 250, "default": 50},
+                "cursor": {"type": "integer", "description": "Sayfalama imleci (next_cursor ile döner)"},
+                "timeframe": {"type": "string", "default": "1h"},
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["filters"],
+            "additionalProperties": False,
+        },
+    )
+)
+
+
 def describe_tools() -> list[dict[str, Any]]:
     return [
         {

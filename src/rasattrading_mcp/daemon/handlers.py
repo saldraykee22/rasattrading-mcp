@@ -232,6 +232,27 @@ async def clear_annotations_handler(params: dict, ctx: dict) -> tuple[dict, Meta
     )
 
 
+async def scan_market_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    from ..pa.screener import Screener
+
+    screener = ctx.get("screener")
+    if screener is None:
+        db = ctx.get("db")
+        if db is None:
+            raise RasatError(ErrorCode.NOT_IMPLEMENTED, "screener bu daemon'da başlatılmamış")
+        screener = Screener(db, engine=ctx.get("pa_engine"), pipeline=ctx.get("pipeline"))
+        ctx["screener"] = screener
+    data = await screener.scan(
+        params.get("filters"),
+        combine=params.get("combine", "AND"),
+        sort_by=params.get("sort_by", "symbol"),
+        limit=params.get("limit", 50),
+        cursor=params.get("cursor"),
+        timeframe=params.get("timeframe", "1h"),
+    )
+    return data, Meta(as_of=utc_iso(), source="pa-screener", freshness=data["freshness"])
+
+
 def build_dispatcher(ctx: dict) -> ToolDispatcher:
     from ..tools import REGISTRY
 
@@ -251,4 +272,5 @@ def build_dispatcher(ctx: dict) -> ToolDispatcher:
     dispatcher.register("annotate_chart", annotate_chart_handler)
     dispatcher.register("get_chart_annotations", get_chart_annotations_handler)
     dispatcher.register("clear_annotations", clear_annotations_handler)
+    dispatcher.register("scan_market", scan_market_handler)
     return dispatcher
