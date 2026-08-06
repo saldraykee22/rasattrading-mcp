@@ -450,6 +450,28 @@ register_tool(
 
 register_tool(
     ToolSpec(
+        name="get_account_balance",
+        description=(
+            "Hesabın tam bakiye görünümü: free (serbest), locked (açık emirlerde kilitli), "
+            "holdings_value (elde tutulan base asset'lerin güncel piyasa değeri) ve "
+            "total/equity (free + locked + holdings_value). Sadece serbest bakiyeyi değil, "
+            "hesabın gerçek toplam değerini döner — daemon'ın kendi taze bakiye/fiyat snapshot'ıyla."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "account_id": {"type": "string", "minLength": 1},
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["account_id"],
+            "additionalProperties": False,
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
         name="get_audit_log",
         description=(
             "Hash-chain doğrulamalı audit log sorgusu. verified=true ise zincir sağlam; "

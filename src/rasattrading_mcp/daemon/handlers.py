@@ -535,6 +535,12 @@ async def get_total_exposure_handler(params: dict, ctx: dict) -> tuple[dict, Met
     return data, Meta(as_of=utc_iso(), source="sqlite-orders", freshness=FRESHNESS_FRESH)
 
 
+async def get_account_balance_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    service = _require_order_service(ctx)
+    data = await service.get_account_balance(account_id=params.get("account_id"))
+    return data, Meta(as_of=utc_iso(), source="binance", freshness=FRESHNESS_FRESH)
+
+
 async def get_audit_log_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
     """Audit log sorgusu — tamamen DB-yerel, pipeline gerektirmez."""
     audit = ctx.get("audit")
@@ -571,6 +577,7 @@ def build_dispatcher(ctx: dict) -> ToolDispatcher:
     dispatcher.register("place_order", place_order_handler)
     dispatcher.register("close_all_positions", close_all_positions_handler)
     dispatcher.register("get_total_exposure", get_total_exposure_handler)
+    dispatcher.register("get_account_balance", get_account_balance_handler)
     dispatcher.register("get_audit_log", get_audit_log_handler)
     dispatcher.register("add_account", add_account_handler)
     dispatcher.register("list_accounts", list_accounts_handler)

@@ -85,6 +85,8 @@ class FakeOrderBroker:
       {client_order_id: OrderResult|None} verilirse onu döner, yoksa son
       `placed` kaydını döner (bulunamadı → None).
     - `balances` dict'i {account_id: {asset: free}} bakiye simülasyonu.
+    - `locked_balances` dict'i {account_id: {asset: locked}} açık emirlerde kilitli
+      miktarları simüle eder (3.21); `get_balance_detail` bunu free ile birleştirir.
     """
 
     def __init__(self, balances: dict[str, dict] | None = None) -> None:
@@ -92,6 +94,7 @@ class FakeOrderBroker:
         self.queries: list[dict] = []
         self.cancelled: list[dict] = []
         self.balances = balances or {}
+        self.locked_balances: dict[str, dict] = {}
         self.place_result: dict | None = None
         self.place_errors: dict[str, Exception] = {}
         self.place_errors_by_account: dict[str, Exception] = {}
@@ -187,3 +190,15 @@ class FakeOrderBroker:
 
     async def get_balance(self, *, account_id):
         return dict(self.balances.get(account_id, {"USDT": 10000.0}))
+
+    async def get_balance_detail(self, *, account_id):
+        free = dict(self.balances.get(account_id, {"USDT": 10000.0}))
+        locked = dict(self.locked_balances.get(account_id, {}))
+        assets = set(free) | set(locked)
+        return {
+            asset: {
+                "free": float(free.get(asset, 0) or 0),
+                "locked": float(locked.get(asset, 0) or 0),
+            }
+            for asset in assets
+        }

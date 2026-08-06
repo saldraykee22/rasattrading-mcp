@@ -191,6 +191,67 @@ class OrderService:
             held_value += free * price
         return open_notional + held_value
 
+    async def _equity_from_balances(self, balances: dict[str, float], quote_asset: str) -> float:
+        """Ortak equity hesabı (3.3 mantığı): serbest quote + base varlıkların piyasa değeri.
+
+        Sadece serbest (free) miktarlar kullanılır; açık emirlerde kilitli miktarlar
+        bakiye-kontrolü (3.8) için equity'ye dahil edilmez çünkü o kontrol "borsaya
+        gönderilebilir serbest miktar" üzerinden çalışır. Fiyatı bilinmeyen varlık
+        değer hesabına katılmaz.
+        """
+        equity = 0.0
+        for asset, free in balances.items():
+            if asset == quote_asset:
+                equity += free
+                continue
+            asset_price = await self.market.price(f"{asset}{quote_asset}")
+            if asset_price is not None:
+                equity += free * asset_price
+        return equity
+
+    async def _account_balance_breakdown(self, account_id: str, quote_asset: str) -> dict[str, Any]:
+        """Hesabın tam bakiye kırılımı (3.21): free / locked / holdings_value / total.
+
+        - `free` → serbest (boşta duran) quote asset miktarı.
+        - `locked` → açık emirlerde kilitli miktarların piyasa değeri (quote + base).
+        - `holdings_value` → elde tutulan base asset'lerin (free) güncel piyasa değeri.
+        - `total`/`equity` → free + locked + holdings_value (gerçek toplam hesap değeri).
+        - `assets` → varlık bazlı detay (free/locked/value).
+        """
+        detail = await self.broker.get_balance_detail(account_id=account_id)
+        free = 0.0
+        locked = 0.0
+        holdings_value = 0.0
+        assets: list[dict[str, Any]] = []
+        for asset, bal in detail.items():
+            free_qty = float(bal.get("free", 0) or 0)
+            locked_qty = float(bal.get("locked", 0) or 0)
+            if asset == quote_asset:
+                free += free_qty
+                locked += locked_qty
+                assets.append({"asset": asset, "free": free_qty, "locked": locked_qty, "value": free_qty})
+                continue
+            symbol = f"{asset}{quote_asset}"
+            price = await self.market.price(symbol)
+            if price is None:
+                # fiyatı bilinmeyen varlık değer hesabına katılmaz; miktarları yine de taşınır.
+                assets.append({"asset": asset, "free": free_qty, "locked": locked_qty, "value": None})
+                continue
+            holdings_value += free_qty * price
+            locked += locked_qty * price
+            assets.append({"asset": asset, "free": free_qty, "locked": locked_qty, "value": (free_qty + locked_qty) * price})
+        total = free + locked + holdings_value
+        return {
+            "account_id": account_id,
+            "quote_asset": quote_asset,
+            "free": free,
+            "locked": locked,
+            "holdings_value": holdings_value,
+            "total": total,
+            "equity": total,
+            "assets": assets,
+        }
+
     # ---------- emir kaydı ----------
 
     def _insert_order(
@@ -507,14 +568,7 @@ class OrderService:
 
         # 1) Daemon'ın kendi taze bakiye snapshot'ı + equity + exchange filtreleri
         balances = await self.broker.get_balance(account_id=account["account_id"])
-        equity = 0.0
-        for asset, free in balances.items():
-            if asset == quote_asset:
-                equity += free
-                continue
-            asset_price = await self.market.price(f"{asset}{quote_asset}")
-            if asset_price is not None:
-                equity += free * asset_price
+        equity = await self._equity_from_balances(balances, quote_asset)
 
         filters = await self.market.filters(symbol)
         if filters is None:
@@ -621,7 +675,7 @@ class OrderService:
         exposure_after = await self._current_exposure(account_id, "USDT") + notional
         await self._enforce_caps_or_override(account, policy, symbol, notional, exposure_after, idempotency_key)
 
-        equity = sum(float(v) for v in balances.values())
+        equity = await self._equity_from_balances(balances, "USDT")
         return await self._place_and_record(
             account, is_real, symbol, side, order_type, quantity, price, notional, market_price,
             idempotency_key, equity, actor,
@@ -1253,6 +1307,25 @@ class OrderService:
             "per_account": per_account,
             "account_count": len(accounts),
         }
+
+    async def get_account_balance(self, *, account_id: str) -> dict[str, Any]:
+        """Hesabın tam bakiye görünümü: free + locked + holdings değeri + toplam (3.21).
+
+        Sadece serbest bakiyeyi döndüren eski davranış, açık emirlerde kilitli
+        miktarları ve elde tutulan base asset'lerin değerini hesaba katmıyordu;
+        bu yüzden hesapta açık pozisyon/emir varsa toplam hesap değeri eksik
+        görünüyordu. Artık `free`/`locked`/`holdings_value`/`total` ayrı ayrı
+        döner; `total` = free + locked + holdings_value.
+        """
+        account_id = self._require_string(account_id, "account_id")
+        account = await self.accounts.get_account(account_id)
+        if not account["credentials_configured"]:
+            # Public/read-only hesapta Binance bakiye sorgusu yapılamaz.
+            raise RasatError(
+                ErrorCode.ACCOUNT_NO_CREDENTIALS,
+                "bakiye sorgusu için credential'lı (authenticated) hesap gerekli",
+            )
+        return await self._account_balance_breakdown(account_id, "USDT")
 
     async def get_audit_log(self, *, limit: int = 50) -> dict[str, Any]:
         """Hash-chain doğrulamalı audit log sorgusu (3.5)."""

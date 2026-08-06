@@ -164,6 +164,8 @@ async def test_signed_broker_signature_verifies_against_sent_query():
             assert balances["USDT"] == 123.45
             assert received["account_qs"].startswith("timestamp=")
             assert "recvWindow" in received["account_qs"]
+            detail = await broker.get_balance_detail(account_id="a1")
+            assert detail["USDT"] == {"free": 123.45, "locked": 0.0}
 
             result = await broker.place_order(
                 account_id="a1",
@@ -177,6 +179,73 @@ async def test_signed_broker_signature_verifies_against_sent_query():
             assert result.status == "FILLED"
             assert result.exchange_order_id == "12345"
             assert "symbol=BTCUSDT" in received["order_qs"]
+        finally:
+            await broker.close()
+
+
+async def test_broker_get_balance_detail_includes_locked():
+    """3.21: get_balance_detail free + locked'ı ayrı taşır; get_balance yalnızca free.
+
+    Kullanıcının gerçek hesap testinde açık emirlerde kilitli (locked) miktarlar
+    ve elde tutulan base asset değeri görünmüyordu — bakiye sorgusu locked'ı
+    atıyordu. Broker detayı artık her iki miktarı da döndürür.
+    """
+    import hashlib
+    import hmac
+
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+
+    from rasattrading_mcp.data.order_broker import BinanceOrderBroker
+
+    api_key = "TESTKEY0000000000000000000000000000"
+    api_secret = "TESTSECRET00000000000000000000000000"
+
+    def _verify(request) -> tuple[bool, dict]:
+        qs = request.query_string
+        params = dict(request.query)
+        signature = params.pop("signature", None)
+        if not signature:
+            return False, {"code": -1022}
+        signed_part = qs[: qs.index("&signature=")]
+        expected = hmac.new(api_secret.encode("utf-8"), signed_part.encode("utf-8"), hashlib.sha256).hexdigest()
+        if expected != signature:
+            return False, {"code": -1022}
+        return True, {"code": 200}
+
+    app = web.Application()
+
+    async def account_handler(request):
+        ok, body = _verify(request)
+        if not ok:
+            return web.json_response(body, status=400)
+        return web.json_response(
+            {
+                "balances": [
+                    {"asset": "USDT", "free": "100.0", "locked": "23.45"},
+                    {"asset": "BTC", "free": "0.5", "locked": "0.25"},
+                ],
+                "canTrade": True,
+            }
+        )
+
+    app.router.add_get("/api/v3/account", account_handler)
+
+    async with TestServer(app) as server:
+        async def creds(_aid):
+            return (api_key, api_secret)
+
+        broker = BinanceOrderBroker(
+            server.make_url("/").human_repr(),
+            credentials=creds,
+            budget=RateLimitBudget(6000),
+        )
+        try:
+            detail = await broker.get_balance_detail(account_id="a1")
+            assert detail["USDT"] == {"free": 100.0, "locked": 23.45}
+            assert detail["BTC"] == {"free": 0.5, "locked": 0.25}
+            free_only = await broker.get_balance(account_id="a1")
+            assert free_only == {"USDT": 100.0, "BTC": 0.5}
         finally:
             await broker.close()
 

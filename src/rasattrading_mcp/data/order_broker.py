@@ -85,6 +85,8 @@ class OrderBroker(Protocol):
 
     async def get_balance(self, *, account_id: str) -> dict[str, float]: ...
 
+    async def get_balance_detail(self, *, account_id: str) -> dict[str, dict[str, float]]: ...
+
 
 def to_client_order_id(idempotency_key: str) -> str:
     """idempotency_key'den güvenli, deterministic bir Binance clientOrderId üretir.
@@ -283,12 +285,18 @@ class BinanceOrderBroker:
         return len(data) if isinstance(data, list) else 0
 
     async def get_balance(self, *, account_id: str) -> dict[str, float]:
+        detail = await self.get_balance_detail(account_id=account_id)
+        return {asset: b["free"] for asset, b in detail.items() if b["free"]}
+
+    async def get_balance_detail(self, *, account_id: str) -> dict[str, dict[str, float]]:
+        """free + locked içeren tam bakiye; `locked` açık emirlerde kilitli (3.21)."""
         data = await self._request("GET", "/api/v3/account", account_id, {})
-        balances: dict[str, float] = {}
+        balances: dict[str, dict[str, float]] = {}
         for b in data.get("balances", []):
-            free = float(b.get("free", 0) or 0)
-            if free:
-                balances[str(b["asset"])] = free
+            balances[str(b["asset"])] = {
+                "free": float(b.get("free", 0) or 0),
+                "locked": float(b.get("locked", 0) or 0),
+            }
         return balances
 
     async def close(self) -> None:

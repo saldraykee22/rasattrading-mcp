@@ -685,3 +685,91 @@ async def test_execute_non_numeric_entry_invalid_request(ex_ctx):
             stop_loss=95, risk_pct=0.01, idempotency_key="bad-entry",
         )
     assert exc_info.value.code == ErrorCode.INVALID_REQUEST
+
+
+# ---------- 3.21: get_account_balance kilitli + holdings dahil ----------
+
+
+async def test_get_account_balance_includes_locked_and_holdings(ex_ctx):
+    # 3.21: açık emirde kilitli (locked) USDT/BTC + elde tutulan BTC değeri toplama
+    # dahil edilmeli; sadece serbest bakiyeyi döndüren eski davranış olmamalı.
+    ctx = ex_ctx
+    # 100 USDT serbest + 0.5 BTC serbest + 0.25 BTC kilitli (açık emir)
+    account_id = await _add_real_account(ctx, balance_usdt=100.0, base_holdings={"BTC": 0.5})
+    ctx["broker"].locked_balances[account_id] = {"BTC": 0.25}
+    service = ctx["service"]
+
+    result = await service.get_account_balance(account_id=account_id)
+
+    assert result["quote_asset"] == "USDT"
+    assert result["free"] == pytest.approx(100.0)  # serbest USDT
+    # kilitli: 0.25 BTC * 100 (market price BTCUSDT=100) = 25
+    assert result["locked"] == pytest.approx(25.0)
+    # holdings: 0.5 BTC serbest * 100 = 50
+    assert result["holdings_value"] == pytest.approx(50.0)
+    assert result["total"] == pytest.approx(100.0 + 25.0 + 50.0)
+    assert result["equity"] == result["total"]
+
+    by_asset = {a["asset"]: a for a in result["assets"]}
+    assert by_asset["USDT"] == {"asset": "USDT", "free": 100.0, "locked": 0.0, "value": 100.0}
+    assert by_asset["BTC"]["free"] == pytest.approx(0.5)
+    assert by_asset["BTC"]["locked"] == pytest.approx(0.25)
+
+
+async def test_get_account_balance_quote_locked_included(ex_ctx):
+    # 3.21: quote asset'te (USDT) kilitli miktar da locked'a girmeli.
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx, balance_usdt=1000.0)
+    ctx["broker"].locked_balances[account_id] = {"USDT": 200.0}
+    service = ctx["service"]
+
+    result = await service.get_account_balance(account_id=account_id)
+
+    assert result["free"] == pytest.approx(1000.0)
+    assert result["locked"] == pytest.approx(200.0)
+    assert result["holdings_value"] == pytest.approx(0.0)
+    assert result["total"] == pytest.approx(1200.0)
+
+
+async def test_get_account_balance_no_credentials_rejected(ex_ctx):
+    # 3.21: credential'sız (public/read-only) hesapta bakiye sorgulanamaz.
+    ctx = ex_ctx
+    account_id = await _add_paper_account(ctx, label="pub")
+    service = ctx["service"]
+    with pytest.raises(RasatError) as exc_info:
+        await service.get_account_balance(account_id=account_id)
+    assert exc_info.value.code == ErrorCode.ACCOUNT_NO_CREDENTIALS
+
+
+async def test_get_account_balance_missing_account_id(ex_ctx):
+    ctx = ex_ctx
+    service = ctx["service"]
+    with pytest.raises(RasatError) as exc_info:
+        await service.get_account_balance(account_id=None)
+    assert exc_info.value.code == ErrorCode.INVALID_REQUEST
+
+
+async def test_get_account_balance_dispatches_via_tool(ex_ctx):
+    # 3.21: get_account_balance tool registry + dispatcher üzerinden çağrılabilir.
+    from rasattrading_mcp.daemon.handlers import build_dispatcher
+    from rasattrading_mcp.daemon.readiness import Readiness
+
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx, balance_usdt=100.0, base_holdings={"BTC": 0.5})
+    ctx["broker"].locked_balances[account_id] = {"BTC": 0.25}
+
+    dispatcher_ctx = {
+        "order_service": ctx["service"],
+        "readiness": Readiness(),
+        "started_at": 0,
+        "pipeline": None,
+    }
+    dispatcher = build_dispatcher(dispatcher_ctx)
+    assert "get_account_balance" in set(dispatcher.names())
+
+    data, meta = await dispatcher.dispatch("get_account_balance", {"account_id": account_id}, dispatcher_ctx)
+    assert data["free"] == pytest.approx(100.0)
+    assert data["locked"] == pytest.approx(25.0)
+    assert data["holdings_value"] == pytest.approx(50.0)
+    assert data["total"] == pytest.approx(175.0)
+    assert meta.source == "binance"
