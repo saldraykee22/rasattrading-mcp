@@ -8,6 +8,11 @@ Daemon'a ihtiyaç duymadan:
 4. İdempotenttir: "tüm bakiyeyi sat" kapsamı çalıştırılmadan önce hangi
    sembol/miktarın satılacağı gösterilir ve onay istenir; headless senaryoda
    önceden verilmiş `yes` bayrağıyla çalışır.
+
+Fiyat kaynağı (ticket 3.7): script `daemon`/`data` pipeline'ına bağımlı olmadan
+imzasız Binance public `/api/v3/ticker/price` uç noktasını kendi kullanır
+(`PublicPriceSource`). Fiyat alınamazsa o asset `price_errors` içinde açıkça
+raporlanır — sessizce atlanmaz — ve hiçbir şey satılamadıysa `ok: True` dönülmez.
 """
 
 from __future__ import annotations
@@ -17,6 +22,8 @@ import logging
 import sys
 from pathlib import Path
 from typing import Any
+
+import aiohttp
 
 from .config import Config
 from .data.order_broker import OrderBroker
@@ -30,6 +37,64 @@ logger = logging.getLogger("rasattrading.emergency_stop")
 
 SELL_LOG_ACTION = "emergency_sell"
 CANCEL_LOG_ACTION = "emergency_cancel"
+
+
+class PublicPriceSource:
+    """Binance public `/api/v3/ticker/price` — imzasız, daemon/pipeline'dan bağımsız fiyat kaynağı.
+
+    `EmergencyStopRunner.market_price` arayüzünü karşılar (`price` + `filters`).
+    Fiyat alınamıyorsa `None` dönmez, `RasatError` fırlatır — böylece çağıran
+    (EmergencyStopRunner) asset'i `price_errors` içinde fail-loud raporlar.
+    `filters` bilinmiyor → `None` (acil satışta step/min_qty bilgisi yoksa
+    serbest bakiye olduğu gibi satılır).
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        session: aiohttp.ClientSession | None = None,
+        timeout_seconds: float = 20.0,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self._session = session
+        self._own_session = session is None
+        self._timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(timeout=self._timeout)
+        return self._session
+
+    async def price(self, symbol: str) -> float:
+        session = await self._get_session()
+        try:
+            async with session.get(
+                f"{self.base_url}/api/v3/ticker/price",
+                params={"symbol": symbol},
+                timeout=self._timeout,
+            ) as resp:
+                if resp.status == 400:
+                    raise RasatError(ErrorCode.INVALID_SYMBOL, f"fiyat kaynağı sembolü tanımıyor: {symbol}")
+                resp.raise_for_status()
+                data = await resp.json()
+        except RasatError:
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise RasatError(ErrorCode.INTERNAL_ERROR, f"fiyat kaynağına ulaşılamadı ({symbol}): {exc}") from exc
+        if not isinstance(data, dict) or "price" not in data:
+            raise RasatError(ErrorCode.INTERNAL_ERROR, f"fiyat kaynağı geçersiz yanıt ({symbol})")
+        try:
+            return float(data["price"])
+        except (TypeError, ValueError):
+            raise RasatError(ErrorCode.INTERNAL_ERROR, f"fiyat kaynağı geçersiz fiyat ({symbol})") from None
+
+    async def filters(self, symbol: str) -> SymbolFilters | None:
+        return None
+
+    async def close(self) -> None:
+        if self._own_session and self._session is not None and not self._session.closed:
+            await self._session.close()
 
 
 class EmergencyStopRunner:
@@ -122,6 +187,7 @@ class EmergencyStopRunner:
         # 2) Base asset bakiyelerini topla → satış planı
         balances = await self.broker.get_balance(account_id=account_id)
         plan: list[dict] = []
+        price_errors: list[dict] = []
         for asset, free in balances.items():
             if asset == self.quote_asset or free <= 0:
                 continue
@@ -130,8 +196,15 @@ class EmergencyStopRunner:
             qty = self._round_down(free, filters.step_size if filters else 0)
             if filters is not None and qty < filters.min_qty:
                 continue
-            price = await self._price(symbol, filters)
-            if price is None:
+            try:
+                price = await self._price(symbol, filters)
+            except RasatError as exc:
+                # Fail-loud (3.7): fiyat alınamayan asset sessizce atlanmaz,
+                # sonuç listesinde açıkça error olarak raporlanır.
+                price_errors.append(
+                    {"symbol": symbol, "asset": asset,
+                     "error": {"code": exc.code, "message": exc.message}}
+                )
                 continue
             plan.append({"symbol": symbol, "asset": asset, "quantity": qty, "price": price,
                          "notional": qty * price})
@@ -182,11 +255,13 @@ class EmergencyStopRunner:
             except RasatError as exc:
                 sold.append({**p, "status": "FAILED", "error": {"code": exc.code, "message": exc.message}})
 
+        sell_failed = any(s.get("status") == "FAILED" for s in sold)
         return {
             "account_id": account_id,
-            "ok": True,
+            "ok": not price_errors and not sell_failed,
             "cancelled_orders": cancelled,
             "sold": sold,
+            "price_errors": price_errors,
             "plan": plan if dry_run else None,
         }
 
@@ -195,10 +270,15 @@ class EmergencyStopRunner:
             return await self.market_price.filters(symbol)
         return None
 
-    async def _price(self, symbol: str, filters: SymbolFilters | None) -> float | None:
-        if self.market_price is not None and hasattr(self.market_price, "price"):
-            return await self.market_price.price(symbol)
-        return None
+    async def _price(self, symbol: str, filters: SymbolFilters | None) -> float:
+        if self.market_price is None:
+            raise RasatError(ErrorCode.INTERNAL_ERROR, f"fiyat kaynağı yok — satış planlanamıyor: {symbol}")
+        if not hasattr(self.market_price, "price"):
+            raise RasatError(ErrorCode.INTERNAL_ERROR, f"fiyat kaynağı geçersiz arayüz: {symbol}")
+        price = await self.market_price.price(symbol)
+        if price is None:
+            raise RasatError(ErrorCode.STALE_DATA, f"fiyat alınamadı: {symbol}")
+        return float(price)
 
     @staticmethod
     def _round_down(value: float, step: float) -> float:
@@ -219,7 +299,11 @@ async def run_emergency_stop(
     market_price: Any | None = None,
     config: Config | None = None,
 ) -> dict[str, Any]:
-    """Kendi DB/secret/log bağlamını kurar; daemon'a ihtiyaç duymaz."""
+    """Kendi DB/secret/log bağlamını kurar; daemon'a ihtiyaç duymaz.
+
+    `market_price` verilmezse (üretim yolu) bağımsız `PublicPriceSource` ile
+    Binance public `/api/v3/ticker/price` kullanılır (ticket 3.7).
+    """
     config = config or Config(data_dir=data_dir)
     from .data.binance_client import BinanceREST
     from .data.order_broker import BinanceOrderBroker
@@ -233,13 +317,14 @@ async def run_emergency_stop(
         await run_migrations(db)
         accounts = AccountService(db, secret_store=SecretStore())
         budget = RateLimitBudget(max_weight=config.rate_limit_max_weight, window_seconds=60)
-        rest = BinanceREST(config.rest_spot_base, budget)
         if broker is None:
             broker = BinanceOrderBroker(
                 config.rest_spot_base,
                 credentials=lambda account_id: accounts.get_credentials(account_id),
                 budget=budget,
             )
+        if market_price is None:
+            market_price = PublicPriceSource(config.rest_spot_base)
         log = EmergencyLog(config.data_dir / "emergency_stop.log")
         runner = EmergencyStopRunner(
             config, accounts, broker, log, market_price=market_price

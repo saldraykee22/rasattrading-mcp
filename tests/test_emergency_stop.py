@@ -3,7 +3,7 @@ import asyncio
 import pytest
 
 from rasattrading_mcp.config import Config
-from rasattrading_mcp.emergency_stop import EmergencyStopRunner
+from rasattrading_mcp.emergency_stop import EmergencyStopRunner, PublicPriceSource, run_emergency_stop
 from rasattrading_mcp.errors import ErrorCode, RasatError
 from rasattrading_mcp.position_sizing import SymbolFilters
 from rasattrading_mcp.storage.accounts import AccountService
@@ -74,6 +74,195 @@ async def _add_real_account(em_ctx, label="main", base_holdings=None, tags=None)
     balances.update(base_holdings or {})
     ctx["broker"].balances[created["account_id"]] = balances
     return created["account_id"]
+
+
+# ---------- PublicPriceSource (3.7: bağımsız fiyat kaynağı) ----------
+
+
+class _FakeResp:
+    def __init__(self, status=200, payload=None):
+        self.status = status
+        self._payload = payload
+        self.headers = {"x-mbx-used-weight-1m": "1", "Content-Type": "application/json"}
+
+    def raise_for_status(self):
+        if self.status >= 400:
+            import aiohttp
+            from types import SimpleNamespace
+
+            info = SimpleNamespace(real_url="http://fake", url="http://fake")
+            raise aiohttp.ClientResponseError(info, None, status=self.status, message=f"fake {self.status}")
+
+    async def json(self):
+        return self._payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeSession:
+    def __init__(self, handler):
+        self._handler = handler
+        self.calls = []
+        self.closed = False
+
+    def get(self, url, *, params=None, timeout=None):
+        params = dict(params or {})
+        self.calls.append((url, params))
+        return self._handler(url, params)
+
+
+async def test_public_price_source_makes_http_call():
+    seen = []
+
+    def handler(url, params):
+        seen.append((url, dict(params)))
+        return _FakeResp(200, {"symbol": "BTCUSDT", "price": "123.45"})
+
+    src = PublicPriceSource("https://api.binance.com", session=_FakeSession(handler))
+    try:
+        price = await src.price("BTCUSDT")
+    finally:
+        await src.close()
+    assert price == 123.45
+    assert seen and seen[0][0].endswith("/api/v3/ticker/price")
+    assert seen[0][1]["symbol"] == "BTCUSDT"
+
+
+async def test_public_price_source_network_error_maps_to_rasat():
+    def handler(url, params):
+        import aiohttp
+
+        raise aiohttp.ClientConnectionError("fiyat servisi çöktü")
+
+    src = PublicPriceSource("https://api.binance.com", session=_FakeSession(handler))
+    try:
+        with pytest.raises(RasatError) as exc_info:
+            await src.price("BTCUSDT")
+        assert exc_info.value.code == ErrorCode.INTERNAL_ERROR
+    finally:
+        await src.close()
+
+
+async def test_public_price_source_http_error_maps_to_rasat():
+    def handler(url, params):
+        return _FakeResp(500, {"code": -1121, "msg": "sunucu hatası"})
+
+    src = PublicPriceSource("https://api.binance.com", session=_FakeSession(handler))
+    try:
+        with pytest.raises(RasatError) as exc_info:
+            await src.price("BTCUSDT")
+        assert exc_info.value.code == ErrorCode.INTERNAL_ERROR
+    finally:
+        await src.close()
+
+
+async def test_public_price_source_unknown_symbol_maps_to_invalid_symbol():
+    def handler(url, params):
+        return _FakeResp(400, {"code": -1121, "msg": "Invalid symbol"})
+
+    src = PublicPriceSource("https://api.binance.com", session=_FakeSession(handler))
+    try:
+        with pytest.raises(RasatError) as exc_info:
+            await src.price("NOPEUSDT")
+        assert exc_info.value.code == ErrorCode.INVALID_SYMBOL
+    finally:
+        await src.close()
+
+
+class _FailingPriceSource:
+    async def price(self, symbol):
+        raise RasatError(ErrorCode.INTERNAL_ERROR, "fiyat servisi çöktü")
+
+    async def filters(self, symbol):
+        return None
+
+
+async def test_emergency_stop_price_failure_fails_loud(em_ctx):
+    ctx = em_ctx
+    account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0, "ETH": 2.0})
+    runner = EmergencyStopRunner(
+        Config(data_dir=ctx["data_dir"], pipeline_enabled=False),
+        ctx["accounts"], ctx["broker"], ctx["log"], market_price=_FailingPriceSource(),
+    )
+    result = await runner.run(account_ids=[account_id], yes=True)
+    # fiyat servisi çöktü → ok:True dönülmez (fail-loud, 3.7)
+    assert result["ok"] is False
+    detail = result["results"][0]
+    assert detail["ok"] is False
+    assert len(detail["price_errors"]) == 2
+    assert detail["sold"] == []
+    assert len(ctx["broker"].placed) == 0  # hiçbir şey satılmadı
+
+
+async def test_emergency_stop_price_failure_empty_plan_not_ok(em_ctx):
+    ctx = em_ctx
+    account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
+    runner = EmergencyStopRunner(
+        Config(data_dir=ctx["data_dir"], pipeline_enabled=False),
+        ctx["accounts"], ctx["broker"], ctx["log"], market_price=_FailingPriceSource(),
+    )
+    result = await runner.run(account_ids=[account_id], yes=True)
+    # plan boş + price hatası → ok:True dönmez
+    assert result["ok"] is False
+    assert result["results"][0]["ok"] is False
+    assert result["results"][0]["price_errors"]
+
+
+async def test_emergency_stop_nothing_to_sell_still_ok(em_ctx):
+    ctx = em_ctx
+    account_id = await _add_real_account(ctx, base_holdings={})  # sadece USDT
+    runner = ctx["runner"]
+    result = await runner.run(account_ids=[account_id], yes=True)
+    # satılacak gerçekten hiçbir şey yok → ok:True (fiyat hatası değil)
+    assert result["ok"] is True
+    detail = result["results"][0]
+    assert detail["ok"] is True
+    assert detail["sold"] == []
+    assert detail["price_errors"] == []
+
+
+async def test_run_emergency_stop_uses_public_price_source_by_default(tmp_path, monkeypatch):
+    from rasattrading_mcp import emergency_stop as es
+    from rasattrading_mcp.storage.accounts import AccountService
+    from rasattrading_mcp.storage.db import Database
+    from rasattrading_mcp.storage.migrations import run_migrations
+
+    created_flag = {}
+
+    class StubPriceSource:
+        def __init__(self, *args, **kwargs):
+            created_flag["created"] = True
+
+        async def price(self, symbol):
+            return 100.0
+
+        async def filters(self, symbol):
+            return None
+
+    monkeypatch.setattr(es, "PublicPriceSource", StubPriceSource)
+
+    cfg = Config(data_dir=tmp_path, pipeline_enabled=False)
+    db = Database(cfg.db_path)
+    await db.start()
+    await run_migrations(db)
+    accounts = AccountService(db, secret_store=SecretStore())
+    created = await accounts.add_account(label="main", api_key="AK", api_secret="AS")
+    await accounts.enable_real_trading(created["account_id"], actor="test")
+    await db.stop()
+
+    broker = FakeOrderBroker()
+    broker.balances[created["account_id"]] = {"USDT": 1000.0, "BTC": 1.0}
+    result = await run_emergency_stop(
+        data_dir=tmp_path, account_ids=[created["account_id"]], yes=True, broker=broker,
+        config=cfg,
+    )
+    assert created_flag.get("created") is True
+    assert result["ok"] is True
+    assert len(result["results"][0]["sold"]) == 1
 
 
 # ---------- emergency log ----------
