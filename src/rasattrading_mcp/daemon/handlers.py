@@ -46,7 +46,10 @@ async def readiness_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
 def _require_pipeline(ctx: dict):
     pipeline = ctx.get("pipeline")
     if pipeline is None:
-        raise RasatError(ErrorCode.NOT_IMPLEMENTED, "veri pipeline'ı bu daemon'da kapalı")
+        raise RasatError(
+            ErrorCode.PIPELINE_UNAVAILABLE,
+            "veri pipeline'ı bu daemon'da kapalı — bu tool canlı veri gerektiriyor",
+        )
     return pipeline
 
 
@@ -453,7 +456,10 @@ def _require_order_service(ctx: dict):
     pipeline = ctx.get("pipeline")
     broker = ctx.get("order_broker")
     if pipeline is None or broker is None:
-        raise RasatError(ErrorCode.NOT_IMPLEMENTED, "order servisi için pipeline ve broker gereklidir")
+        raise RasatError(
+            ErrorCode.PIPELINE_UNAVAILABLE,
+            "order servisi için pipeline ve broker gereklidir — bu daemon'da kapalı",
+        )
     from ..storage.orders import PipelineMarketFeed
 
     service = OrderService(
@@ -530,8 +536,21 @@ async def get_total_exposure_handler(params: dict, ctx: dict) -> tuple[dict, Met
 
 
 async def get_audit_log_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
-    service = _require_order_service(ctx)
-    data = await service.get_audit_log(limit=params.get("limit", 50))
+    """Audit log sorgusu — tamamen DB-yerel, pipeline gerektirmez."""
+    audit = ctx.get("audit")
+    if audit is None:
+        raise RasatError(ErrorCode.NOT_IMPLEMENTED, "audit log bu daemon'da başlatılmamış")
+    limit = params.get("limit", 50)
+    if not isinstance(limit, int) or limit < 1 or limit > 500:
+        raise RasatError(ErrorCode.INVALID_REQUEST, "limit 1-500 arası olmalı")
+    broken = await audit.verify()
+    tail = await audit.tail(limit)
+    data = {
+        "verified": len(broken) == 0,
+        "broken": broken,
+        "tail": tail,
+        "count": len(tail),
+    }
     return data, Meta(as_of=utc_iso(), source="sqlite-audit", freshness=FRESHNESS_FRESH)
 
 
@@ -541,16 +560,18 @@ def build_dispatcher(ctx: dict) -> ToolDispatcher:
     dispatcher = ToolDispatcher(REGISTRY)
     dispatcher.register("ping", ping_handler)
     dispatcher.register("get_readiness", readiness_handler)
-    if ctx.get("pipeline") is not None:
-        dispatcher.register("get_candles", candles_handler)
-        dispatcher.register("get_ticker", ticker_handler)
-        dispatcher.register("get_symbol_info", get_symbol_info_handler)
-        dispatcher.register("calculate_position_size", calculate_position_size_handler)
-        dispatcher.register("execute_on_accounts", execute_on_accounts_handler)
-        dispatcher.register("place_order", place_order_handler)
-        dispatcher.register("close_all_positions", close_all_positions_handler)
-        dispatcher.register("get_total_exposure", get_total_exposure_handler)
-        dispatcher.register("get_audit_log", get_audit_log_handler)
+    # TÜM tool'lar her zaman kayıtlıdır (adapter 32'sini de tanıtır).
+    # Pipeline'a gerçekten bağımlı olanlar çağrıldığında PIPELINE_UNAVAILABLE
+    # döner — TOOL_NOT_FOUND değil (tanıtım/tanım tutarlılığı).
+    dispatcher.register("get_candles", candles_handler)
+    dispatcher.register("get_ticker", ticker_handler)
+    dispatcher.register("get_symbol_info", get_symbol_info_handler)
+    dispatcher.register("calculate_position_size", calculate_position_size_handler)
+    dispatcher.register("execute_on_accounts", execute_on_accounts_handler)
+    dispatcher.register("place_order", place_order_handler)
+    dispatcher.register("close_all_positions", close_all_positions_handler)
+    dispatcher.register("get_total_exposure", get_total_exposure_handler)
+    dispatcher.register("get_audit_log", get_audit_log_handler)
     dispatcher.register("add_account", add_account_handler)
     dispatcher.register("list_accounts", list_accounts_handler)
     dispatcher.register("remove_account", remove_account_handler)
