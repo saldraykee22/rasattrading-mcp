@@ -16,7 +16,7 @@ import time
 
 from ..config import Config, TIMEFRAME_SECONDS
 from ..envelope import FRESHNESS_FRESH
-from .analysis import PAEngine
+from .analysis import PAEngine, PA_LOOKBACK
 
 logger = logging.getLogger("rasattrading.pa.worker")
 
@@ -74,7 +74,7 @@ class PAWorker:
     async def _process(self, symbol: str, tf: str) -> bool:
         async with self._sem:
             try:
-                candles = await self.engine._load_candles(symbol, tf, 200)
+                candles = await self.engine._load_candles(symbol, tf, PA_LOOKBACK)
             except Exception:  # noqa: BLE001
                 return False
             if not candles:

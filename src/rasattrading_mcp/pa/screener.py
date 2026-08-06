@@ -27,7 +27,7 @@ from typing import Any
 from ..envelope import FRESHNESS_FRESH, FRESHNESS_STALE
 from ..errors import ErrorCode, RasatError
 from ..storage.db import Database
-from .analysis import PAEngine, _read_current
+from .analysis import PAEngine, PA_LOOKBACK, _read_current
 from .liquidity import load_futures_series
 from .vwap_sessions import compute_vwap
 
@@ -175,10 +175,17 @@ def _eval_structure_event(f: dict, ctx: dict) -> bool:
     structure = ctx.get("structure")
     if not structure:
         return False
-    n = len(ctx["candles"])
+    candles = ctx["candles"]
     since = f["since_bars"]
+    cutoff = candles[max(0, len(candles) - since)]["open_time"]
     for ev in structure.get("events", []):
-        if ev["type"] == f["event"] and ev["index"] >= n - since:
+        if ev["type"] != f["event"]:
+            continue
+        t = ev.get("time")
+        if t is not None:
+            if t >= cutoff:
+                return True
+        elif ev["index"] >= len(candles) - since:
             return True
     return False
 
@@ -187,10 +194,17 @@ def _eval_liquidity_sweep(f: dict, ctx: dict) -> bool:
     zones = ctx.get("liquidity_zones")
     if not zones:
         return False
-    n = len(ctx["candles"])
+    candles = ctx["candles"]
     since = f["since_bars"]
+    cutoff = candles[max(0, len(candles) - since)]["open_time"]
     for z in zones:
-        if z.get("mitigated") and z.get("swept_at") is not None and z["swept_at"] >= n - since:
+        if not z.get("mitigated"):
+            continue
+        st = z.get("swept_at_time")
+        if st is not None:
+            if st >= cutoff:
+                return True
+        elif z.get("swept_at") is not None and z["swept_at"] >= len(candles) - since:
             return True
     return False
 
@@ -263,6 +277,71 @@ def _eval_node(node: dict, ctx: dict) -> bool:
     return FILTER_FNS[ftype](node, ctx)
 
 
+def _eval_with_matches(node: dict, ctx: dict) -> tuple[bool, list[dict]]:
+    """`_eval_node` + eşleşen yaprak filtreler (denetlenebilirlik için, 2.16).
+
+    `(bool, [eşleşen filtre düğümleri])` döner. AND düğümünde tüm alt filtreler
+    eşleşmişse eşleşenler birleştirilir; OR düğümünde yalnız eşleşen alt
+    filtreler toplanır.
+    """
+    ftype = node["type"]
+    if ftype == "and":
+        matched: list[dict] = []
+        for s in node["filters"]:
+            ok, m = _eval_with_matches(s, ctx)
+            if not ok:
+                return False, []
+            matched.extend(m)
+        return True, matched
+    if ftype == "or":
+        matched = []
+        for s in node["filters"]:
+            ok, m = _eval_with_matches(s, ctx)
+            if ok:
+                matched.extend(m)
+        return bool(matched), matched
+    if FILTER_FNS[ftype](node, ctx):
+        return True, [node]
+    return False, []
+
+
+def _signal_summary(f: dict, ctx: dict) -> str:
+    """Eşleşen bir filtre için kısa, insan-okunur sinyal özeti (2.16)."""
+    ftype = f["type"]
+    if ftype == "structure_event":
+        return f"{f['event']} since={f['since_bars']}"
+    if ftype == "liquidity_sweep_occurred":
+        return f"sweep since={f['since_bars']}"
+    if ftype == "near_order_block":
+        close = ctx["close"]
+        best: float | None = None
+        for ob in ctx.get("order_blocks") or []:
+            if ob.get("mitigated"):
+                continue
+            lo, hi = ob["range"]["low"], ob["range"]["high"]
+            dist = min(abs(close - lo), abs(close - hi)) / close * 100.0
+            if best is None or dist < best:
+                best = dist
+        d = f"{best:.2f}%" if best is not None else "?"
+        return f"near_ob {d} (max {f['max_distance_pct']}%)"
+    if ftype == "funding_rate":
+        fr = ctx.get("funding_rate")
+        v = fr.get("value") if fr else None
+        return f"funding={v!r}"
+    if ftype == "above_below_vwap":
+        vwap = ctx.get("vwap")
+        diff = (ctx["close"] / vwap - 1.0) * 100.0 if vwap else None
+        dd = f"{diff:+.2f}%" if diff is not None else "?"
+        return f"vwap {f['position']} ({dd})"
+    if ftype == "price_change":
+        return f"price {f['window_bars']}bar"
+    if ftype == "volume_change":
+        return f"volume {f['recent_bars']}/{f['baseline_bars']}bar"
+    if ftype == "oi_change":
+        return f"oi {f['window']}bar"
+    return ftype
+
+
 # ---------------------------------------------------------------------------
 # Screener servisi
 # ---------------------------------------------------------------------------
@@ -287,7 +366,10 @@ class Screener:
         return await self.db.read(_q)
 
     async def _build_context(self, symbol: str, timeframe: str, needs_analysis: bool, filter_types: list[str]) -> dict | None:
-        candles = await self.engine._read_candles(symbol, timeframe, 300)
+        # PA engine'in yapı/likidite payload'ıyla AYNI pencere (2.16 fix): event
+        # indeksleri bu pencereye göre üretilir; farklı mum sayısı event/sweep
+        # indekslerini hizasız bırakıp gerçek son olayları kaçırıyordu.
+        candles = await self.engine._read_candles(symbol, timeframe, PA_LOOKBACK)
         if not candles:
             return None
         from .swings import filter_closed_candles
@@ -327,6 +409,21 @@ class Screener:
         series = await load_futures_series(self.db, symbol, ftype, limit=1)
         return series[-1] if series else None
 
+    def _symbol_validity(self, symbol: str) -> bool | None:
+        """Evren doğrulanabilirse sembol geçerliliği (2.16): True/False, bilinmiyorsa None.
+
+        `data_stale` yalnızca PA tazeliğini ölçer; sembolün hâlâ işlem yapılabilir
+        olduğunu (evrende olup olmadığını) kapsamaz. Evren yüklüyse (`snapshot`
+        dolu) `universe.contains` ile doğrularız; evren henüz yüklenmemişse
+        (snapshot boş) filtreleme yapamayız — `None` döner, sembol aday kalır.
+        """
+        if self.pipeline is None or not hasattr(self.pipeline, "universe"):
+            return None
+        uni = self.pipeline.universe
+        if not uni.snapshot():
+            return None
+        return uni.contains(symbol)
+
     async def scan(
         self,
         filters: list | dict,
@@ -357,10 +454,14 @@ class Screener:
         matched: list[dict] = []
         any_stale = False
         for symbol in symbols:
+            valid = self._symbol_validity(symbol)
+            if valid is False:
+                # Delist edilmiş / evrende olmayan sembol — yanıltıcı eşleşme üretme (2.16).
+                continue
             ctx = await self._build_context(symbol, timeframe, needs_analysis, filter_types)
             if ctx is None:
                 continue
-            ok = _eval_node(root, ctx)
+            ok, matched_nodes = _eval_with_matches(root, ctx)
             if not ok:
                 continue
             stale = PAEngine.freshness_for(timeframe, ctx["as_of"]) != FRESHNESS_FRESH
@@ -369,7 +470,11 @@ class Screener:
                 {
                     "symbol": symbol,
                     "data_stale": stale,
+                    "symbol_valid": valid,
                     "price": ctx["close"],
+                    "as_of": ctx["as_of"],
+                    "matched_filters": [n["type"] for n in matched_nodes],
+                    "signal_summary": "; ".join(_signal_summary(n, ctx) for n in matched_nodes),
                     "sort_value": self._sort_value(sort_by, ctx),
                 }
             )
@@ -383,7 +488,18 @@ class Screener:
         next_cursor = (start + limit) if (start + limit) < total else None
 
         return {
-            "symbols": [{"symbol": r["symbol"], "data_stale": r["data_stale"], "price": r["price"]} for r in page],
+            "symbols": [
+                {
+                    "symbol": r["symbol"],
+                    "data_stale": r["data_stale"],
+                    "symbol_valid": r["symbol_valid"],
+                    "price": r["price"],
+                    "as_of": r["as_of"],
+                    "matched_filters": r["matched_filters"],
+                    "signal_summary": r["signal_summary"],
+                }
+                for r in page
+            ],
             "total_matched": total,
             "next_cursor": next_cursor,
             "combine": combine.upper(),

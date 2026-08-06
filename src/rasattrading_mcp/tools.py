@@ -524,7 +524,11 @@ register_tool(
             "likidite skoru. Varsayılan yalnızca aktif (mitigasyonsuz) bölgeleri döner; "
             "include_mitigated=true ile depolanan tarihçenin tamamı döner. Skorun equal_levels "
             "bileşeni aktif bölge sayısına göre puanlanır (mitigasyonlular puan getirmez); "
-            "funding bileşeni `bias: long_crowded|short_crowded` taşır."
+            "funding bileşeni `bias: long_crowded|short_crowded` taşır. "
+            "NOT: include_mitigated=true tarihçe, eski (2.15 öncesi) semantiğe göre "
+            "mitigated=false kalmış breaker kayıtlarını da içerebilir — bu beklenen "
+            "immutable-tarihçe davranışıdır, listedeki her bölge 'aktif' değildir; "
+            "aktif görünüm varsayılan çağrıdır."
         ),
         input_schema=_pa_schema({"include_mitigated": {"type": "boolean", "default": False}}),
     )
@@ -537,7 +541,10 @@ register_tool(
             "BOS/CHoCH sonrası order block'lar (order_block|breaker|mitigation_block) + FVG'ler. "
             "Varsayılan yalnızca aktif bölgeler; include_mitigated=true ile tam tarihçe. "
             "Breaker'lar kapanışla kırılmış OB olduğu için mitigated=true taşır; aynı/çok yakın "
-            "fiyat aralığındaki OB'ler tek mantıksal bölgede birleştirilir (2.15)."
+            "fiyat aralığındaki OB'ler tek mantıksal bölgede birleştirilir (2.15). "
+            "NOT: include_mitigated=true tarihçe, eski semantiğe göre mitigated=false kalmış "
+            "breaker kayıtlarını da içerebilir (immutable geçmişin üzerine yazılmaz) — "
+            "listedeki her bölge 'aktif' değildir; aktif görünüm varsayılan çağrıdır."
         ),
         input_schema=_pa_schema({"include_mitigated": {"type": "boolean", "default": False}}),
     )
@@ -629,7 +636,11 @@ register_tool(
             "Filtre türleri: volume_change, price_change, structure_event, "
             "liquidity_sweep_occurred, near_order_block, funding_rate, oi_change, "
             "above_below_vwap; and/or düğümleriyle iç içe kullanılabilir. "
-            "Sonuç veri güncelliğini (freshness) ve stale sembolleri açıkça taşır."
+            "Her satır `data_stale` (PA tazeliği) YANINDA `symbol_valid` (evrende "
+            "işlem yapılabilir mi — delist olmayan), `matched_filters` (hangi "
+            "filtre(ler) eşleşti) ve `signal_summary` (eşleşmeyi tetikleyen ham "
+            "değerler) taşır (2.16). `data_stale=false` tek başına sembolün "
+            "işlem yapılabilir olduğu anlamına gelmez; `symbol_valid` kontrol edin."
         ),
         input_schema={
             "type": "object",
