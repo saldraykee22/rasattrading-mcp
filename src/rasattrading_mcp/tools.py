@@ -522,7 +522,9 @@ register_tool(
         description=(
             "Equal highs/lows likidite bölgeleri + sweep/mitigasyon durumu + futures tabanlı "
             "likidite skoru. Varsayılan yalnızca aktif (mitigasyonsuz) bölgeleri döner; "
-            "include_mitigated=true ile depolanan tarihçenin tamamı döner."
+            "include_mitigated=true ile depolanan tarihçenin tamamı döner. Skorun equal_levels "
+            "bileşeni aktif bölge sayısına göre puanlanır (mitigasyonlular puan getirmez); "
+            "funding bileşeni `bias: long_crowded|short_crowded` taşır."
         ),
         input_schema=_pa_schema({"include_mitigated": {"type": "boolean", "default": False}}),
     )
@@ -533,7 +535,9 @@ register_tool(
         name="get_order_blocks",
         description=(
             "BOS/CHoCH sonrası order block'lar (order_block|breaker|mitigation_block) + FVG'ler. "
-            "Varsayılan yalnızca aktif bölgeler; include_mitigated=true ile tam tarihçe."
+            "Varsayılan yalnızca aktif bölgeler; include_mitigated=true ile tam tarihçe. "
+            "Breaker'lar kapanışla kırılmış OB olduğu için mitigated=true taşır; aynı/çok yakın "
+            "fiyat aralığındaki OB'ler tek mantıksal bölgede birleştirilir (2.15)."
         ),
         input_schema=_pa_schema({"include_mitigated": {"type": "boolean", "default": False}}),
     )

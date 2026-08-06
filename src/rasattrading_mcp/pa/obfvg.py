@@ -10,8 +10,15 @@ Kurallar (sürüm `obfvg-v1`):
   → `mitigated=true`, `zone_type=mitigation_block`.
 - **Breaker:** Fiyat bölgeyi tamamen aşar ve karşı kenardan kapanırsa
   (bullish OB: close < zone.low; bearish OB: close > zone.high)
-  → `zone_type=breaker` (öncelikli).
-- **FVG:** `candle[i].high < candle[i+2].low` → bullish; 
+  → `zone_type=breaker`. Breaker, kapanışla kırılmış (kullanılmış) OB'dir:
+  2.15 fix — artık geçerli bir aktif bölge değildir, bu yüzden
+  `mitigated=true` taşır (önceden `false` kalıp "aktif" sanılıyordu).
+- **Dedup (2.15):** Aynı/çok yakın fiyat aralığını kapsayan OB'ler tek
+  mantıksal bölge olarak birleştirilir. Birden çok BOS/CHoCH event'i aynı
+  mumu "son karşı renkli mum" olarak seçebilir; bu ayrı kayıtlar üretiyor ve
+  aktif sayısını şişiriyordu. İlk (en erken event) kayıt korunur — mitigasyon
+  taraması en eksiksiz olduğu için zone'un gerçek durumunu taşır.
+- **FVG:** `candle[i].high < candle[i+2].low` → bullish;
   `candle[i].low > candle[i+2].high` → bearish. Bölge = boşluk aralığı.
   Boşluk `< FVG_MIN_GAP_PCT` ise üretilmez. FVG'ye fiyat girişi → mitigated.
 """
@@ -20,7 +27,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .params import FVG_MIN_GAP_PCT, OBFVG_ALGO_VERSION
+from .params import FVG_MIN_GAP_PCT, OB_DEDUP_TOLERANCE_PCT, OBFVG_ALGO_VERSION
 
 
 def _last_opposite_candle(candles: list[dict], upto_index: int, want_red: bool) -> int | None:
@@ -43,8 +50,10 @@ def _mark_order_block(zone: dict, candles: list[dict]) -> None:
         c = candles[i]
         if direction == "bullish":
             if c["close"] < zone["range"]["low"]:
+                # Breaker: OB fiyatın karşı kenardan kapanışla kırıldığı bölge —
+                # artık geçerli değildir, mitigated=true (2.15 fix, önceden false).
                 zone["zone_type"] = "breaker"
-                zone["mitigated"] = False
+                zone["mitigated"] = True
                 return
             if not zone["mitigated"] and c["low"] <= zone["range"]["high"]:
                 zone["mitigated"] = True
@@ -52,7 +61,7 @@ def _mark_order_block(zone: dict, candles: list[dict]) -> None:
         else:
             if c["close"] > zone["range"]["high"]:
                 zone["zone_type"] = "breaker"
-                zone["mitigated"] = False
+                zone["mitigated"] = True
                 return
             if not zone["mitigated"] and c["high"] >= zone["range"]["low"]:
                 zone["mitigated"] = True
@@ -101,11 +110,39 @@ def _mark_fvg(zone: dict, candles: list[dict]) -> None:
                 return
 
 
+def _dedup_order_blocks(order_blocks: list[dict], tolerance_pct: float) -> list[dict]:
+    """Aynı/çok yakın fiyat aralığını kapsayan OB'leri tek mantıksal bölgede birleştirir.
+
+    Birden çok BOS/CHoCH event'i aynı mumu "son karşı renkli mum" olarak seçebilir;
+    bu, aynı fiyat aralığını kapsayan ayrı kayıtlar üretiyordu (2.15 fix — sayım
+    şişiyordu). Aralıklar tolerans içinde çakışıyorsa **ilk (en erken event) kayıt**
+    korunur: mitigasyon taraması en eksiksiz olduğu için zone'un gerçek durumunu
+    taşır; yinelenenler elenir.
+    """
+    kept: list[dict] = []
+    for ob in order_blocks:
+        lo, hi = ob["range"]["low"], ob["range"]["high"]
+        ref = (lo + hi) / 2.0
+        tol = ref * tolerance_pct / 100.0
+        dup = False
+        for k in kept:
+            if k["direction"] != ob["direction"]:
+                continue
+            klo, khi = k["range"]["low"], k["range"]["high"]
+            if not (hi + tol < klo or khi + tol < lo):
+                dup = True
+                break
+        if not dup:
+            kept.append(ob)
+    return kept
+
+
 def compute_order_blocks(
     candles: list[dict],
     structure: dict,
     algo_version: str = OBFVG_ALGO_VERSION,
     min_gap_pct: float = FVG_MIN_GAP_PCT,
+    dedup_tolerance_pct: float = OB_DEDUP_TOLERANCE_PCT,
 ) -> dict[str, Any]:
     """BOS/CHoCH olaylarından order block üretir + tüm FVG'leri hesaplar."""
     events = structure.get("events", [])
@@ -131,6 +168,8 @@ def compute_order_blocks(
         }
         _mark_order_block(zone, candles)
         order_blocks.append(zone)
+
+    order_blocks = _dedup_order_blocks(order_blocks, dedup_tolerance_pct)
 
     return {
         "algo_version": algo_version,

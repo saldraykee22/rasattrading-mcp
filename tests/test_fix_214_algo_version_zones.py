@@ -146,7 +146,11 @@ async def test_2_14_include_mitigated_list_has_documented_relationship(db):
 
 
 def test_2_14_score_equal_levels_mitigation_breakdown():
-    """Karma bölge setinde aktif/mitigasyonlu kırılımı doğru hesaplanır."""
+    """Karma bölge setinde aktif/mitigasyonlu kırılımı doğru hesaplanır.
+
+    2.15 fix: puan aktif bölge sayısına göre hesaplanır — mitigasyonlu bölgeler
+    "kullanılmış likidite" olarak puan getirmez (önceden tüm bölgeler sayılırdı).
+    """
     zones = [
         {"kind": "equal_highs", "mitigated": False},
         {"kind": "equal_highs", "mitigated": True},
@@ -159,8 +163,9 @@ def test_2_14_score_equal_levels_mitigation_breakdown():
     assert eq["zones"] == 4
     assert eq["active_zones"] == 2
     assert eq["mitigated_zones"] == 2
-    assert eq["points"] == 16.0  # 4/10 * 40
+    assert eq["points"] == 8.0  # 2 aktif / 10 * 40
     assert "2 aktif" in eq["note"]
+    assert "puan aktif bölge sayısına göre" in eq["note"]
 
 
 async def test_2_14_full_analysis_score_and_zones_together(db):

@@ -29,6 +29,14 @@ EQ_SWEEP = [
 
 FALLING = [(105 - i * 0.5, 105.5 - i * 0.5, 104.5 - i * 0.5, 105 - i * 0.5) for i in range(15)]
 
+# Tek BOS event'i → tek OB; fiyat bölgeye geri dönmez → aktif (mitigasyonsuz) OB.
+ACTIVE_OB = [
+    (100, 100.5, 99.5, 100), (100, 100.5, 99.5, 100), (99, 100, 98, 99.5),
+    (99.5, 100.5, 99, 100), (100, 102, 99.5, 101), (101, 101.5, 100.5, 101),
+    (101, 101.5, 100.5, 100.5), (100.5, 103, 101.1, 102.5), (102, 102.5, 101.6, 102),
+    (102, 102.5, 101.6, 102), (102.5, 103.5, 102, 103),
+]
+
 
 @pytest.fixture
 def cfg(tmp_path):
@@ -142,7 +150,10 @@ async def test_scan_structure_event(db):
 
 
 async def test_scan_near_order_block(db):
-    await seed_all(db)
+    # UPTREND (BTCUSDT) iki BOS event'i aynı mumu işaret ettiği için dedup sonrası
+    # tek ve mitigasyonlu OB üretiyor (2.15) — bu testte gerçek aktif OB kullanılır.
+    await seed(db, "BTCUSDT", ACTIVE_OB)
+    await seed(db, "ETHUSDT", EQ_SWEEP)
     screener = Screener(db)
     res = await screener.scan([{"type": "near_order_block", "max_distance_pct": 2.0}])
     syms = [s["symbol"] for s in res["symbols"]]

@@ -324,8 +324,17 @@ class PAEngine:
 
     @staticmethod
     def freshness_for(timeframe: str, as_of: int | None) -> str:
+        """PA snapshot'ının tazelik etiketi (2.15 fix — semantik netleşti).
+
+        `fresh`, analizin timeframe'in **son kapanmış mumunu** içerdiği anlamına
+        gelir: `as_of` (analizdeki son kapanmış mumun `open_time`'ı), wall-clock'ta
+        son kapanmış mumun `open_time`'ından (`latest_closed`) küçük değilse.
+        Gerçek zaman (ticker) ile aynı anlık snapshot değildir — bar bazlı analiz
+        doğası gereği en fazla bir period geride kalır. Bir period'tan daha eskiye
+        dayanan analiz (son kapanmış mum eksikken) `stale` olur.
+        """
         if as_of is None:
             return FRESHNESS_STALE
         period = TIMEFRAME_SECONDS[timeframe]
         latest_closed = int(time.time() // period) * period - period
-        return FRESHNESS_FRESH if as_of >= latest_closed - period else FRESHNESS_STALE
+        return FRESHNESS_FRESH if as_of >= latest_closed else FRESHNESS_STALE

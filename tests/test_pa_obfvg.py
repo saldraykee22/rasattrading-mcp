@@ -54,7 +54,9 @@ def test_order_block_after_bos():
     res = compute_order_blocks(mk(OBS), st)
     assert res["algo_version"] == OBFVG_ALGO_VERSION
     obs = res["order_blocks"]
-    assert len(obs) == 2
+    # 2 BOS event'i (7 ve 12) aynı mumu (candle 6) OB adayı seçti → aynı fiyat
+    # aralığı dedup ile tek mantıksal bölgeye iner (2.15), ilk (en erken) kayıt kalır.
+    assert len(obs) == 1
     ob = next(o for o in obs if o["event_index"] == 7)
     assert ob["direction"] == "bullish"
     assert ob["candle_index"] == 6
@@ -68,7 +70,8 @@ def test_order_block_becomes_breaker():
     res = compute_order_blocks(mk(BREAKER), st)
     ob = next(o for o in res["order_blocks"] if o["event_index"] == 7)
     assert ob["zone_type"] == "breaker"
-    assert ob["mitigated"] is False
+    # Breaker: kapanışla kırılmış OB → artık geçerli değil, mitigated=true (2.15)
+    assert ob["mitigated"] is True
 
 
 def test_fvg_detection_and_mitigation():

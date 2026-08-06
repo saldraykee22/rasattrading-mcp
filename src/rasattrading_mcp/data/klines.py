@@ -304,13 +304,18 @@ class KlineService:
     # ---------- helper ----------
 
     def freshness_for(self, symbol: str, tf: str, rows: list[dict]) -> str:
-        """Son barın güncelliğine göre freshness."""
+        """Son barın güncelliğine göre freshness (2.15: fazladan bir period toleransı yok).
+
+        `fresh`, DB'deki son mumun timeframe'in son kapanmış mumu olduğu anlamına
+        gelir (`last_open >= latest_closed`). Bir mum eksikse (son kapanmış mum
+        henüz saklanmadıysa) `stale` — fail-closed, eski veri taze sanılmaz.
+        """
         if not rows:
             return FRESHNESS_STALE
         period = TIMEFRAME_SECONDS[tf]
         last_open = rows[-1]["open_time"]
         expected = int(time.time() // period) * period - period
-        if last_open >= expected - period:
+        if last_open >= expected:
             return FRESHNESS_FRESH
         return FRESHNESS_STALE
 

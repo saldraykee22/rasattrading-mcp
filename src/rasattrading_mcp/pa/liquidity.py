@@ -123,7 +123,14 @@ def _norm_liquidation(count: float) -> float:
 
 
 def liquidity_score(zones: list[dict], futures: dict[str, Any] | None) -> dict[str, Any]:
-    """0-100 likidite skoru. Futures girdileri sadece `fresh` ise katkı verir."""
+    """0-100 likidite skoru. Futures girdileri sadece `fresh` ise katkı verir.
+
+    2.15 fix — `equal_levels` puanı aktif (mitigasyonsuz) bölge sayısına göre
+    hesaplanır; mitigasyonlu bölgeler "kullanılmış likidite" olarak puan getirmez
+    (10 bölgenin 7'si mitigasyonluysa tam puan verilmez). Funding bileşeni yön
+    bilgisi taşır: `bias: long_crowded|short_crowded` (+ skor üstünde
+    `funding_bias`).
+    """
     futures = futures or {}
     w = LIQUIDITY_WEIGHTS
 
@@ -139,10 +146,11 @@ def liquidity_score(zones: list[dict], futures: dict[str, Any] | None) -> dict[s
             "mitigated_zones": eq_mitigated,
             "note": (
                 f"analizde {eq_count} eşit-seviye bölge; {eq_active} aktif (mitigasyonsuz), "
-                f"{eq_mitigated} mitigasyonlu — varsayılan listede yalnızca aktifler görünür"
+                f"{eq_mitigated} mitigasyonlu — varsayılan listede yalnızca aktifler görünür; "
+                f"puan aktif bölge sayısına göre hesaplanır"
             ),
             "included": True,
-            "points": round(min(eq_count, 10) / 10.0 * w["equal_levels"], 1),
+            "points": round(min(eq_active, 10) / 10.0 * w["equal_levels"], 1),
         }
     }
 
@@ -163,16 +171,23 @@ def liquidity_score(zones: list[dict], futures: dict[str, Any] | None) -> dict[s
             continue
         value = item.get("value")
         points = round(weight * norm(value) if value is not None else 0.0, 1)
-        components[key] = {"status": "fresh", "value": value, "included": True, "points": points}
+        comp: dict[str, Any] = {"status": "fresh", "value": value, "included": True, "points": points}
+        if key == "funding_rate" and value is not None:
+            # Pozitif funding → long'lar ödüyor (crowded long); negatif → kısa kalabalığı.
+            comp["bias"] = "long_crowded" if value >= 0 else "short_crowded"
+        components[key] = comp
         futures_available = True
 
-    total = round(sum(c["points"] for c in components.values()), 1)
-    return {
-        "score": total,
+    funding = components.get("funding_rate") or {}
+    result: dict[str, Any] = {
+        "score": round(sum(c["points"] for c in components.values()), 1),
         "components": components,
         "futures_available": futures_available,
         "algo_version": LIQUIDITY_ALGO_VERSION,
     }
+    if funding.get("included") and "bias" in funding:
+        result["funding_bias"] = funding["bias"]
+    return result
 
 
 async def load_futures_context(db: Database, symbol: str) -> dict[str, dict]:

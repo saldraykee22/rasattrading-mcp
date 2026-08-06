@@ -45,6 +45,11 @@ LIQUIDITY_WEIGHTS = {
 # gürültü sayılır ve bölge üretilmez.
 FVG_MIN_GAP_PCT = 0.0
 
+# Order block dedup toleransı: aynı/çok yakın fiyat aralığını kapsayan OB'ler
+# tek mantıksal bölge olarak birleştirilir (2.15 fix — birden çok BOS/CHoCH
+# event'i aynı mumu OB adayı seçip ayrı kayıt üretiyordu).
+OB_DEDUP_TOLERANCE_PCT = 0.05
+
 # ---------------- 2.3 session ----------------
 
 # Killzone tanımları (UTC saat cinsinden, sabit). Fiyat seviyeleri günün

@@ -156,6 +156,12 @@ def _pa_meta(timeframe: str, as_of: int | None, algo_version: str | None) -> Met
         source="pa-engine",
         freshness=PAEngine.freshness_for(timeframe, as_of),
         algo_version=algo_version,
+        extra={
+            "freshness_note": (
+                "fresh = analiz, timeframe'in son kapanmış mumunu içerir (as_of, son "
+                "kapanmış mumun open_time'ıdır); ticker gibi gerçek zamanlı değil"
+            )
+        },
     )
 
 

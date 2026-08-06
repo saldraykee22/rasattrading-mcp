@@ -135,12 +135,14 @@ async def test_order_blocks_default_and_history(db):
     await seed_candles(db, "BTCUSDT", UPTREND)
     engine = PAEngine(db)
     data = await engine.get_order_blocks("BTCUSDT", TF)
-    active = [o for o in data["order_blocks"] if o["zone_type"] != "breaker"]
-    assert len(data["order_blocks"]) == 1  # sadece aktif olan
-    assert data["order_blocks"][0]["mitigated"] is False
+    # UPTREND'te 2 BOS event'i (7 ve 12) aynı mumu OB adayı seçer → aynı fiyat
+    # aralığı dedup ile tek mantıksal bölgeye iner (2.15); bu bölge de sweep
+    # edildiği için varsayılan (aktif) liste boş döner.
+    assert data["order_blocks"] == []
 
     full = await engine.get_order_blocks("BTCUSDT", TF, include_mitigated=True)
-    assert len(full["order_blocks"]) == 2  # tarihçede mitigate olan da görünür
+    assert len(full["order_blocks"]) == 1  # tek mantıksal bölge tarihçede görünür
+    assert full["order_blocks"][0]["mitigated"] is True
 
 
 async def test_get_full_analysis_reasonable_size(db):
