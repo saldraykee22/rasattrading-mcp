@@ -71,6 +71,14 @@ class OrderBroker(Protocol):
         client_order_id: str,
     ) -> OrderResult | None: ...
 
+    async def cancel_order(
+        self,
+        *,
+        account_id: str,
+        symbol: str,
+        client_order_id: str,
+    ) -> OrderResult | None: ...
+
     async def get_balance(self, *, account_id: str) -> dict[str, float]: ...
 
 
@@ -212,6 +220,21 @@ class BinanceOrderBroker:
         except RasatError as exc:
             # -2013 emir yok → None (yeniden gönderim güvenli)
             if exc.code == ErrorCode.ORDER_REJECTED and exc.details and exc.details.get("binance_code") == -2013:
+                return None
+            raise
+        return self._order_result(data)
+
+    async def cancel_order(self, *, account_id: str, symbol: str, client_order_id: str) -> OrderResult | None:
+        try:
+            data = await self._request(
+                "DELETE",
+                "/api/v3/order",
+                account_id,
+                {"symbol": symbol, "origClientOrderId": client_order_id},
+            )
+        except RasatError as exc:
+            # -2011 emir zaten iptal/dolmuş → None
+            if exc.code == ErrorCode.ORDER_REJECTED and exc.details and exc.details.get("binance_code") == -2011:
                 return None
             raise
         return self._order_result(data)

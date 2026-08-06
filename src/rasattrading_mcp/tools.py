@@ -386,6 +386,87 @@ register_tool(
     )
 )
 
+# ---------- Modül 3 / 3.5: kill switch + exposure + audit ----------
+
+register_tool(
+    ToolSpec(
+        name="close_all_positions",
+        description=(
+            "Hesabın (veya account_id='all' ise tüm hesapların) açık emirlerini iptal edip "
+            "base asset bakiyelerini market fiyatından satar. Kısmi başarıda hangi hesabın "
+            "kapandığı/kapanamadığı açıkça raporlanır; idempotenttir (tekrar çalıştırma çift "
+            "satış yapmaz)."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "account_id": {"type": "string", "description": "Hedef account_id veya 'all'"},
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["account_id"],
+            "additionalProperties": False,
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="disable_real_trading",
+        description=(
+            "Kill switch: hesabın (veya 'all') trading kilidini `real`'den `paper`'a çevirir; "
+            "yeni emirler gönderilmez. Audit log'a yazılır; zaten paper ise idempotent."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "account_id": {"type": "string", "description": "Hedef account_id veya 'all'"},
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["account_id"],
+            "additionalProperties": False,
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="get_total_exposure",
+        description=(
+            "Tüm hesapların toplam exposure'ını döner: sembol bazlı (açık emir notional + base "
+            "bakiye değeri, daemon'ın taze fiyatıyla) ve hesap bazlı özet."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="get_audit_log",
+        description=(
+            "Hash-chain doğrulamalı audit log sorgusu. verified=true ise zincir sağlam; "
+            "değilse broken kırık satırları içerir."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50},
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+    )
+)
+
 
 def describe_tools() -> list[dict[str, Any]]:
     return [

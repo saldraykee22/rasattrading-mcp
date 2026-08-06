@@ -157,5 +157,14 @@ class FakeOrderBroker:
             return None
         return OrderResult(status="FILLED", exchange_order_id="EX1", executed_qty=match[0]["quantity"])
 
+    async def cancel_order(self, *, account_id, symbol, client_order_id):
+        self.cancelled = getattr(self, "cancelled", [])
+        self.cancelled.append(
+            {"account_id": account_id, "symbol": symbol, "client_order_id": client_order_id}
+        )
+        from rasattrading_mcp.data.order_broker import OrderResult
+
+        return OrderResult(status="CANCELED", exchange_order_id=f"CX{len(self.cancelled)}")
+
     async def get_balance(self, *, account_id):
         return dict(self.balances.get(account_id, {"USDT": 10000.0}))

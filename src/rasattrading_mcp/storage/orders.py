@@ -784,3 +784,191 @@ class OrderService:
             {**existing, "status": found.status, "exchange_order_id": found.exchange_order_id,
              "executed_qty": found.executed_qty, "avg_price": found.avg_price}
         )
+
+    # ---------- kill switch: close_all_positions (3.5) ----------
+
+    async def close_all_positions(self, *, account_id: str, actor: str = "mcp-agent") -> dict[str, Any]:
+        """Açık emirleri iptal edip base asset bakiyelerini market fiyatından satar.
+
+        - `account_id == "all"` ise tüm hesaplar; değilse o hesap.
+        - Spot long-only: "pozisyon kapat" = elde tutulan base asset bakiyesini satmak.
+        - Kısmi başarı: her hesap ayrı sonuç; hangi hesabın kapandığı/kapanamadığı açıkça raporlanır.
+        - Idempotent: aynı (account, symbol) satışı tekrar çalıştırmada çift satış yapmaz.
+        """
+        if not isinstance(account_id, str) or not account_id.strip():
+            raise RasatError(ErrorCode.INVALID_REQUEST, "account_id zorunlu (string|'all')")
+        account_id = account_id.strip()
+
+        if account_id == "all":
+            accounts = (await self.accounts.list_accounts())["accounts"]
+        else:
+            accounts = [await self.accounts.get_account(account_id)]
+
+        results = []
+        for account in accounts:
+            lock = self._lock(account["account_id"])
+            async with lock:
+                try:
+                    result = await self._close_one(account, actor=actor or "mcp-agent")
+                    results.append(result)
+                except RasatError as exc:
+                    results.append(
+                        {
+                            "account_id": account["account_id"],
+                            "closed": False,
+                            "error": {"code": exc.code, "message": exc.message},
+                        }
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("pozisyon kapatma başarısız: %s", account["account_id"])
+                    results.append(
+                        {
+                            "account_id": account["account_id"],
+                            "closed": False,
+                            "error": {"code": ErrorCode.INTERNAL_ERROR, "message": str(exc)},
+                        }
+                    )
+
+        closed = sum(1 for r in results if r.get("closed"))
+        return {"results": results, "count": len(results), "closed": closed, "failed": len(results) - closed}
+
+    async def _close_one(self, account: dict, actor: str) -> dict:
+        from ..data.order_broker import to_client_order_id
+
+        account_id = account["account_id"]
+        is_real = await self._is_real(account)
+        cancelled: list[str] = []
+        sold: list[dict] = []
+
+        # 1) Açık emirleri iptal et
+        def _open_orders(conn: sqlite3.Connection) -> list[dict]:
+            return [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT " + ", ".join(_ORDER_COLUMNS)
+                    + " FROM orders WHERE account_id = ? AND status IN ('NEW', 'PARTIALLY_FILLED')",
+                    (account_id,),
+                ).fetchall()
+            ]
+
+        open_orders = await self.db.read(_open_orders)
+        for order in open_orders:
+            if is_real:
+                try:
+                    await self.broker.cancel_order(
+                        account_id=account_id,
+                        symbol=order["symbol"],
+                        client_order_id=order["client_order_id"],
+                    )
+                except RasatError:
+                    pass
+            cancelled.append(order["symbol"])
+
+            def _cancel(conn: sqlite3.Connection, oid: str = order["order_id"]) -> None:
+                self._update_order(conn, oid, status="CANCELED")
+
+            await self.db.write(_cancel)
+
+        # 2) Base asset bakiyelerini sat
+        if not is_real:
+            return {"account_id": account_id, "closed": False, "mode": "paper",
+                    "cancelled": cancelled, "sold": sold}
+
+        balances = await self.broker.get_balance(account_id=account_id)
+        quote_asset = "USDT"
+        for asset, free in balances.items():
+            if asset == quote_asset or free <= 0:
+                continue
+            symbol = f"{asset}{quote_asset}"
+            if not await self.market.symbol_valid(symbol):
+                continue
+            idem = f"close-{account_id}-{symbol}"
+            existing = await self.db.read(lambda conn: self._load_order(conn, account_id, idem))
+            if existing is not None:
+                sold.append({"symbol": symbol, "quantity": existing["quantity"],
+                             "status": existing["status"], "order_id": existing["order_id"]})
+                continue
+            price = await self.market.price(symbol)
+            if price is None:
+                sold.append({"symbol": symbol, "skipped": "stale price"})
+                continue
+            filters = await self.market.filters(symbol)
+            if filters is None:
+                sold.append({"symbol": symbol, "skipped": "no filters"})
+                continue
+            from ..position_sizing import round_down_to_step
+
+            qty = round_down_to_step(float(free), filters.step_size)
+            if qty < filters.min_qty:
+                sold.append({"symbol": symbol, "skipped": "below min_qty"})
+                continue
+            result = await self._place_and_record(
+                account, True, symbol, "SELL", "MARKET", qty, None, qty * price, price,
+                idem, 0.0, actor,
+            )
+            sold.append({"symbol": symbol, "quantity": result["quantity"],
+                         "status": result["status"], "order_id": result["order_id"]})
+
+        return {"account_id": account_id, "closed": True, "mode": "real",
+                "cancelled": cancelled, "sold": sold}
+
+    # ---------- exposure + audit (3.5) ----------
+
+    async def _exposure_by_symbol(self, account_id: str) -> dict[str, float]:
+        """Hesabın sembol bazlı exposure'ı: açık emir notional + base bakiye değeri."""
+
+        def _open(conn: sqlite3.Connection) -> dict[str, float]:
+            rows = conn.execute(
+                "SELECT symbol, SUM(notional) AS n FROM orders "
+                "WHERE account_id = ? AND status IN ('NEW', 'PARTIALLY_FILLED') GROUP BY symbol",
+                (account_id,),
+            ).fetchall()
+            return {str(r["symbol"]): float(r["n"]) for r in rows}
+
+        by_symbol = await self.db.read(_open)
+        balances = await self.broker.get_balance(account_id=account_id)
+        for asset, free in balances.items():
+            if asset == "USDT":
+                continue
+            symbol = f"{asset}USDT"
+            price = await self.market.price(symbol)
+            if price is None:
+                continue
+            by_symbol[symbol] = by_symbol.get(symbol, 0.0) + free * price
+        return by_symbol
+
+    async def get_total_exposure(self) -> dict[str, Any]:
+        """Tüm hesapların toplam exposure'ı: sembol bazlı risk görünümü."""
+        accounts = (await self.accounts.list_accounts())["accounts"]
+        by_symbol: dict[str, float] = {}
+        per_account: dict[str, float] = {}
+        for account in accounts:
+            try:
+                per = await self._exposure_by_symbol(account["account_id"])
+            except Exception:  # noqa: BLE001
+                continue
+            per_account[account["account_id"]] = sum(per.values())
+            for symbol, value in per.items():
+                by_symbol[symbol] = by_symbol.get(symbol, 0.0) + value
+        ordered = dict(sorted(by_symbol.items(), key=lambda kv: -kv[1]))
+        return {
+            "total": sum(by_symbol.values()),
+            "by_symbol": ordered,
+            "per_account": per_account,
+            "account_count": len(accounts),
+        }
+
+    async def get_audit_log(self, *, limit: int = 50) -> dict[str, Any]:
+        """Hash-chain doğrulamalı audit log sorgusu (3.5)."""
+        if self.audit is None:
+            raise RasatError(ErrorCode.NOT_IMPLEMENTED, "audit log bu bağlamda yok")
+        if not isinstance(limit, int) or limit < 1 or limit > 500:
+            raise RasatError(ErrorCode.INVALID_REQUEST, "limit 1-500 arası olmalı")
+        broken = await self.audit.verify()
+        tail = await self.audit.tail(limit)
+        return {
+            "verified": len(broken) == 0,
+            "broken": broken,
+            "tail": tail,
+            "count": len(tail),
+        }

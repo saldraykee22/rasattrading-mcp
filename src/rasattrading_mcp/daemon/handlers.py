@@ -312,6 +312,41 @@ async def place_order_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
     return data, Meta(as_of=utc_iso(), source="sqlite-orders", freshness=FRESHNESS_FRESH)
 
 
+async def close_all_positions_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    service = _require_order_service(ctx)
+    data = await service.close_all_positions(
+        account_id=params.get("account_id"),
+        actor=str(ctx.get("actor", "mcp-agent")),
+    )
+    return data, Meta(as_of=utc_iso(), source="sqlite-orders", freshness=FRESHNESS_FRESH)
+
+
+async def disable_real_trading_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    account_id = params.get("account_id")
+    service = _require_account_service(ctx)
+    if account_id == "all":
+        accounts = await service.list_accounts()
+        results = []
+        for account in accounts["accounts"]:
+            results.append(await service.disable_real_trading(account["account_id"], actor=str(ctx.get("actor", "mcp-agent"))))
+        data = {"results": results, "count": len(results)}
+    else:
+        data = await service.disable_real_trading(account_id, actor=str(ctx.get("actor", "mcp-agent")))
+    return data, Meta(as_of=utc_iso(), source="sqlite-accounts", freshness=FRESHNESS_FRESH)
+
+
+async def get_total_exposure_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    service = _require_order_service(ctx)
+    data = await service.get_total_exposure()
+    return data, Meta(as_of=utc_iso(), source="sqlite-orders", freshness=FRESHNESS_FRESH)
+
+
+async def get_audit_log_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    service = _require_order_service(ctx)
+    data = await service.get_audit_log(limit=params.get("limit", 50))
+    return data, Meta(as_of=utc_iso(), source="sqlite-audit", freshness=FRESHNESS_FRESH)
+
+
 def build_dispatcher(ctx: dict) -> ToolDispatcher:
     from ..tools import REGISTRY
 
@@ -325,10 +360,14 @@ def build_dispatcher(ctx: dict) -> ToolDispatcher:
         dispatcher.register("calculate_position_size", calculate_position_size_handler)
         dispatcher.register("execute_on_accounts", execute_on_accounts_handler)
         dispatcher.register("place_order", place_order_handler)
+        dispatcher.register("close_all_positions", close_all_positions_handler)
+        dispatcher.register("get_total_exposure", get_total_exposure_handler)
+        dispatcher.register("get_audit_log", get_audit_log_handler)
     dispatcher.register("add_account", add_account_handler)
     dispatcher.register("list_accounts", list_accounts_handler)
     dispatcher.register("remove_account", remove_account_handler)
     dispatcher.register("enable_real_trading", enable_real_trading_handler)
+    dispatcher.register("disable_real_trading", disable_real_trading_handler)
     dispatcher.register("set_risk_policy", set_risk_policy_handler)
     dispatcher.register("override_risk_policy", override_risk_policy_handler)
     dispatcher.register("get_risk_policy", get_risk_policy_handler)

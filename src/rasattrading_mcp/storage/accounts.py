@@ -302,6 +302,46 @@ class AccountService:
 
         return await self.db.write(_flip)
 
+    async def disable_real_trading(self, account_id: Any, *, actor: str = "mcp-agent") -> dict[str, Any]:
+        """Kill switch: real hesabı `paper`'a çevirir (3.5).
+
+        `enable_real_trading`'in tersi; audit_log'a yazılır. Zaten paper ise
+        idempotent davranır.
+        """
+        if not isinstance(account_id, str) or not account_id.strip():
+            raise RasatError(ErrorCode.INVALID_REQUEST, "account_id zorunlu (string)")
+        account_id = account_id.strip()
+
+        def _flip(conn: sqlite3.Connection) -> dict[str, Any]:
+            row = conn.execute(
+                "SELECT " + ", ".join(_ACCOUNT_FIELDS) + " FROM accounts WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+            if row is None:
+                raise RasatError(ErrorCode.ACCOUNT_NOT_FOUND, f"account bulunamadı: {account_id}")
+            already_paper = str(row["trading_lock"]) != "real"
+            if not already_paper:
+                now = int(time.time())
+                conn.execute(
+                    "UPDATE accounts SET trading_lock = 'paper', updated_at = ? WHERE account_id = ?",
+                    (now, account_id),
+                )
+                if self.audit is not None:
+                    self.audit.append_in_connection(
+                        conn,
+                        actor=actor or "mcp-agent",
+                        action="disable_real_trading",
+                        details={"account_id": account_id, "trading_lock": "paper"},
+                    )
+            return {
+                "account_id": account_id,
+                "trading_lock": "paper",
+                "already_paper": already_paper,
+                "mode": "authenticated",
+            }
+
+        return await self.db.write(_flip)
+
     async def get_account(self, account_id: str) -> dict[str, Any]:
         """Internal account lookup used by execution tickets; no secrets returned."""
 
