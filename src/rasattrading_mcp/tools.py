@@ -189,6 +189,130 @@ register_tool(
 )
 
 
+# ---------- Modül 2 / 2.4: PA tool'ları + annotation ----------
+
+
+def _pa_schema(extra: dict) -> dict:
+    base = {
+        "symbol": {"type": "string", "description": "Spot USDT çifti, örn. BTCUSDT"},
+        "timeframe": {"type": "string", "description": "1m,3m,5m,15m,30m,1h,2h,4h,6h,8h,12h,1d,3d,1w,1M"},
+        "lookback": {"type": "integer", "minimum": 20, "maximum": 1000, "default": 200},
+        "request_id": {"type": "string"},
+        "idempotency_key": {"type": "string"},
+    }
+    base.update(extra)
+    return {"type": "object", "properties": base, "required": ["symbol", "timeframe"], "additionalProperties": False}
+
+
+register_tool(
+    ToolSpec(
+        name="get_market_structure",
+        description=(
+            "Swing High/Low + BOS/CHoCH yapısı: trend, swing'ler (HH/LH/HL/LL) ve yapı kırılım "
+            "olayları. meta.algo_version algoritma sürümünü taşır."
+        ),
+        input_schema=_pa_schema({}),
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="get_liquidity_zones",
+        description=(
+            "Equal highs/lows likidite bölgeleri + sweep/mitigasyon durumu + futures tabanlı "
+            "likidite skoru. Varsayılan yalnızca aktif (mitigasyonsuz) bölgeleri döner; "
+            "include_mitigated=true ile depolanan tarihçenin tamamı döner."
+        ),
+        input_schema=_pa_schema({"include_mitigated": {"type": "boolean", "default": False}}),
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="get_order_blocks",
+        description=(
+            "BOS/CHoCH sonrası order block'lar (order_block|breaker|mitigation_block) + FVG'ler. "
+            "Varsayılan yalnızca aktif bölgeler; include_mitigated=true ile tam tarihçe."
+        ),
+        input_schema=_pa_schema({"include_mitigated": {"type": "boolean", "default": False}}),
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="get_full_analysis",
+        description=(
+            "Tek çağrıda tüm PA özeti: yapı + likidite + order block/FVG + VWAP + session "
+            "seviyeleri. Context şişmesin diye vwap noktaları sınırlıdır."
+        ),
+        input_schema=_pa_schema({"include_mitigated": {"type": "boolean", "default": False}}),
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="annotate_chart",
+        description=(
+            "Sembol+timeframe'e agent işaretlemesi ekler (örn. {level, label, kind}). "
+            "Hesaplamaya etkisi yoktur, kalıcı kaydedilir."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "timeframe": {"type": "string"},
+                "annotations": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "İşaretleme listesi (tek nesne de kabul edilir)",
+                },
+                "created_by": {"type": "string", "default": "agent"},
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["symbol", "timeframe", "annotations"],
+            "additionalProperties": False,
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="get_chart_annotations",
+        description="Sembol+timeframe'in kayıtlı işaretlemelerini döner.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "timeframe": {"type": "string"},
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["symbol", "timeframe"],
+            "additionalProperties": False,
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="clear_annotations",
+        description="Sembol+timeframe'in tüm işaretlemelerini siler; silinen sayıyı döner.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "timeframe": {"type": "string"},
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["symbol", "timeframe"],
+            "additionalProperties": False,
+        },
+    )
+)
+
+
 def describe_tools() -> list[dict[str, Any]]:
     return [
         {

@@ -128,6 +128,110 @@ async def remove_account_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
     return data, Meta(as_of=utc_iso(), source="sqlite-accounts", freshness=FRESHNESS_FRESH)
 
 
+# ---------- Modül 2: PA tool handler'ları ----------
+
+
+def _require_pa_engine(ctx: dict):
+    engine = ctx.get("pa_engine")
+    if engine is not None:
+        return engine
+    from ..pa.analysis import PAEngine
+
+    db = ctx.get("db")
+    if db is None:
+        raise RasatError(ErrorCode.NOT_IMPLEMENTED, "PA motoru bu daemon'da başlatılmamış")
+    engine = PAEngine(db, pipeline=ctx.get("pipeline"))
+    ctx["pa_engine"] = engine
+    return engine
+
+
+def _pa_meta(timeframe: str, as_of: int | None) -> Meta:
+    from ..pa.analysis import PAEngine
+
+    return Meta(
+        as_of=utc_iso(as_of) if as_of else utc_iso(),
+        source="pa-engine",
+        freshness=PAEngine.freshness_for(timeframe, as_of),
+        algo_version=None,
+    )
+
+
+async def get_market_structure_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    engine = _require_pa_engine(ctx)
+    symbol = params["symbol"]
+    timeframe = params["timeframe"]
+    lookback = params.get("lookback", 200)
+    data = await engine.get_market_structure(symbol, timeframe, lookback)
+    return data, _pa_meta(timeframe, data["as_of"])
+
+
+async def get_liquidity_zones_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    engine = _require_pa_engine(ctx)
+    data = await engine.get_liquidity_zones(
+        params["symbol"], params["timeframe"], params.get("include_mitigated", False), params.get("lookback", 200)
+    )
+    return data, _pa_meta(params["timeframe"], data["as_of"])
+
+
+async def get_order_blocks_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    engine = _require_pa_engine(ctx)
+    data = await engine.get_order_blocks(
+        params["symbol"], params["timeframe"], params.get("include_mitigated", False), params.get("lookback", 200)
+    )
+    return data, _pa_meta(params["timeframe"], data["as_of"])
+
+
+async def get_full_analysis_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    engine = _require_pa_engine(ctx)
+    data = await engine.get_full_analysis(
+        params["symbol"], params["timeframe"], params.get("include_mitigated", False), params.get("lookback", 200)
+    )
+    return data, _pa_meta(params["timeframe"], data["as_of"])
+
+
+def _require_annotations(ctx: dict):
+    svc = ctx.get("annotations")
+    if svc is not None:
+        return svc
+    from ..pa.annotations import AnnotationService
+
+    db = ctx.get("db")
+    if db is None:
+        raise RasatError(ErrorCode.NOT_IMPLEMENTED, "annotation servisi bu daemon'da başlatılmamış")
+    svc = AnnotationService(db)
+    ctx["annotations"] = svc
+    return svc
+
+
+async def annotate_chart_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    svc = _require_annotations(ctx)
+    ids = await svc.annotate(
+        params["symbol"],
+        params["timeframe"],
+        params["annotations"],
+        created_by=str(params.get("created_by", "agent")),
+    )
+    return {"symbol": params["symbol"], "timeframe": params["timeframe"], "annotation_ids": ids}, Meta(
+        as_of=utc_iso(), source="sqlite-annotations", freshness=FRESHNESS_FRESH
+    )
+
+
+async def get_chart_annotations_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    svc = _require_annotations(ctx)
+    items = await svc.get(params["symbol"], params["timeframe"])
+    return {"symbol": params["symbol"], "timeframe": params["timeframe"], "annotations": items}, Meta(
+        as_of=utc_iso(), source="sqlite-annotations", freshness=FRESHNESS_FRESH
+    )
+
+
+async def clear_annotations_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    svc = _require_annotations(ctx)
+    removed = await svc.clear(params["symbol"], params["timeframe"])
+    return {"symbol": params["symbol"], "timeframe": params["timeframe"], "removed": removed}, Meta(
+        as_of=utc_iso(), source="sqlite-annotations", freshness=FRESHNESS_FRESH
+    )
+
+
 def build_dispatcher(ctx: dict) -> ToolDispatcher:
     from ..tools import REGISTRY
 
@@ -140,4 +244,11 @@ def build_dispatcher(ctx: dict) -> ToolDispatcher:
     dispatcher.register("add_account", add_account_handler)
     dispatcher.register("list_accounts", list_accounts_handler)
     dispatcher.register("remove_account", remove_account_handler)
+    dispatcher.register("get_market_structure", get_market_structure_handler)
+    dispatcher.register("get_liquidity_zones", get_liquidity_zones_handler)
+    dispatcher.register("get_order_blocks", get_order_blocks_handler)
+    dispatcher.register("get_full_analysis", get_full_analysis_handler)
+    dispatcher.register("annotate_chart", annotate_chart_handler)
+    dispatcher.register("get_chart_annotations", get_chart_annotations_handler)
+    dispatcher.register("clear_annotations", clear_annotations_handler)
     return dispatcher
