@@ -177,12 +177,31 @@ async def test_close_all_positions_idempotent_no_double_sell(ex_ctx):
     assert len(ctx["broker"].placed) == 1
 
 
+async def test_close_all_positions_sells_rebought_position(ex_ctx):
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
+    service = ctx["service"]
+
+    first = await service.close_all_positions(account_id=account_id, actor="test")
+    assert first["results"][0]["closed"] is True
+    assert len(ctx["broker"].placed) == 1  # ilk close: 1 SELL
+
+    # 3.11: close sonrası yeniden BTC alındı → ikinci close YENİ SELL üretmeli
+    ctx["broker"].balances[account_id]["BTC"] = 2.0
+    second = await service.close_all_positions(account_id=account_id, actor="test")
+    assert second["results"][0]["closed"] is True
+    assert len(ctx["broker"].placed) == 2  # 0 değil — yeni pozisyon satıldı
+    sold = {s["symbol"]: s for s in second["results"][0]["sold"]}
+    assert sold["BTCUSDT"]["quantity"] == pytest.approx(2.0)
+    assert sold["BTCUSDT"]["status"] == "FILLED"
+
+
 async def test_close_all_positions_all_partial_success(ex_ctx):
     ctx = ex_ctx
     ok_id = await _add_real_account(ctx, label="ok", base_holdings={"BTC": 1.0}, tags=["kill"])
     bad_id = await _add_real_account(ctx, label="bad", base_holdings={"BTC": 1.0}, tags=["kill"])
     # bad hesabın satışı ağ hatası versin ve Binance'te de bulunamasın → UNKNOWN
-    cid = to_client_order_id(f"close-{bad_id}-BTCUSDT")
+    cid = to_client_order_id(f"close-{bad_id}-BTCUSDT-1.0")
     ctx["broker"].place_errors[cid] = RasatError(ErrorCode.TIMEOUT, "ağ hatası")
     ctx["broker"].query_results[cid] = None
 

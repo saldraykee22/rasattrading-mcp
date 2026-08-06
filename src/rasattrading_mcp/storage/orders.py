@@ -985,12 +985,6 @@ class OrderService:
             symbol = f"{asset}{quote_asset}"
             if not await self.market.symbol_valid(symbol):
                 continue
-            idem = f"close-{account_id}-{symbol}"
-            existing = await self.db.read(lambda conn: self._load_order(conn, account_id, idem))
-            if existing is not None:
-                sold.append({"symbol": symbol, "quantity": existing["quantity"],
-                             "status": existing["status"], "order_id": existing["order_id"]})
-                continue
             price = await self.market.price(symbol)
             if price is None:
                 sold.append({"symbol": symbol, "skipped": "stale price"})
@@ -1005,6 +999,28 @@ class OrderService:
             if qty < filters.min_qty:
                 sold.append({"symbol": symbol, "skipped": "below min_qty"})
                 continue
+
+            # 3.11: idem key, satılacak MİKTARI (mevcut bakiye anlık görüntüsü) da
+            # içerir. Aynı (account, symbol) çiftinde yeniden alınan pozisyon yeni
+            # miktar üretince yeni satış denemesi açılır; yalnızca aynı miktarın
+            # tamamlanmış satışı (FILLED) dedup edilir.
+            idem = f"close-{account_id}-{symbol}-{qty}"
+            existing = await self.db.read(lambda conn: self._load_order(conn, account_id, idem))
+            if existing is not None:
+                if existing["status"] == "FILLED":
+                    sold.append({"symbol": symbol, "quantity": existing["quantity"],
+                                 "status": existing["status"], "order_id": existing["order_id"]})
+                    continue
+                # Açık/işlemde veya durumu belirsiz → körlemesine tekrar gönderim
+                # yok (reconcile-before-retry); stored durum raporlanır.
+                if existing["status"] in ("NEW", "PARTIALLY_FILLED", "UNKNOWN"):
+                    sold.append({"symbol": symbol, "quantity": existing["quantity"],
+                                 "status": existing["status"], "order_id": existing["order_id"]})
+                    continue
+                # Terminal ama FILLED değil (CANCELED/REJECTED): satış gerçekleşmedi,
+                # bakiye duruyor → UNIQUE(account, idem) kısıtı için nonce ile yeni deneme.
+                idem = f"{idem}-{existing['order_id']}"
+
             result = await self._place_and_record(
                 account, True, symbol, "SELL", "MARKET", qty, None, qty * price, price,
                 idem, 0.0, actor,
