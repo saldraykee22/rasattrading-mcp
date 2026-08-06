@@ -193,3 +193,107 @@ async def test_2_16_screener_context_uses_pa_lookback(db):
     assert ctx is not None
     assert len(ctx["candles"]) <= PA_LOOKBACK
     assert len(ctx["candles"]) == PA_LOOKBACK  # 200 kapanmış mum mevcut
+
+
+# ---------------------------------------------------------------------------
+# S4 — Sorun 2: data_stale yanında symbol_valid (delist filtreleme)
+# ---------------------------------------------------------------------------
+
+
+class _FakeUniverse:
+    def __init__(self, symbols: list[str]) -> None:
+        self._symbols = list(symbols)
+
+    def snapshot(self) -> list[str]:
+        return list(self._symbols)
+
+    def contains(self, symbol: str) -> bool:
+        return symbol in self._symbols
+
+
+class _FakePipeline:
+    def __init__(self, symbols: list[str]) -> None:
+        self.universe = _FakeUniverse(symbols)
+
+
+class _StaleCandidateScreener(Screener):
+    """Aday listesini DB'den (delist edilmiş semboller dahil) dönen screener.
+
+    Canlıda `_candidate_symbols` evren snapshot'ını kullandığında delist semboller
+    zaten elenirdi; asıl risk DB fallback yolunda adayın evren kontrolünden
+    geçmemesidir. Bu subclass adayları DB'den (COHRUSDT dahil) çekerek
+    `_symbol_validity` filtresinin gerçekten devreye girdiğini doğrular.
+    """
+
+    async def _candidate_symbols(self) -> list[str]:
+        def _q(conn):
+            rows = conn.execute("SELECT DISTINCT symbol FROM candles WHERE source='spot'").fetchall()
+            return sorted(r["symbol"] for r in rows)
+
+        return await self.db.read(_q)
+
+
+async def test_2_16_invalid_symbol_filtered_by_universe(db):
+    """Delist edilmiş sembol artık yanıltıcı şekilde eşleşmez (data_stale=false iken bile)."""
+    # COHRUSDT/USARUSDT/FLNCUSDT canlı örneği: mum verisi var ama evrende yok.
+    for sym, target in TARGETS.items():
+        await seed(db, sym, breakout_series(target))
+    await seed(db, "COHRUSDT", breakout_series(193))  # evrende YOK
+
+    screener = _StaleCandidateScreener(db, pipeline=_FakePipeline(list(TARGETS)))  # COHRUSDT evrende değil
+    res = await screener.scan([{"type": "structure_event", "event": "bos_bullish", "since_bars": 24}])
+    syms = [s["symbol"] for s in res["symbols"]]
+    assert "COHRUSDT" not in syms  # delist — tarama sonucunda yer almaz
+    assert {"BMTUSDT", "HUMAUSDT", "AUSDT"} <= set(syms)
+    for s in res["symbols"]:
+        assert s["symbol_valid"] is True
+
+
+async def test_2_16_symbol_valid_unknown_without_pipeline(db):
+    """Pipeline yoksa symbol_valid None olur (evren doğrulanamaz) — davranış korunur."""
+    await seed(db, "BMTUSDT", breakout_series(193))
+    screener = Screener(db)  # pipeline yok
+    res = await screener.scan([{"type": "structure_event", "event": "bos_bullish", "since_bars": 24}])
+    bmt = next(s for s in res["symbols"] if s["symbol"] == "BMTUSDT")
+    assert bmt["symbol_valid"] is None
+
+
+# ---------------------------------------------------------------------------
+# S5 — Sorun 3: tarama satırları denetlenebilir (matched_filters + signal_summary)
+# ---------------------------------------------------------------------------
+
+
+async def test_2_16_scan_rows_are_auditable(db):
+    """Eşleşmeyi tetikleyen filtreler ve ham sinyal özeti satır bazında döner."""
+    await seed(db, "BMTUSDT", breakout_series(193))
+    screener = Screener(db)
+    res = await screener.scan(
+        [
+            {"type": "structure_event", "event": "bos_bullish", "since_bars": 24},
+            {"type": "above_below_vwap", "position": "above"},
+        ],
+        combine="AND",
+    )
+    bmt = next(s for s in res["symbols"] if s["symbol"] == "BMTUSDT")
+    assert "structure_event" in bmt["matched_filters"]
+    assert "above_below_vwap" in bmt["matched_filters"]
+    assert "bos_bullish" in bmt["signal_summary"]
+    assert "vwap above" in bmt["signal_summary"]
+    assert bmt["as_of"] is not None
+    assert bmt["price"] > 0
+
+
+async def test_2_16_matched_filters_or_semantics(db):
+    """OR kombinasyonda yalnız eşleşen filtreler matched_filters'a girer."""
+    await seed(db, "BMTUSDT", breakout_series(193))
+    screener = Screener(db)
+    res = await screener.scan(
+        [
+            {"type": "structure_event", "event": "bos_bullish", "since_bars": 24},
+            {"type": "price_change", "window_bars": 10, "min": 500},
+        ],
+        combine="OR",
+    )
+    bmt = next(s for s in res["symbols"] if s["symbol"] == "BMTUSDT")
+    assert "structure_event" in bmt["matched_filters"]
+    assert "price_change" not in bmt["matched_filters"]  # %500 değişim yok → eşleşmedi
