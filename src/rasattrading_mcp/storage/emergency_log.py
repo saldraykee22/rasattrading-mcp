@@ -92,14 +92,20 @@ class EmergencyLog:
             prev_seq = seq
         return broken
 
-    def is_action_done(self, action: str, idem_key: str) -> bool:
-        """Aynı (action, idem_key) daha önce loglandı mı? — idempotency için."""
+    def is_action_done(self, action: str, idem_key: str, status: str | None = None) -> bool:
+        """Aynı (action, idem_key) daha önce loglandı mı? — idempotency için.
+
+        `status` verilirse yalnızca o terminal duruma sahip kayıt "done" sayılır
+        (3.15): NEW/PARTIALLY_FILLED/UNKNOWN ile biten bir sell "done" değildir,
+        sonraki koşuda broker'dan gerçek durumu sorgulanıp reconcile edilir.
+        """
         for row in self.entries():
             if row.get("_corrupt"):
                 continue
             details = row.get("details") or {}
             if row.get("action") == action and details.get("idem_key") == idem_key:
-                return True
+                if status is None or details.get("status") == status:
+                    return True
         return False
 
     def clear(self) -> None:

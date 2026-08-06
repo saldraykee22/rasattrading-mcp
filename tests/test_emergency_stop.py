@@ -3,6 +3,7 @@ import asyncio
 import pytest
 
 from rasattrading_mcp.config import Config
+from rasattrading_mcp.data.order_broker import OrderResult
 from rasattrading_mcp.emergency_stop import EmergencyStopRunner, PublicPriceSource, run_emergency_stop
 from rasattrading_mcp.errors import ErrorCode, RasatError
 from rasattrading_mcp.position_sizing import SymbolFilters
@@ -173,12 +174,93 @@ async def test_public_price_source_unknown_symbol_maps_to_invalid_symbol():
         await src.close()
 
 
+def _exchange_info_resp():
+    return _FakeResp(200, {
+        "timezone": "UTC",
+        "symbols": [
+            {
+                "symbol": "BTCUSDT", "baseAsset": "BTC", "quoteAsset": "USDT", "status": "TRADING",
+                "filters": [
+                    {"filterType": "LOT_SIZE", "minQty": "0.00001", "maxQty": "100000", "stepSize": "0.001"},
+                    {"filterType": "MIN_NOTIONAL", "minNotional": "5.0", "applyToMarket": True},
+                    {"filterType": "PRICE_FILTER", "minPrice": "0.01", "maxPrice": "1000000.0", "tickSize": "0.01"},
+                ],
+            }
+        ],
+    })
+
+
+async def test_public_price_source_filters_from_exchange_info():
+    # 3.16: PublicPriceSource.filters imzasız exchangeInfo'dan filtreleri döner.
+    calls = []
+
+    def handler(url, params):
+        calls.append(url)
+        return _exchange_info_resp()
+
+    src = PublicPriceSource("https://api.binance.com", session=_FakeSession(handler))
+    try:
+        filters = await src.filters("BTCUSDT")
+    finally:
+        await src.close()
+    assert filters is not None
+    assert filters.step_size == 0.001
+    assert filters.min_qty == 0.00001
+    assert filters.min_notional == 5.0
+    assert any(url.endswith("/api/v3/exchangeInfo") for url in calls)
+
+
+async def test_public_price_source_filters_cached():
+    # 3.16: exchangeInfo tek sefer çekilir, sonra cache'lenir.
+    calls = []
+
+    def handler(url, params):
+        calls.append(url)
+        return _exchange_info_resp()
+
+    src = PublicPriceSource("https://api.binance.com", session=_FakeSession(handler))
+    try:
+        await src.filters("BTCUSDT")
+        await src.filters("BTCUSDT")
+    finally:
+        await src.close()
+    assert sum(1 for c in calls if c.endswith("/api/v3/exchangeInfo")) == 1
+
+
+async def test_public_price_source_unknown_symbol_filters_none():
+    # 3.16: bilinmeyen sembol → None (fail-closed, ham miktar yok).
+    def handler(url, params):
+        return _exchange_info_resp()
+
+    src = PublicPriceSource("https://api.binance.com", session=_FakeSession(handler))
+    try:
+        assert await src.filters("NOPEUSDT") is None
+    finally:
+        await src.close()
+
+
+async def test_public_price_source_rejects_non_finite_price():
+    # 3.16/M2: nan/inf/0 fiyat asla kabul edilmez.
+    for bad in ("nan", "inf", "0"):
+        def handler(url, params, _bad=bad):
+            return _FakeResp(200, {"symbol": "BTCUSDT", "price": _bad})
+
+        src = PublicPriceSource("https://api.binance.com", session=_FakeSession(handler))
+        try:
+            with pytest.raises(RasatError) as exc_info:
+                await src.price("BTCUSDT")
+            assert exc_info.value.code == ErrorCode.INTERNAL_ERROR
+        finally:
+            await src.close()
+
+
 class _FailingPriceSource:
     async def price(self, symbol):
         raise RasatError(ErrorCode.INTERNAL_ERROR, "fiyat servisi çöktü")
 
     async def filters(self, symbol):
-        return None
+        # Filtre servisi sağlam; yalnızca fiyat yolu test ediliyor (3.16 fail-closed değil).
+        return SymbolFilters(**{**FILTERS.__dict__, "symbol": symbol})
 
 
 async def test_emergency_stop_price_failure_fails_loud(em_ctx):
@@ -241,7 +323,10 @@ async def test_run_emergency_stop_uses_public_price_source_by_default(tmp_path, 
             return 100.0
 
         async def filters(self, symbol):
-            return None
+            return SymbolFilters(**{**FILTERS.__dict__, "symbol": symbol})
+
+        async def close(self):
+            created_flag["closed"] = True
 
     monkeypatch.setattr(es, "PublicPriceSource", StubPriceSource)
 
@@ -261,6 +346,7 @@ async def test_run_emergency_stop_uses_public_price_source_by_default(tmp_path, 
         config=cfg,
     )
     assert created_flag.get("created") is True
+    assert created_flag.get("closed") is True  # 3.16: kendi session'ını kapattı
     assert result["ok"] is True
     assert len(result["results"][0]["sold"]) == 1
 
@@ -310,8 +396,8 @@ async def test_emergency_stop_sells_and_cancels(em_ctx, monkeypatch):
     assert statuses == {"BTCUSDT": "FILLED", "ETHUSDT": "FILLED"}
     # açık emirler iptal edildi
     assert len(ctx["broker"].cancelled_all) == 1  # BTCUSDT açık emri
-    # log yazıldı
-    assert ctx["log"].is_action_done("emergency_sell", f"{account_id}:BTCUSDT")
+    # log yazıldı (3.15: key miktar+nonce içerir, sembol prefix'i ile doğrula)
+    assert ctx["runner"]._latest_sell_details(account_id, "BTCUSDT") is not None
     assert ctx["log"].verify() == []
 
 
@@ -328,6 +414,123 @@ async def test_emergency_stop_no_double_sell(em_ctx):
     second = await runner.run(account_ids=[account_id], yes=True)
     assert second["ok"] is True
     assert len(ctx["broker"].placed) == placed_after_first  # çift satış yok
+
+
+async def test_emergency_stop_rebuy_after_done_sells_again(em_ctx):
+    # 3.15: bir "done" cycle'dan sonra yeni bakiye (rebuy) SKIPPED_DONE ile
+    # atlanmamalı — gerçekten yeni SELL üretmeli.
+    ctx = em_ctx
+    account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
+    runner = ctx["runner"]
+
+    first = await runner.run(account_ids=[account_id], yes=True)
+    assert first["ok"] is True
+    assert len(ctx["broker"].placed) == 1
+
+    # yeniden 2.0 BTC alındı → ikinci çağrı YENİ SELL üretmeli
+    ctx["broker"].balances[account_id]["BTC"] = 2.0
+    second = await runner.run(account_ids=[account_id], yes=True)
+    assert second["ok"] is True
+    assert len(ctx["broker"].placed) == 2
+    sold = {s["symbol"]: s for s in second["results"][0]["sold"]}
+    assert sold["BTCUSDT"]["quantity"] == pytest.approx(2.0)
+    assert sold["BTCUSDT"]["status"] == "FILLED"
+
+
+async def test_emergency_stop_nonterminal_sell_reconciled_not_done(em_ctx):
+    # 3.15: broker NEW dönerse bu "done" değildir; sonraki çalıştırma broker'a
+    # sorar (reconcile-before-resend), körlemesine çift SELL göndermez.
+    ctx = em_ctx
+    account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
+    runner = ctx["runner"]
+
+    ctx["broker"].place_result = {"status": "NEW", "exchange_order_id": None}
+    first = await runner.run(account_ids=[account_id], yes=True)
+    assert first["results"][0]["sold"][0]["status"] == "NEW"
+
+    detail = runner._latest_sell_details(account_id, "BTCUSDT")
+    assert detail is not None
+    cid = detail["cid"]
+    ctx["broker"].place_result = None
+    ctx["broker"].query_results[cid] = OrderResult(status="NEW", exchange_order_id="EX-INFLIGHT")
+
+    second = await runner.run(account_ids=[account_id], yes=True)
+    assert len(ctx["broker"].placed) == 1  # çift satış yok
+    assert second["results"][0]["sold"][0]["status"] == "NEW"  # işlemde olarak raporlanır
+
+
+async def test_emergency_stop_missing_filters_fails_closed(em_ctx):
+    # 3.16: filtre bilgisi yoksa ham miktar gönderilmez — fail-closed.
+    class _NoFiltersSource:
+        async def price(self, symbol):
+            return 100.0
+
+        async def filters(self, symbol):
+            return None
+
+    ctx = em_ctx
+    account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
+    runner = EmergencyStopRunner(
+        Config(data_dir=ctx["data_dir"], pipeline_enabled=False),
+        ctx["accounts"], ctx["broker"], ctx["log"], market_price=_NoFiltersSource(),
+    )
+    result = await runner.run(account_ids=[account_id], yes=True)
+    detail = result["results"][0]
+    assert detail["ok"] is False
+    assert len(detail["filter_errors"]) == 1
+    assert detail["sold"] == []
+    assert len(ctx["broker"].placed) == 0  # ham bakiye gönderilmedi
+
+
+async def test_emergency_stop_rounds_to_step(em_ctx):
+    # 3.16: miktar LOT_SIZE step'e göre yuvarlanmalı (1.7 → 1.5).
+    class _StepFilterSource:
+        async def price(self, symbol):
+            return 100.0
+
+        async def filters(self, symbol):
+            return SymbolFilters(
+                symbol=symbol, base_asset="BTC", quote_asset="USDT", status="TRADING",
+                step_size=0.5, min_qty=0.1, max_qty=100000, min_notional=5.0,
+                tick_size=0.01, min_price=0.01, max_price=1000000.0,
+            )
+
+    ctx = em_ctx
+    account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.7})
+    runner = EmergencyStopRunner(
+        Config(data_dir=ctx["data_dir"], pipeline_enabled=False),
+        ctx["accounts"], ctx["broker"], ctx["log"], market_price=_StepFilterSource(),
+    )
+    result = await runner.run(account_ids=[account_id], yes=True)
+    assert result["results"][0]["ok"] is True
+    assert result["results"][0]["sold"][0]["quantity"] == pytest.approx(1.5)
+
+
+async def test_emergency_stop_below_min_notional_fails_closed(em_ctx):
+    # 3.16: MIN_NOTIONAL altında kalan satış plana girmez (fail-closed).
+    class _MinNotionalSource:
+        async def price(self, symbol):
+            return 100.0
+
+        async def filters(self, symbol):
+            return SymbolFilters(
+                symbol=symbol, base_asset="BTC", quote_asset="USDT", status="TRADING",
+                step_size=0.00001, min_qty=0.00001, max_qty=100000, min_notional=1000.0,
+                tick_size=0.01, min_price=0.01, max_price=1000000.0,
+            )
+
+    ctx = em_ctx
+    account_id = await _add_real_account(ctx, base_holdings={"BTC": 0.5})
+    runner = EmergencyStopRunner(
+        Config(data_dir=ctx["data_dir"], pipeline_enabled=False),
+        ctx["accounts"], ctx["broker"], ctx["log"], market_price=_MinNotionalSource(),
+    )
+    result = await runner.run(account_ids=[account_id], yes=True)
+    detail = result["results"][0]
+    assert detail["ok"] is False
+    assert len(detail["filter_errors"]) == 1
+    assert detail["sold"] == []
+    assert len(ctx["broker"].placed) == 0
 
 
 async def test_emergency_stop_requires_confirmation(em_ctx, monkeypatch):

@@ -93,10 +93,12 @@ async def _plant_open_order(ex_ctx, account_id, idempotency_key):
     ctx = ex_ctx
     ctx["broker"].place_result = {"status": "NEW"}
     service = ctx["service"]
-    return await service.place_order(
+    placed = await service.place_order(
         account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="LIMIT",
         quantity=0.5, price=80, idempotency_key=idempotency_key,
     )
+    ctx["broker"].place_result = None  # sonraki sell'ler default FILLED dönsün
+    return placed
 
 
 async def test_close_all_positions_cancel_failure_not_marked_canceled(ex_ctx):
@@ -196,21 +198,63 @@ async def test_close_all_positions_sells_rebought_position(ex_ctx):
     assert sold["BTCUSDT"]["status"] == "FILLED"
 
 
+async def test_close_all_positions_same_qty_rebuy_sells_again(ex_ctx):
+    # B1/3.14: birebir AYNI miktarın yeniden alımı bile yeni SELL üretmeli —
+    # eski FILLED dedup'unun bıraktığı kenar durumu (3.11 kabul kriteri).
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
+    service = ctx["service"]
+
+    first = await service.close_all_positions(account_id=account_id, actor="test")
+    assert first["results"][0]["closed"] is True
+    assert len(ctx["broker"].placed) == 1
+
+    # tam aynı miktar (1.0) yeniden alındı
+    ctx["broker"].balances[account_id]["BTC"] = 1.0
+    second = await service.close_all_positions(account_id=account_id, actor="test")
+    assert second["results"][0]["closed"] is True
+    assert len(ctx["broker"].placed) == 2  # eski FILLED'a takılıp atlamadı
+    sold = {s["symbol"]: s for s in second["results"][0]["sold"]}
+    assert sold["BTCUSDT"]["quantity"] == pytest.approx(1.0)
+    assert sold["BTCUSDT"]["status"] == "FILLED"
+
+
+async def test_close_all_positions_rejected_retry_no_unique_error(ex_ctx):
+    # H5/3.14: REJECTED ile biten close'un aynı miktar retry'i UNIQUE constraint
+    # hatasına düşmeden yeni SELL üretmeli.
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
+    service = ctx["service"]
+
+    ctx["broker"].place_result = {"status": "REJECTED", "exchange_order_id": None}
+    first = await service.close_all_positions(account_id=account_id, actor="test")
+    assert first["results"][0]["closed"] is False
+    assert len(ctx["broker"].placed) == 1
+
+    # retry: broker artık kabul ediyor
+    ctx["broker"].place_result = None
+    second = await service.close_all_positions(account_id=account_id, actor="test")
+    assert second["results"][0]["closed"] is True  # UNIQUE hatası yok
+    assert len(ctx["broker"].placed) == 2
+    assert second["results"][0]["sold"][0]["status"] == "FILLED"
+
+
 async def test_close_all_positions_all_partial_success(ex_ctx):
     ctx = ex_ctx
     ok_id = await _add_real_account(ctx, label="ok", base_holdings={"BTC": 1.0}, tags=["kill"])
     bad_id = await _add_real_account(ctx, label="bad", base_holdings={"BTC": 1.0}, tags=["kill"])
-    # bad hesabın satışı ağ hatası versin ve Binance'te de bulunamasın → UNKNOWN
-    cid = to_client_order_id(f"close-{bad_id}-BTCUSDT-1.0")
-    ctx["broker"].place_errors[cid] = RasatError(ErrorCode.TIMEOUT, "ağ hatası")
-    ctx["broker"].query_results[cid] = None
+    # bad hesabın satışı ağ hatası versin ve Binance'te de bulunamasın → UNKNOWN.
+    # (3.14 idem key run nonce'ı taşıdığından cid önceden bilinmez; hesap bazlı hata.)
+    ctx["broker"].place_errors_by_account[bad_id] = RasatError(ErrorCode.TIMEOUT, "ağ hatası")
+    ctx["broker"].query_results_by_account[bad_id] = None
 
     service = ctx["service"]
     result = await service.close_all_positions(account_id="all", actor="test")
     assert result["count"] == 2
     by_account = {r["account_id"]: r for r in result["results"]}
+    # 3.19: satış UNKNOWN olduğu için bad hesap closed denmez — yalnızca FILLED kapalıdır
     assert by_account[ok_id]["closed"] is True
-    assert by_account[bad_id]["closed"] is True  # hesap düzeyi kapandı (satış kısmı kısmi)
+    assert by_account[bad_id]["closed"] is False
     # kısmi başarı raporu: ok_id BTC sattı (FILLED), bad_id satamadı (UNKNOWN)
     ok_sold = {s["symbol"]: s for s in by_account[ok_id]["sold"]}
     bad_sold = {s["symbol"]: s for s in by_account[bad_id]["sold"]}
@@ -306,6 +350,73 @@ async def test_reconcile_open_orders_skips_paper_accounts(ex_ctx):
     # paper hesap reconcile edilmez (borsada gerçek emir yok)
     result = await service.reconcile_open_orders()
     assert result["scanned"] == 0
+
+
+async def test_reconcile_open_orders_same_status_partial_fill_syncs(ex_ctx):
+    # 3.18: durum aynı (PARTIALLY_FILLED) kalsa bile executed_qty/avg_price
+    # ilerlemişse reconcile bunları güncellemeli — status eşit diye skip yok.
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx)
+    service = ctx["service"]
+    cid = to_client_order_id("partial-fill")
+
+    def _insert(conn):
+        order = service._insert_order(
+            conn, account_id=account_id, idempotency_key="partial-fill",
+            symbol="BTCUSDT", side="BUY", order_type="LIMIT", quantity=1.0,
+            price=100.0, notional=100.0, reference_price=100.0, equity_snapshot=0.0,
+            status="PARTIALLY_FILLED", client_order_id=cid,
+        )
+        return order["order_id"]
+
+    order_id = await ctx["db"].write(_insert)
+
+    # broker: aynı PARTIALLY_FILLED ama executed_qty 0.5→1.0, avg 100→101 ilerledi
+    ctx["broker"].query_results[cid] = OrderResult(
+        status="PARTIALLY_FILLED", exchange_order_id="EX-PF",
+        executed_qty=1.0, avg_price=101.0,
+    )
+
+    result = await service.reconcile_open_orders()
+    assert result["scanned"] >= 1
+    assert result["unchanged"] == 0  # status eşit olsa da fill alanları değişti
+    assert result["reconciled"] >= 1
+
+    def _q(conn):
+        return dict(conn.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,)).fetchone())
+
+    row = await ctx["db"].read(_q)
+    assert row["status"] == "PARTIALLY_FILLED"
+    assert row["executed_qty"] == pytest.approx(1.0)
+    assert row["avg_price"] == pytest.approx(101.0)
+    assert row["exchange_order_id"] == "EX-PF"
+
+
+async def test_reconcile_open_orders_same_fields_counts_unchanged(ex_ctx):
+    # 3.18: tüm alanlar gerçekten aynıysa unchanged sayılır (gereksiz yazma yok).
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx)
+    service = ctx["service"]
+    cid = to_client_order_id("partial-unchanged")
+
+    def _insert(conn):
+        order = service._insert_order(
+            conn, account_id=account_id, idempotency_key="partial-unchanged",
+            symbol="BTCUSDT", side="BUY", order_type="LIMIT", quantity=1.0,
+            price=100.0, notional=100.0, reference_price=100.0, equity_snapshot=0.0,
+            status="PARTIALLY_FILLED", client_order_id=cid,
+        )
+        return order["order_id"]
+
+    await ctx["db"].write(_insert)
+
+    ctx["broker"].query_results[cid] = OrderResult(
+        status="PARTIALLY_FILLED", exchange_order_id=None, executed_qty=0.0, avg_price=0.0,
+    )
+
+    result = await service.reconcile_open_orders()
+    assert result["scanned"] >= 1
+    assert result["unchanged"] >= 1
 
 
 async def test_disable_real_trading(ex_ctx):

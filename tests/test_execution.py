@@ -163,6 +163,83 @@ async def test_timeout_unknown_no_blind_retry(ex_ctx):
     assert result["error"]["code"] == ErrorCode.ORDER_UNKNOWN
 
 
+async def test_unknown_retry_requeries_and_discovers_filled(ex_ctx):
+    # 3.17: UNKNOWN kayıtlı emir, aynı key ile retry'de Binance'e TEKRAR sorulur;
+    # gerçekte FILLED olmuşsa kayıt güncellenir ve stored UNKNOWN dönmez.
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx)
+    service = ctx["service"]
+    cid = to_client_order_id("idem-unknown-fill")
+    ctx["broker"].place_errors[cid] = RasatError(ErrorCode.TIMEOUT, "ağ zaman aşımı")
+    ctx["broker"].query_results[cid] = None  # ilk deneme: bulunamadı → UNKNOWN
+
+    first = await service.place_order(
+        account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="MARKET",
+        quantity=1.0, idempotency_key="idem-unknown-fill",
+    )
+    assert first["status"] == "UNKNOWN"
+
+    # ikinci retry: emir artık Binance'te FILLED görünüyor
+    ctx["broker"].place_errors.pop(cid)
+    ctx["broker"].query_results[cid] = OrderResult(status="FILLED", exchange_order_id="EX-FILL", executed_qty=1.0, avg_price=100.0)
+
+    second = await service.place_order(
+        account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="MARKET",
+        quantity=1.0, idempotency_key="idem-unknown-fill",
+    )
+    assert second["status"] == "FILLED"
+    assert second["exchange_order_id"] == "EX-FILL"
+    assert len(ctx["broker"].placed) == 1  # çift emir yok
+    # kayıt güncellendi
+    rows = await _order_rows(ctx["db"])
+    assert rows[0]["status"] == "FILLED"
+
+
+async def test_unknown_retry_still_unknown_when_not_found(ex_ctx):
+    # 3.17: UNKNOWN kayıt, retry'de borsada hâlâ doğrulanamıyorsa UNKNOWN kalır.
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx)
+    service = ctx["service"]
+    cid = to_client_order_id("idem-unknown-2")
+    ctx["broker"].place_errors[cid] = RasatError(ErrorCode.TIMEOUT, "ağ zaman aşımı")
+    ctx["broker"].query_results[cid] = None
+
+    await service.place_order(
+        account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="MARKET",
+        quantity=1.0, idempotency_key="idem-unknown-2",
+    )
+    second = await service.place_order(
+        account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="MARKET",
+        quantity=1.0, idempotency_key="idem-unknown-2",
+    )
+    assert second["status"] == "UNKNOWN"
+    assert len(ctx["broker"].placed) == 1  # körlemesine tekrar gönderim yok
+    # ikinci retry de Binance'i sorguladı (reconcile)
+    assert len(ctx["broker"].queries) == 2
+
+
+async def test_unknown_order_included_in_total_exposure(ex_ctx):
+    # 3.17: UNKNOWN emirler exposure'a konservatif olarak (dolu varsayılarak) dahil.
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
+    service = ctx["service"]
+    cid = to_client_order_id("idem-exposure-unknown")
+    ctx["broker"].place_errors[cid] = RasatError(ErrorCode.TIMEOUT, "ağ zaman aşımı")
+    ctx["broker"].query_results[cid] = None
+
+    result = await service.place_order(
+        account_id=account_id, symbol="ETHUSDT", side="BUY", order_type="MARKET",
+        quantity=2.0, idempotency_key="idem-exposure-unknown",
+    )
+    assert result["status"] == "UNKNOWN"
+
+    exposure = await service.get_total_exposure()
+    # BTC holding (1*100) + UNKNOWN ETHUSDT notional (2*50=100) dahil
+    assert exposure["by_symbol"]["BTCUSDT"] == pytest.approx(100.0)
+    assert exposure["by_symbol"]["ETHUSDT"] == pytest.approx(100.0)
+    assert exposure["total"] == pytest.approx(200.0)
+
+
 # ---------- idempotency preflight'tan önce (3.12) ----------
 
 
