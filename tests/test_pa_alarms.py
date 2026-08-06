@@ -131,7 +131,7 @@ async def test_trigger_on_analysis_update(db):
     assert len(rec["triggered"]) == 1
     assert rec["triggered"][0]["alert_id"] == (await alarms.list_alerts())[0]["alert_id"]
     state = (await alarms.list_alerts())[0]["state"]
-    assert state == "triggered"
+    assert state == "cooldown"  # cooldown_seconds=300 → kalıcı cooldown state'i
 
 
 async def test_stale_data_does_not_trigger(db):

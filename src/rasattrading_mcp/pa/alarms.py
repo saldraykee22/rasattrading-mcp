@@ -35,6 +35,7 @@ logger = logging.getLogger("rasattrading.pa.alarms")
 
 STATE_ARMED = "armed"
 STATE_TRIGGERED = "triggered"
+STATE_COOLDOWN = "cooldown"
 
 
 class AlarmService:
@@ -78,6 +79,8 @@ class AlarmService:
     ) -> dict:
         if not isinstance(clauses, list) or not clauses:
             raise RasatError(ErrorCode.INVALID_REQUEST, "en az bir clause gerekli")
+        if not isinstance(cooldown_seconds, int) or cooldown_seconds < 0:
+            raise RasatError(ErrorCode.INVALID_REQUEST, "cooldown_seconds >= 0 integer olmalı")
         combine = (combine or "AND").upper()
         if combine not in ("AND", "OR"):
             raise RasatError(ErrorCode.INVALID_REQUEST, f"combine yalnızca AND|OR: {combine}")
@@ -147,7 +150,17 @@ class AlarmService:
 
     @staticmethod
     def _lazy_state(state: str, cooldown_until: int | None, now: int) -> str:
-        if state == STATE_TRIGGERED and cooldown_until is not None and now >= cooldown_until:
+        """Görünür state: kalıcı `state` + `cooldown_until`'dan türetilir.
+
+        - `cooldown_until` gelecekte → `cooldown` (kalıcı, restart sonrası korunur).
+        - `cooldown_until` geçmişte → `armed` (cooldown bitti).
+        - `triggered` + cooldown_until NULL (cooldown=0) → hemen yeniden kurulabilir → `armed`.
+        """
+        if cooldown_until is not None:
+            if now < cooldown_until:
+                return STATE_COOLDOWN
+            return STATE_ARMED
+        if state == STATE_TRIGGERED:
             return STATE_ARMED
         return state
 
@@ -160,7 +173,7 @@ class AlarmService:
             if row is None:
                 raise RasatError(ErrorCode.NOT_FOUND, f"alarm bulunamadı: {alert_id}")
             state = self._lazy_state(row["state"], row["cooldown_until"], now)
-            if state == STATE_TRIGGERED:
+            if state != STATE_ARMED:
                 return None  # cooldown'da → tetiklenmez
             exists = conn.execute(
                 "SELECT 1 FROM triggered_alerts WHERE alert_id=? AND trigger_key=?", (alert_id, trigger_key)
@@ -171,10 +184,16 @@ class AlarmService:
                 "INSERT INTO triggered_alerts (alert_id, trigger_key, payload, triggered_at) VALUES (?,?,?,?)",
                 (alert_id, trigger_key, json.dumps(payload, ensure_ascii=False), now),
             )
-            conn.execute(
-                "UPDATE alerts SET state=?, cooldown_until=?, updated_at=? WHERE alert_id=?",
-                (STATE_TRIGGERED, now + cooldown_seconds, now, alert_id),
-            )
+            if cooldown_seconds > 0:
+                conn.execute(
+                    "UPDATE alerts SET state=?, cooldown_until=?, updated_at=? WHERE alert_id=?",
+                    (STATE_COOLDOWN, now + cooldown_seconds, now, alert_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE alerts SET state=?, cooldown_until=NULL, updated_at=? WHERE alert_id=?",
+                    (STATE_TRIGGERED, now, alert_id),
+                )
             return {"alert_id": alert_id, "trigger_key": trigger_key, "triggered_at": now}
 
         return await self.db.write(_w)
@@ -349,7 +368,7 @@ class AlarmService:
     async def _alerts_by_symbol(self, symbol: str, timeframe: str) -> list[dict]:
         def _q(conn):
             rows = conn.execute(
-                "SELECT * FROM alerts WHERE state != 'triggered' OR cooldown_until IS NULL OR cooldown_until <= ?",
+                "SELECT * FROM alerts WHERE state IN ('armed','triggered') OR cooldown_until IS NULL OR cooldown_until <= ?",
                 (int(time.time()),),
             ).fetchall()
             out = []

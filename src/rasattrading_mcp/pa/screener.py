@@ -55,6 +55,15 @@ FILTER_KEYS: dict[str, set[str]] = {
 
 EVENT_TYPES = {"bos_bullish", "bos_bearish", "choch_bullish", "choch_bearish"}
 
+# pozitif integer bekleyen anahtarlar (varsa)
+INT_KEYS_BY_FILTER: dict[str, tuple[str, ...]] = {
+    "volume_change": ("recent_bars", "baseline_bars"),
+    "price_change": ("window_bars",),
+    "structure_event": ("since_bars",),
+    "liquidity_sweep_occurred": ("since_bars",),
+    "oi_change": ("window",),
+}
+
 
 def _defaults(f: dict) -> dict:
     ftype = f["type"]
@@ -88,6 +97,9 @@ def _validate_node(node: Any) -> dict:
         raise RasatError(ErrorCode.INVALID_REQUEST, "filtre bir nesne ve 'type' alanı taşımalı")
     ftype = node["type"]
     if ftype in ("and", "or"):
+        for key in node:
+            if key not in ("type", "filters"):
+                raise RasatError(ErrorCode.INVALID_REQUEST, f"{ftype} düğümü bilinmeyen anahtar: {key}")
         subs = node.get("filters")
         if not isinstance(subs, list) or not subs:
             raise RasatError(ErrorCode.INVALID_REQUEST, f"{ftype} düğümü en az bir alt filtre ister")
@@ -100,15 +112,24 @@ def _validate_node(node: Any) -> dict:
             continue
         if key not in allowed:
             raise RasatError(ErrorCode.INVALID_REQUEST, f"filtre '{ftype}' bilinmeyen anahtar: {key}")
+    for key in INT_KEYS_BY_FILTER.get(ftype, ()):
+        if key in node and (isinstance(node[key], bool) or not isinstance(node[key], int) or node[key] < 1):
+            raise RasatError(ErrorCode.INVALID_REQUEST, f"{ftype}.{key} pozitif integer olmalı (verildi: {node[key]!r})")
     for key in ("min", "max"):
-        if key in node and not isinstance(node[key], (int, float)):
-            raise RasatError(ErrorCode.INVALID_REQUEST, f"{ftype}.{key} sayı olmalı")
+        if key in node:
+            v = node[key]
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise RasatError(ErrorCode.INVALID_REQUEST, f"{ftype}.{key} sayı olmalı")
+    if "min" in node and "max" in node and node["min"] > node["max"]:
+        raise RasatError(ErrorCode.INVALID_REQUEST, f"{ftype}: min, max'tan büyük olamaz")
     if ftype == "structure_event" and node.get("event") not in EVENT_TYPES:
         raise RasatError(ErrorCode.INVALID_REQUEST, f"bilinmeyen structure event: {node.get('event')}")
     if ftype == "above_below_vwap" and node.get("position") not in ("above", "below"):
         raise RasatError(ErrorCode.INVALID_REQUEST, "above_below_vwap.position above|below olmalı")
-    if ftype == "near_order_block" and not isinstance(node.get("max_distance_pct"), (int, float)):
-        raise RasatError(ErrorCode.INVALID_REQUEST, "near_order_block.max_distance_pct sayı olmalı")
+    if ftype == "near_order_block":
+        v = node.get("max_distance_pct")
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+            raise RasatError(ErrorCode.INVALID_REQUEST, "near_order_block.max_distance_pct >= 0 sayı olmalı")
     return _defaults(node)
 
 
