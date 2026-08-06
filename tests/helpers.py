@@ -94,7 +94,9 @@ class FakeOrderBroker:
         self.balances = balances or {}
         self.place_result: dict | None = None
         self.place_errors: dict[str, Exception] = {}
+        self.place_errors_by_account: dict[str, Exception] = {}
         self.query_results: dict[str, object | None] = {}
+        self.query_results_by_account: dict[str, object | None] = {}
         self.cancel_errors: dict[str, Exception] = {}
         self._seq = 1000
 
@@ -110,6 +112,8 @@ class FakeOrderBroker:
                 "client_order_id": client_order_id,
             }
         )
+        if account_id in self.place_errors_by_account:
+            raise self.place_errors_by_account[account_id]
         if client_order_id in self.place_errors:
             raise self.place_errors[client_order_id]
         from rasattrading_mcp.data.order_broker import OrderResult
@@ -152,6 +156,8 @@ class FakeOrderBroker:
         )
         from rasattrading_mcp.data.order_broker import OrderResult
 
+        if account_id in self.query_results_by_account:
+            return self.query_results_by_account[account_id]
         if client_order_id in self.query_results:
             return self.query_results[client_order_id]
         match = [p for p in self.placed if p.get("client_order_id") == client_order_id]

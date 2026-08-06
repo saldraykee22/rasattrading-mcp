@@ -143,9 +143,10 @@ class OrderService:
 
     @staticmethod
     def _open_order_notional(conn: sqlite3.Connection, account_id: str) -> float:
+        # 3.17: UNKNOWN de exposure'a konservatif olarak (dolu varsayılarak) dahil.
         row = conn.execute(
             "SELECT COALESCE(SUM(notional), 0) AS total FROM orders "
-            "WHERE account_id = ? AND status IN ('NEW', 'PARTIALLY_FILLED')",
+            "WHERE account_id = ? AND status IN ('NEW', 'PARTIALLY_FILLED', 'UNKNOWN')",
             (account_id,),
         ).fetchone()
         return float(row["total"]) if row else 0.0
@@ -245,6 +246,25 @@ class OrderService:
         row = conn.execute(
             "SELECT " + ", ".join(_ORDER_COLUMNS) + " FROM orders WHERE account_id = ? AND idempotency_key = ?",
             (account_id, idempotency_key),
+        ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
+    @staticmethod
+    def _load_open_close(conn: sqlite3.Connection, account_id: str, symbol: str) -> dict | None:
+        """Bu hesap+sembolde işlemde/unknown kalmış bir close SELL'i var mı?
+
+        3.14: idem key'e run nonce'ı eklendiği için aynı key araması cross-run'da
+        eşleşmez; çift satışı önlemek için açık/unknown close emri sembol bazlı
+        aranır ve broker'dan gerçek durumla reconcile edilir.
+        """
+        row = conn.execute(
+            "SELECT " + ", ".join(_ORDER_COLUMNS)
+            + " FROM orders WHERE account_id = ? AND symbol = ? AND side = 'SELL'"
+            + " AND idempotency_key LIKE 'close-%' AND status IN ('NEW', 'PARTIALLY_FILLED', 'UNKNOWN')"
+            + " ORDER BY created_at DESC LIMIT 1",
+            (account_id, symbol),
         ).fetchone()
         if row is None:
             return None
@@ -829,7 +849,9 @@ class OrderService:
         - Terminal durumdaysa stored sonuç döner.
         - Açık/NEW durumdaysa reconcile edilir (gerçek durum sorulur) ve döner.
         """
-        if existing["status"] not in ("NEW", "PARTIALLY_FILLED"):
+        # 3.17: UNKNOWN de yeniden sorgulanır — zaman aşımından sonra gerçekten
+        # FILLED olmuş olabilir; stored UNKNOWN'ı körlemesine dönmeyiz.
+        if existing["status"] not in ("NEW", "PARTIALLY_FILLED", "UNKNOWN"):
             return self._order_to_result(existing)
 
         if str(account.get("trading_lock", "paper")) != "real":
@@ -935,7 +957,16 @@ class OrderService:
                 await self.db.write(_unknown)
                 reconciled += 1
                 continue
-            if found.status == order["status"]:
+            # 3.18: "unchanged" yalnızca status değil, TÜM değişebilir alanlar eşitse.
+            # Aynı status'te (örn. PARTIALLY_FILLED) executed_qty/avg_price ilerlemiş
+            # olabilir; status eşit görünse bile gerçek fill alanları senkronlanmalı.
+            same = (
+                found.status == order["status"]
+                and found.exchange_order_id == order["exchange_order_id"]
+                and found.executed_qty == order["executed_qty"]
+                and found.avg_price == order["avg_price"]
+            )
+            if same:
                 unchanged += 1
                 continue
 
@@ -948,7 +979,8 @@ class OrderService:
                     self.audit.append_in_connection(
                         conn, actor="system", action="order_reconciled",
                         details={"account_id": order["account_id"], "order_id": order["order_id"],
-                                 "symbol": order["symbol"], "status": f.status},
+                                 "symbol": order["symbol"], "status": f.status,
+                                 "executed_qty": f.executed_qty, "avg_price": f.avg_price},
                     )
 
             await self.db.write(_apply)
@@ -964,7 +996,12 @@ class OrderService:
         - `account_id == "all"` ise tüm hesaplar; değilse o hesap.
         - Spot long-only: "pozisyon kapat" = elde tutulan base asset bakiyesini satmak.
         - Kısmi başarı: her hesap ayrı sonuç; hangi hesabın kapandığı/kapanamadığı açıkça raporlanır.
-        - Idempotent: aynı (account, symbol) satışı tekrar çalıştırmada çift satış yapmaz.
+        - 3.14: her `_close_one` çağrısı kendi close-run nonce'ını üretir; idem key
+          `account+symbol+qty+run` bileşimidir. Bu, eşit miktarlı rebuy'da dahi yeni
+          SELL üretir (eskiden FILLED dedup eşit miktar alımını atlıyordu) ve
+          REJECTED/CANCELED sonrası retry'in UNIQUE constraint'e takılmasını önler.
+        - Reconcile-before-resend: işlemde/unknown kalmış bir close emri varsa önce
+          broker'dan gerçek durum sorulur; körlemesine çift satış YOK.
         """
         if not isinstance(account_id, str) or not account_id.strip():
             raise RasatError(ErrorCode.INVALID_REQUEST, "account_id zorunlu (string|'all')")
@@ -1064,6 +1101,10 @@ class OrderService:
             return {"account_id": account_id, "closed": False, "mode": "paper",
                     "cancelled": cancelled, "cancel_errors": cancel_errors, "sold": sold}
 
+        # 3.14: her close run'ı kendi nonce'ını taşır — aynı (account, symbol, qty)
+        # rebuy'da dahi yeni idem key → yeni SELL; REJECTED retry'i UNIQUE'e takılmaz.
+        run_nonce = uuid.uuid4().hex[:12]
+
         balances = await self.broker.get_balance(account_id=account_id)
         quote_asset = "USDT"
         for asset, free in balances.items():
@@ -1087,27 +1128,34 @@ class OrderService:
                 sold.append({"symbol": symbol, "skipped": "below min_qty"})
                 continue
 
-            # 3.11: idem key, satılacak MİKTARI (mevcut bakiye anlık görüntüsü) da
-            # içerir. Aynı (account, symbol) çiftinde yeniden alınan pozisyon yeni
-            # miktar üretince yeni satış denemesi açılır; yalnızca aynı miktarın
-            # tamamlanmış satışı (FILLED) dedup edilir.
-            idem = f"close-{account_id}-{symbol}-{qty}"
-            existing = await self.db.read(lambda conn: self._load_order(conn, account_id, idem))
-            if existing is not None:
-                if existing["status"] == "FILLED":
-                    sold.append({"symbol": symbol, "quantity": existing["quantity"],
-                                 "status": existing["status"], "order_id": existing["order_id"]})
-                    continue
-                # Açık/işlemde veya durumu belirsiz → körlemesine tekrar gönderim
-                # yok (reconcile-before-retry); stored durum raporlanır.
-                if existing["status"] in ("NEW", "PARTIALLY_FILLED", "UNKNOWN"):
-                    sold.append({"symbol": symbol, "quantity": existing["quantity"],
-                                 "status": existing["status"], "order_id": existing["order_id"]})
-                    continue
-                # Terminal ama FILLED değil (CANCELED/REJECTED): satış gerçekleşmedi,
-                # bakiye duruyor → UNIQUE(account, idem) kısıtı için nonce ile yeni deneme.
-                idem = f"{idem}-{existing['order_id']}"
+            # 3.14: reconcile-before-resend — bu sembolde işlemde/unknown kalmış bir
+            # close SELL'i varsa önce broker'dan gerçek durumu sor; körlemesine
+            # çift satış yok. Terminal REJECTED/CANCELED ise yeni run ile tekrar dene.
+            open_close = await self.db.read(lambda conn: self._load_open_close(conn, account_id, symbol))
+            if open_close is not None:
+                try:
+                    found = await self.broker.query_order(
+                        account_id=account_id, symbol=symbol,
+                        client_order_id=open_close["client_order_id"],
+                    )
+                except RasatError:
+                    found = None
+                if found is not None:
+                    def _sync(conn: sqlite3.Connection, oid: str = open_close["order_id"], f: Any = found) -> None:
+                        self._update_order(
+                            conn, oid, status=f.status, exchange_order_id=f.exchange_order_id,
+                            executed_qty=f.executed_qty, avg_price=f.avg_price,
+                        )
 
+                    await self.db.write(_sync)
+                    if found.status in ("NEW", "PARTIALLY_FILLED", "UNKNOWN", "FILLED"):
+                        # hâlâ işlemde/unknown/dolu → yeni SELL gönderme
+                        sold.append({"symbol": symbol, "quantity": open_close["quantity"],
+                                     "status": found.status, "order_id": open_close["order_id"]})
+                        continue
+                    # REJECTED/CANCELED/EXPIRED → eski deneme başarısız; yeni SELL
+
+            idem = f"close-{account_id}-{symbol}-{qty}-{run_nonce}"
             result = await self._place_and_record(
                 account, True, symbol, "SELL", "MARKET", qty, None, qty * price, price,
                 idem, 0.0, actor,
@@ -1115,7 +1163,10 @@ class OrderService:
             sold.append({"symbol": symbol, "quantity": result["quantity"],
                          "status": result["status"], "order_id": result["order_id"]})
 
-        return {"account_id": account_id, "closed": not cancel_errors, "mode": "real",
+        # 3.19: closed yalnızca her şey GERÇEKTEN satıldıysa (FILLED) ve iptal hatası
+        # yoksa True. UNKNOWN/REJECTED/NEW/atlanmış satış → pozisyon hâlâ açık olabilir.
+        sold_ok = all(s.get("status") == "FILLED" for s in sold)
+        return {"account_id": account_id, "closed": (not cancel_errors) and sold_ok, "mode": "real",
                 "cancelled": cancelled, "cancel_errors": cancel_errors, "sold": sold}
 
     # ---------- exposure + audit (3.5) ----------
@@ -1124,9 +1175,10 @@ class OrderService:
         """Hesabın sembol bazlı exposure'ı: açık emir notional + base bakiye değeri."""
 
         def _open(conn: sqlite3.Connection) -> dict[str, float]:
+            # 3.17: UNKNOWN da konservatif exposure'a dahil (gerçekte dolu olabilir).
             rows = conn.execute(
                 "SELECT symbol, SUM(notional) AS n FROM orders "
-                "WHERE account_id = ? AND status IN ('NEW', 'PARTIALLY_FILLED') GROUP BY symbol",
+                "WHERE account_id = ? AND status IN ('NEW', 'PARTIALLY_FILLED', 'UNKNOWN') GROUP BY symbol",
                 (account_id,),
             ).fetchall()
             return {str(r["symbol"]): float(r["n"]) for r in rows}
