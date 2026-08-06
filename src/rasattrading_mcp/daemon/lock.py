@@ -17,6 +17,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import psutil
+
 LOCK_VERSION = 1
 
 
@@ -42,10 +44,14 @@ class LockInfo:
     @classmethod
     def create(cls, port: int, state: str = "starting") -> "LockInfo":
         now = time.time()
+        try:
+            start_time = psutil.Process().create_time()
+        except (psutil.Error, OSError):
+            start_time = now
         return cls(
             version=LOCK_VERSION,
             pid=os.getpid(),
-            start_time=now,
+            start_time=start_time,
             nonce=secrets.token_hex(16),
             token=secrets.token_hex(32),
             state=state,
@@ -80,14 +86,27 @@ class LockInfo:
 
 
 def pid_alive(pid: int) -> bool:
-    """PID canlı mı? (liveness probe, process'i öldürmez)"""
+    """PID canlı mı? (psutil tabanlı — os.kill'in Windows'taki sahte KeyboardInterrupt
+    quirk'ünden kaçınır ve PID reuse'u önlemek için start_time eşleşmesine izin verir)"""
     if pid <= 0:
         return False
     try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
+        return psutil.pid_exists(pid)
+    except (psutil.Error, OSError):
         return False
+
+
+def owner_alive(info: LockInfo, start_time_tolerance: float = 2.0) -> bool:
+    """Kilit sahibi hâlâ aynı process mi? PID + process başlangıç zamanı eşleşmeli."""
+    if info.pid <= 0:
+        return False
+    if not pid_alive(info.pid):
+        return False
+    try:
+        actual = psutil.Process(info.pid).create_time()
+    except (psutil.Error, OSError):
+        return False
+    return abs(actual - info.start_time) < start_time_tolerance
 
 
 def read_lock(path: Path) -> LockInfo | None:
@@ -129,7 +148,10 @@ class LockManager:
         """Kilit dosyasını atomik oluşturur. Başka canlı daemon varsa LockHeldError fırlatır."""
         for _ in range(max_retries):
             existing = read_lock(self._path)
-            if existing is not None and not pid_alive(existing.pid):
+            if existing is not None and not owner_alive(existing):
+                self._path.unlink(missing_ok=True)
+            elif existing is None and self._path.exists():
+                # Bozuk/okunamaz kilit dosyası → stale kabul et ve temizle
                 self._path.unlink(missing_ok=True)
             elif existing is not None:
                 raise LockHeldError(existing)

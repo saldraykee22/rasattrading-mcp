@@ -6,7 +6,14 @@ import sys
 import pytest
 
 from rasattrading_mcp.config import Config
-from rasattrading_mcp.daemon.lock import LockHeldError, LockInfo, LockManager, pid_alive, read_lock
+from rasattrading_mcp.daemon.lock import (
+    LockHeldError,
+    LockInfo,
+    LockManager,
+    owner_alive,
+    pid_alive,
+    read_lock,
+)
 from rasattrading_mcp.daemon.readiness import Readiness, ReadinessError
 
 
@@ -83,6 +90,15 @@ def test_release_does_not_remove_others(cfg):
     current = read_lock(cfg.lock_path)
     assert current is not None
     assert current.nonce == other.nonce
+
+
+def test_owner_alive_pid_reuse_detected(cfg):
+    """Aynı PID ama farklı start_time -> sahibi değil (PID reuse koruması)."""
+    info = LockInfo.create(port=cfg.port)
+    assert owner_alive(info) is True  # bizim kendi sürecimiz
+
+    info.start_time = info.start_time - 10_000  # eski bir process başlangıcı
+    assert owner_alive(info) is False
 
 
 def _json(info: LockInfo) -> str:

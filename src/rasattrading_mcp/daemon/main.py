@@ -77,9 +77,18 @@ class DaemonRunner:
             await self._start_pipeline()
 
     async def _run_migrations(self) -> None:
-        """1.2'de SQLite + migration runner ile doldurulacak. Şimdilik sadece state."""
+        """SQLite açılır, migration'lar `migrating` durumunda uygulanır."""
+        from ..storage.db import Database
+        from ..storage.migrations import run_migrations
+
+        self.db = Database(self.config.db_path)
+        await self.db.start()
+
         self.readiness.set_state("migrating")
         self.lock_mgr.update_state(self.readiness.state)
+        applied = await run_migrations(self.db)
+        if applied:
+            logger.info("migration uygulandı: %s", applied)
         self.readiness.set_state("warming_up")
         self.lock_mgr.update_state(self.readiness.state)
 

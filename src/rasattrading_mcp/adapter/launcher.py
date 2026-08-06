@@ -20,7 +20,7 @@ from pathlib import Path
 
 from .. import __version__
 from ..config import Config
-from ..daemon.lock import LockInfo, LockManager, pid_alive, read_lock
+from ..daemon.lock import LockInfo, LockManager, owner_alive, read_lock
 from ..errors import ErrorCode, RasatError
 
 logger = logging.getLogger("rasattrading.adapter.launcher")
@@ -59,7 +59,7 @@ def _spawn_daemon(config: Config) -> None:
 
 def _cleanup_stale_lock(config: Config) -> None:
     lock = read_lock(config.lock_path)
-    if lock is not None and not pid_alive(lock.pid):
+    if lock is not None and not owner_alive(lock):
         config.lock_path.unlink(missing_ok=True)
         logger.info("stale kilit temizlendi (pid=%s)", lock.pid)
 
@@ -69,7 +69,7 @@ async def _wait_for_lock(config: Config, timeout: float) -> LockInfo:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         lock = read_lock(config.lock_path)
-        if lock is not None and pid_alive(lock.pid):
+        if lock is not None and owner_alive(lock):
             return lock
         await asyncio.sleep(0.2)
     raise DaemonUnavailableError(
@@ -91,7 +91,7 @@ async def _wait_until_ready(config: Config, lock: LockInfo, timeout: float) -> N
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         current = read_lock(config.lock_path)
-        if current is not None and current.nonce == lock.nonce and pid_alive(current.pid):
+        if current is not None and current.nonce == lock.nonce and owner_alive(current):
             if _http_probe_ok(config, current.token):
                 # 1.3+: HTTP tarafından doğrulama ayrı; bekleyiş health state'ine göre.
                 pass
@@ -112,7 +112,7 @@ async def ensure_daemon(config: Config) -> str:
     if lock is None:
         _spawn_daemon(config)
         lock = await _wait_for_lock(config, timeout=config.ready_timeout_seconds)
-    elif not pid_alive(lock.pid):
+    elif not owner_alive(lock):
         # tekrar kontrol et (race)
         if read_lock(config.lock_path) is not None:
             config.lock_path.unlink(missing_ok=True)
