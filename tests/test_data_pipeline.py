@@ -190,11 +190,26 @@ async def test_miniticker_ws_reconnect_marks_stale():
 # ---------- klines ----------
 
 async def test_parse_klines():
+    # Binance ham `open_time` milisaniyedir; tek birim standardı için saniyeye normalize edilir.
     raw = [[1700000000000, "1", "2", "0", "1.5", "10", 1700000100000, "100", 5, "0", "0", "0"]]
     rows = parse_klines(raw)
-    assert rows[0]["open_time"] == 1700000000000
+    assert rows[0]["open_time"] == 1700000000
     assert rows[0]["close"] == 1.5
     assert rows[0]["trades"] == 5
+
+
+async def test_parse_klines_seconds_passthrough():
+    # Zaten saniye olan fixture verisi aynen korunur (FakeRest gibi test verisi).
+    raw = [[1700000000, "1", "2", "0", "1.5", "10", 1700000100, "100", 5, "0", "0", "0"]]
+    rows = parse_klines(raw)
+    assert rows[0]["open_time"] == 1700000000
+
+
+async def test_parse_klines_bad_row_skipped():
+    raw = [["not-a-number", "1", "2", "0", "1.5", "10"], [1700000000000, "1", "2", "0", "1.5", "10", 1700000100000, "100", 5]]
+    rows = parse_klines(raw)
+    assert len(rows) == 1
+    assert rows[0]["open_time"] == 1700000000
 
 
 async def _make_klines(cfg, db, fake):

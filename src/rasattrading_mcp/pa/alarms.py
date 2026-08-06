@@ -29,11 +29,13 @@ from ..storage.db import Database
 from .analysis import PAEngine, _read_current
 from .liquidity import load_futures_series
 from .screener import _eval_node, validate_filters
+from .swings import filter_closed_candles
 
 logger = logging.getLogger("rasattrading.pa.alarms")
 
 STATE_ARMED = "armed"
 STATE_TRIGGERED = "triggered"
+STATE_COOLDOWN = "cooldown"
 
 
 class AlarmService:
@@ -77,6 +79,8 @@ class AlarmService:
     ) -> dict:
         if not isinstance(clauses, list) or not clauses:
             raise RasatError(ErrorCode.INVALID_REQUEST, "en az bir clause gerekli")
+        if not isinstance(cooldown_seconds, int) or cooldown_seconds < 0:
+            raise RasatError(ErrorCode.INVALID_REQUEST, "cooldown_seconds >= 0 integer olmalı")
         combine = (combine or "AND").upper()
         if combine not in ("AND", "OR"):
             raise RasatError(ErrorCode.INVALID_REQUEST, f"combine yalnızca AND|OR: {combine}")
@@ -146,7 +150,17 @@ class AlarmService:
 
     @staticmethod
     def _lazy_state(state: str, cooldown_until: int | None, now: int) -> str:
-        if state == STATE_TRIGGERED and cooldown_until is not None and now >= cooldown_until:
+        """Görünür state: kalıcı `state` + `cooldown_until`'dan türetilir.
+
+        - `cooldown_until` gelecekte → `cooldown` (kalıcı, restart sonrası korunur).
+        - `cooldown_until` geçmişte → `armed` (cooldown bitti).
+        - `triggered` + cooldown_until NULL (cooldown=0) → hemen yeniden kurulabilir → `armed`.
+        """
+        if cooldown_until is not None:
+            if now < cooldown_until:
+                return STATE_COOLDOWN
+            return STATE_ARMED
+        if state == STATE_TRIGGERED:
             return STATE_ARMED
         return state
 
@@ -159,7 +173,7 @@ class AlarmService:
             if row is None:
                 raise RasatError(ErrorCode.NOT_FOUND, f"alarm bulunamadı: {alert_id}")
             state = self._lazy_state(row["state"], row["cooldown_until"], now)
-            if state == STATE_TRIGGERED:
+            if state != STATE_ARMED:
                 return None  # cooldown'da → tetiklenmez
             exists = conn.execute(
                 "SELECT 1 FROM triggered_alerts WHERE alert_id=? AND trigger_key=?", (alert_id, trigger_key)
@@ -170,10 +184,16 @@ class AlarmService:
                 "INSERT INTO triggered_alerts (alert_id, trigger_key, payload, triggered_at) VALUES (?,?,?,?)",
                 (alert_id, trigger_key, json.dumps(payload, ensure_ascii=False), now),
             )
-            conn.execute(
-                "UPDATE alerts SET state=?, cooldown_until=?, updated_at=? WHERE alert_id=?",
-                (STATE_TRIGGERED, now + cooldown_seconds, now, alert_id),
-            )
+            if cooldown_seconds > 0:
+                conn.execute(
+                    "UPDATE alerts SET state=?, cooldown_until=?, updated_at=? WHERE alert_id=?",
+                    (STATE_COOLDOWN, now + cooldown_seconds, now, alert_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE alerts SET state=?, cooldown_until=NULL, updated_at=? WHERE alert_id=?",
+                    (STATE_TRIGGERED, now, alert_id),
+                )
             return {"alert_id": alert_id, "trigger_key": trigger_key, "triggered_at": now}
 
         return await self.db.write(_w)
@@ -183,6 +203,9 @@ class AlarmService:
     async def _clause_context(self, symbol: str, timeframe: str) -> dict | None:
         """Bir sembolün güncel analizini (depolanmış/istenirse hesaplanmış) context yapar."""
         candles = await self.engine._read_candles(symbol, timeframe, 300)
+        if not candles:
+            return None
+        candles = filter_closed_candles(candles, timeframe)
         if not candles:
             return None
         ms = await _read_current(self.db, "market_structure", symbol, timeframe)
@@ -212,9 +235,9 @@ class AlarmService:
         fr = await self._latest_futures(symbol, "funding_rate")
         if fr is not None:
             ctx["funding_rate"] = fr
-        oi = await self._latest_futures(symbol, "open_interest")
-        if oi is not None:
-            ctx["oi_series"] = [oi]
+        oi = await load_futures_series(self.db, symbol, "open_interest")
+        if oi:
+            ctx["oi_series"] = oi
         return ctx
 
     async def _latest_futures(self, symbol: str, ftype: str) -> dict | None:
@@ -222,16 +245,24 @@ class AlarmService:
         return series[-1] if series else None
 
     async def on_analysis_updated(self, symbol: str, timeframe: str, analysis: dict) -> list[dict]:
-        """PA analizi güncellendi → ilgili basit + kompozit alarmları değerlendir."""
+        """PA analizi güncellendi → ilgili basit + kompozit alarmları değerlendir.
+
+        Freshness kapısı (2.8): analiz snapshot'ı stale ise fail-closed — tetiklenmez.
+        Context kapanmış mumlardan kurulur; oluşmakta olan bar dahil edilmez.
+        """
+        as_of = analysis.get("as_of")
+        if PAEngine.freshness_for(timeframe, as_of) != FRESHNESS_FRESH:
+            return []  # stale analiz → tetikleme yok
         triggers: list[dict] = []
         candles = await self.engine._read_candles(symbol, timeframe, 300)
+        candles = filter_closed_candles(candles, timeframe)
         ctx = self._ctx_from_analysis(analysis, candles)
         fr = await self._latest_futures(symbol, "funding_rate")
         if fr is not None:
             ctx["funding_rate"] = fr
-        oi = await self._latest_futures(symbol, "open_interest")
-        if oi is not None:
-            ctx["oi_series"] = [oi]
+        oi = await load_futures_series(self.db, symbol, "open_interest")
+        if oi:
+            ctx["oi_series"] = oi
         alerts = await self._alerts_by_symbol(symbol, timeframe)
         for alert in alerts:
             definition = json.loads(alert["definition"])
@@ -254,13 +285,11 @@ class AlarmService:
         return triggers
 
     async def evaluate_symbol(self, symbol: str, timeframe: str) -> list[dict]:
-        """Talep üzerine değerlendirme: depolanmış analizden (daemon arka plan döngüsü için)."""
-        analysis = None
-        ms = await _read_current(self.db, "market_structure", symbol, timeframe)
-        if ms is not None:
-            analysis = {"as_of": ms["effective_from"]}
-        if analysis is None:
-            return []
+        """Talep üzerine değerlendirme: depolanmış analizden (daemon arka plan döngüsü için).
+
+        PA kaydı yoksa `_clause_context` analizi hesaplatır — alarm döngüsü,
+        agent tool çağırmadan güncel kayıtlara dayanır (boş dönmez).
+        """
         alerts = await self._alerts_by_symbol(symbol, timeframe)
         triggers: list[dict] = []
         for alert in alerts:
@@ -339,7 +368,7 @@ class AlarmService:
     async def _alerts_by_symbol(self, symbol: str, timeframe: str) -> list[dict]:
         def _q(conn):
             rows = conn.execute(
-                "SELECT * FROM alerts WHERE state != 'triggered' OR cooldown_until IS NULL OR cooldown_until <= ?",
+                "SELECT * FROM alerts WHERE state IN ('armed','triggered') OR cooldown_until IS NULL OR cooldown_until <= ?",
                 (int(time.time()),),
             ).fetchall()
             out = []

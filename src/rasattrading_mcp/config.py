@@ -62,6 +62,9 @@ class Config:
     rate_limit_window_seconds: float = 60.0
     http_timeout_seconds: float = 20.0
     alarm_eval_seconds: float = 30.0
+    pa_check_seconds: float = 20.0
+    pa_worker_concurrency: int = 4
+    futures_stale_after_seconds: float = 1800.0
 
     @property
     def db_path(self) -> Path:

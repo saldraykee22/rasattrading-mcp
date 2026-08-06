@@ -18,6 +18,7 @@ from typing import Any
 from ..config import Config
 from ..errors import ErrorCode, RasatError
 from ..storage.db import Database
+from ..timeutil import to_epoch_seconds
 from .binance_client import BinanceREST
 from .universe import UniverseService
 
@@ -47,7 +48,7 @@ class FuturesContextPoller:
                         item["symbol"],
                         "funding_rate",
                         float(rate),
-                        int(item.get("time", 0)),
+                        to_epoch_seconds(item.get("time", 0)),
                         {"next_funding_time": item.get("nextFundingTime")},
                     )
                 )
@@ -69,7 +70,7 @@ class FuturesContextPoller:
                         symbol,
                         "open_interest",
                         float(data.get("openInterest", 0)),
-                        int(data.get("time", 0)),
+                        to_epoch_seconds(data.get("time", 0)),
                         {},
                     )
                 ]
@@ -102,7 +103,10 @@ class FuturesContextPoller:
         rows: list[tuple] = []
         for o in data:
             try:
-                event_time = int(o.get("time", 0))
+                # `_last_liquidation_ts` API `startTime` paramı için ms tutulur;
+                # DB'ye saniye yazılır (tek birim standardı).
+                raw_ms = int(o.get("time", 0))
+                event_time = to_epoch_seconds(raw_ms)
                 price = float(o.get("price", 0))
                 qty = float(o.get("origQty", 0))
                 rows.append(
@@ -114,8 +118,8 @@ class FuturesContextPoller:
                         {"side": o.get("side"), "price": price, "qty": qty},
                     )
                 )
-                if event_time > self._last_liquidation_ts:
-                    self._last_liquidation_ts = event_time
+                if raw_ms > self._last_liquidation_ts:
+                    self._last_liquidation_ts = raw_ms
             except (TypeError, ValueError):
                 continue
         if rows:
@@ -144,10 +148,36 @@ class FuturesContextPoller:
 
         await self._db.write(_write)
 
+    async def age_stale_rows(self, now: float | None = None) -> int:
+        """`fresh` satırları yaşlandırır: `futures_stale_after_seconds` süredir
+        yenilenmeyenler `stale` olur.
+
+        Poll başarısız olsa bile çalışır — eski futures verisi süresiz `fresh`
+        kalamaz (2.10 fix). Dönen değer yaşlandırılan satır sayısıdır.
+        """
+        now = now if now is not None else time.time()
+        cutoff = int(now) - int(self._config.futures_stale_after_seconds)
+
+        def _w(conn) -> int:
+            cur = conn.execute(
+                "UPDATE futures_context SET freshness='stale' WHERE freshness='fresh' AND fetched_at < ?",
+                (cutoff,),
+            )
+            return cur.rowcount
+
+        aged = await self._db.write(_w)
+        if aged:
+            logger.info("futures_context yaşlandırıldı: %d satır", aged)
+        return aged
+
     async def run_loop(self, stop: asyncio.Event) -> None:
         """Funding + OI `futures_poll_seconds`'ta, liquidation `liquidation_poll_seconds`'ta."""
         while not stop.is_set():
             try:
+                try:
+                    await self.age_stale_rows()
+                except Exception:  # noqa: BLE001
+                    logger.exception("futures aging hatası")
                 try:
                     await self.poll_funding()
                 except RasatError as exc:
