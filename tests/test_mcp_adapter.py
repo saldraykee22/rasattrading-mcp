@@ -76,6 +76,32 @@ async def test_mcp_handshake_list_tools_and_call(cfg):
         await runner.cleanup()
 
 
+async def test_initialization_options_buildable_for_run(cfg):
+    """mcp SDK >=1.29 Server.run stdio yolu icin gerekli options uretilebiliyor.
+
+    `run_adapter` stdio_server + Server.run yolunu kullanir; SDK 1.29'da
+    InitializationOptions (capabilities dahil) zorunlu hale geldi ve bu yol
+    hicbir unit testte sarmalanmadigi icin canli stdio testinde patlamisti.
+    Bu test, options kurulumunun yapilabilir oldugunu sabitler.
+    """
+    from rasattrading_mcp.adapter.main import build_initialization_options
+
+    runner, port = await _start_daemon_app(cfg)
+    try:
+        client = DaemonClient(Config(data_dir=cfg.data_dir, port=port), TOKEN)
+        try:
+            server = build_adapter_server(client)
+            options = build_initialization_options(server)
+            assert options.server_name == "rasattrading-mcp"
+            assert options.server_version
+            assert options.capabilities is not None
+            assert options.capabilities.tools is not None
+        finally:
+            await client.close()
+    finally:
+        await runner.cleanup()
+
+
 async def test_mcp_unknown_tool_is_error(cfg):
     runner, port = await _start_daemon_app(cfg)
     try:

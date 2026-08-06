@@ -12,7 +12,8 @@ import logging
 import sys
 from typing import Any
 
-from mcp.server.lowlevel import Server
+from mcp.server.lowlevel import NotificationOptions, Server
+from mcp.server.models import InitializationOptions
 from mcp.server.stdio import stdio_server
 from mcp.types import CallToolResult, TextContent, Tool
 
@@ -33,6 +34,23 @@ def build_mcp_tools() -> list[Tool]:
         Tool(name=t.name, description=t.description, inputSchema=t.input_schema)
         for t in REGISTRY.list()
     ]
+
+
+def build_initialization_options(server: Server) -> InitializationOptions:
+    """mcp SDK >=1.29 `Server.run` için gerekli InitializationOptions.
+
+    SDK 1.29 ile `initialization_options` zorunlu hale geldi; capabilities
+    alanı da pydantic tarafından required. Ayrı tutulması test edilebilirliği
+    sağlar (stdio yolu hiçbir unit testte sarmalanmıyor).
+    """
+    return InitializationOptions(
+        server_name="rasattrading-mcp",
+        server_version=__version__,
+        capabilities=server.get_capabilities(
+            notification_options=NotificationOptions(),
+            experimental_capabilities={},
+        ),
+    )
 
 
 def build_adapter_server(client: DaemonClient) -> Server:
@@ -83,7 +101,11 @@ async def run_adapter(config: Config) -> int:
 
     try:
         async with stdio_server() as (read_stream, write_stream):
-            await server.run(read_stream, write_stream)
+            await server.run(
+                read_stream,
+                write_stream,
+                build_initialization_options(server),
+            )
     finally:
         await client.close()
     return 0
