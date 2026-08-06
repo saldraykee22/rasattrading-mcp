@@ -79,11 +79,13 @@ async def ex_ctx(ex_db):
             "market": market, "service": service}
 
 
-async def _add_real_account(ex_ctx, label="main", balance_usdt=10000.0, tags=None):
+async def _add_real_account(ex_ctx, label="main", balance_usdt=10000.0, tags=None, base_holdings=None):
     ctx = ex_ctx
     created = await ctx["accounts"].add_account(label=label, api_key=f"AK_{label}", api_secret=f"AS_{label}", tags=tags or [])
     await ctx["accounts"].enable_real_trading(created["account_id"], actor="test")
-    ctx["broker"].balances[created["account_id"]] = {"USDT": balance_usdt}
+    balances = {"USDT": balance_usdt}
+    balances.update(base_holdings or {})
+    ctx["broker"].balances[created["account_id"]] = balances
     return created["account_id"]
 
 
@@ -335,6 +337,88 @@ async def test_aggregate_exposure_cap_with_override(ex_ctx):
         quantity=2.0, idempotency_key="agg-3",
     )
     assert allowed["status"] == "FILLED"
+
+
+# ---------- serbest bakiye kontrolü (3.8: equity değil, available) ----------
+
+
+async def test_buy_uses_free_quote_not_equity(ex_ctx):
+    ctx = ex_ctx
+    # BTC holdingli hesap: equity (1*100 + 100 = 200) > serbest USDT (100)
+    account_id = await _add_real_account(ctx, balance_usdt=100.0, base_holdings={"BTC": 1.0})
+    service = ctx["service"]
+
+    # equity yetse bile serbest USDT'yi aşan 1 BTC (100 + 0.1 fee) → INSUFFICIENT_BALANCE
+    with pytest.raises(RasatError) as exc_info:
+        await service.place_order(
+            account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="MARKET",
+            quantity=1.0, idempotency_key="buy-no-free",
+        )
+    assert exc_info.value.code == ErrorCode.INSUFFICIENT_BALANCE
+    assert len(ctx["broker"].placed) == 0  # borsaya gitmedi
+
+    # 0.9 BTC (90 + 0.09) serbest USDT içinde → geçer
+    ok = await service.place_order(
+        account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="MARKET",
+        quantity=0.9, idempotency_key="buy-free-ok",
+    )
+    assert ok["status"] == "FILLED"
+
+
+async def test_buy_zero_balance_insufficient(ex_ctx):
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx, balance_usdt=0.0)
+    service = ctx["service"]
+    with pytest.raises(RasatError) as exc_info:
+        await service.place_order(
+            account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="MARKET",
+            quantity=1.0, idempotency_key="zero-bal",
+        )
+    assert exc_info.value.code == ErrorCode.INSUFFICIENT_BALANCE  # INVALID_REQUEST değil
+    assert len(ctx["broker"].placed) == 0
+
+
+async def test_sell_requires_free_base(ex_ctx):
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx, base_holdings={"BTC": 0.5})
+    service = ctx["service"]
+
+    # 0.5 BTC var; 1.0 satılamaz → INSUFFICIENT_BALANCE
+    with pytest.raises(RasatError) as exc_info:
+        await service.place_order(
+            account_id=account_id, symbol="BTCUSDT", side="SELL", order_type="MARKET",
+            quantity=1.0, idempotency_key="sell-no-base",
+        )
+    assert exc_info.value.code == ErrorCode.INSUFFICIENT_BALANCE
+    assert len(ctx["broker"].placed) == 0
+
+    ok = await service.place_order(
+        account_id=account_id, symbol="BTCUSDT", side="SELL", order_type="MARKET",
+        quantity=0.5, idempotency_key="sell-base-ok",
+    )
+    assert ok["status"] == "FILLED"
+
+
+async def test_execute_sell_requires_free_base(ex_ctx):
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx, base_holdings={"BTC": 0.05})
+    service = ctx["service"]
+    result = await service.execute_on_accounts(
+        account_ids=[account_id], symbol="BTCUSDT", side="SELL", entry=100, stop_loss=105,
+        risk_pct=0.01, idempotency_key="sell-sized",
+    )
+    # risk sizing ~20 BTC üretir ama serbest base 0.05 → borsaya gitmeden reddedilir
+    assert result["results"][0]["status"] == "REJECTED"
+    assert result["results"][0]["error"]["code"] == ErrorCode.INSUFFICIENT_BALANCE
+    assert len(ctx["broker"].placed) == 0
+
+    # yeterli base varsa SELL işlenir
+    ok_id = await _add_real_account(ctx, label="sell-ok", base_holdings={"BTC": 1.0})
+    ok = await service.execute_on_accounts(
+        account_ids=[ok_id], symbol="BTCUSDT", side="SELL", entry=100, stop_loss=105,
+        risk_pct=0.0001, idempotency_key="sell-sized-ok",
+    )
+    assert ok["results"][0]["status"] == "FILLED"
 
 
 # ---------- accuracy checks her zaman aktif ----------

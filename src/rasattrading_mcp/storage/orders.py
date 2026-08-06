@@ -379,6 +379,49 @@ class OrderService:
         check_price_fresh(FRESHNESS_FRESH if price is not None else None, symbol)
         check_stop_direction(side, entry, stop_loss)
 
+    @staticmethod
+    def _check_available_balance(
+        *,
+        balances: dict,
+        side: str,
+        symbol: str,
+        base_asset: str,
+        quote_asset: str,
+        quantity: float,
+        notional: float,
+        fee: float,
+    ) -> None:
+        """Spot'ta emrin gerektirdiği SERBEST bakiyeyi kontrol eder (3.8).
+
+        - BUY  → serbest quote-asset (USDT) >= notional + fee
+        - SELL → serbest base-asset >= quantity
+
+        Equity değil, broker'ın `free` bakiyesi kullanılır: base asset tutan bir
+        hesapta equity mevcut USDT'den büyük olduğu için equity-bazlı kontrol
+        "yetersiz bakiye → gönderilmez" garantisini sağlamaz (review H1).
+        Yetersizlikte her zaman `INSUFFICIENT_BALANCE` fırlatılır.
+        """
+        side_norm = (side or "BUY").upper()
+        if side_norm == "BUY":
+            available = float(balances.get(quote_asset, 0) or 0)
+            required = notional + fee
+            if required > available:
+                raise RasatError(
+                    ErrorCode.INSUFFICIENT_BALANCE,
+                    f"yetersiz bakiye: BUY için gereken {required:.8f} {quote_asset} "
+                    f"> serbest {available:.8f} ({symbol})",
+                )
+        elif side_norm == "SELL":
+            available = float(balances.get(base_asset, 0) or 0)
+            if quantity > available:
+                raise RasatError(
+                    ErrorCode.INSUFFICIENT_BALANCE,
+                    f"yetersiz bakiye: SELL için gereken {quantity:.8f} {base_asset} "
+                    f"> serbest {available:.8f} ({symbol})",
+                )
+        else:
+            raise RasatError(ErrorCode.INVALID_REQUEST, f"geçersiz side: {side}")
+
     async def _execute_one_sized(
         self,
         account: dict,
@@ -402,7 +445,7 @@ class OrderService:
         if existing is not None:
             return await self._handle_existing(account, existing)
 
-        # 1) Daemon'ın kendi taze bakiye + equity snapshot'ı
+        # 1) Daemon'ın kendi taze bakiye snapshot'ı + equity + exchange filtreleri
         balances = await self.broker.get_balance(account_id=account["account_id"])
         equity = 0.0
         for asset, free in balances.items():
@@ -413,13 +456,34 @@ class OrderService:
             if asset_price is not None:
                 equity += free * asset_price
 
-        # 2) Position sizing (exchange filtrelerine uyumlu, fee-aware)
         filters = await self.market.filters(symbol)
         if filters is None:
             raise RasatError(ErrorCode.FILTER_VIOLATION, f"exchangeInfo filtreleri yok: {symbol}")
+
+        # 3.8: boyutlandırma girişi yan-aware — BUY'da serbest USDT (equity değil),
+        # SELL'de equity (base gate'i boyutlandırma sonrası uygulanır). Sıfır
+        # bakiye INSUFFICIENT_BALANCE döner, INVALID_REQUEST değil.
+        side_norm = (side or "BUY").upper()
+        if side_norm == "BUY":
+            available_quote = float(balances.get(quote_asset, 0) or 0)
+            if available_quote <= 0:
+                raise RasatError(
+                    ErrorCode.INSUFFICIENT_BALANCE,
+                    f"yetersiz bakiye: serbest {quote_asset} 0 ({symbol})",
+                )
+            sizing_balance = available_quote
+        else:
+            sizing_balance = equity
+            if sizing_balance <= 0:
+                raise RasatError(
+                    ErrorCode.INSUFFICIENT_BALANCE,
+                    f"yetersiz bakiye: hesap bakiyesi 0 ({symbol})",
+                )
+
+        # 2) Position sizing (exchange filtrelerine uyumlu, fee-aware)
         sized = calculate_position_size(
             symbol=symbol,
-            account_balance=equity,
+            account_balance=sizing_balance,
             risk_pct=risk_pct,
             entry=entry,
             stop_loss=stop_loss,
@@ -430,14 +494,23 @@ class OrderService:
         quantity = sized["quantity"]
         notional = quantity * price
 
-        # 3) Risk politikası cap'leri (override yoksa katı)
+        # 3) Serbest bakiye gate'i (3.8): BUY → serbest USDT, SELL → serbest base.
+        #    Market fiyatı entry'den yüksekse sizing'in entry-bazlı cap'i yetmez;
+        #    bu gate nihai notional/fee üzerinden borsaya gitmeden reddeder.
+        self._check_available_balance(
+            balances=balances, side=side_norm, symbol=symbol,
+            base_asset=filters.base_asset, quote_asset=quote_asset,
+            quantity=quantity, notional=notional, fee=notional * self.default_fee_rate,
+        )
+
+        # 4) Risk politikası cap'leri (override yoksa katı)
         policy = await self.risk.get_policy(account["account_id"])
         exposure_after = await self._current_exposure(account["account_id"], quote_asset) + notional
         await self._enforce_caps_or_override(
             account, policy, symbol, notional, exposure_after, idempotency_key
         )
 
-        # 4) Emri gönder
+        # 5) Emri gönder
         return await self._place_and_record(
             account, is_real, symbol, side, order_type, quantity, entry, notional, price,
             idempotency_key, equity, actor,
@@ -469,11 +542,22 @@ class OrderService:
         if existing is not None:
             return await self._handle_existing(account, existing)
 
+        # 3.8: serbest bakiye gate'i (BUY → USDT, SELL → base) — equity değil.
+        filters = await self.market.filters(symbol)
+        base_asset = filters.base_asset if filters else (
+            symbol[: -len("USDT")] if symbol.endswith("USDT") else symbol
+        )
+        balances = await self.broker.get_balance(account_id=account_id)
+        self._check_available_balance(
+            balances=balances, side=(side or "BUY").upper(), symbol=symbol,
+            base_asset=base_asset, quote_asset="USDT",
+            quantity=quantity, notional=notional, fee=notional * self.default_fee_rate,
+        )
+
         policy = await self.risk.get_policy(account_id)
         exposure_after = await self._current_exposure(account_id, "USDT") + notional
         await self._enforce_caps_or_override(account, policy, symbol, notional, exposure_after, idempotency_key)
 
-        balances = await self.broker.get_balance(account_id=account_id)
         equity = sum(float(v) for v in balances.values())
         return await self._place_and_record(
             account, is_real, symbol, side, order_type, quantity, price, notional, market_price,
