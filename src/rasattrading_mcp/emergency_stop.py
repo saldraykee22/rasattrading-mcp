@@ -19,7 +19,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import sys
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -38,15 +41,19 @@ logger = logging.getLogger("rasattrading.emergency_stop")
 SELL_LOG_ACTION = "emergency_sell"
 CANCEL_LOG_ACTION = "emergency_cancel"
 
+_FILTERS_TTL_SECONDS = 3600.0
+
 
 class PublicPriceSource:
-    """Binance public `/api/v3/ticker/price` — imzasız, daemon/pipeline'dan bağımsız fiyat kaynağı.
+    """Binance public `/api/v3/ticker/price` + `/api/v3/exchangeInfo` — imzasız,
+    daemon/pipeline'dan bağımsız fiyat/filtre kaynağı (ticket 3.7, 3.16).
 
     `EmergencyStopRunner.market_price` arayüzünü karşılar (`price` + `filters`).
     Fiyat alınamıyorsa `None` dönmez, `RasatError` fırlatır — böylece çağıran
     (EmergencyStopRunner) asset'i `price_errors` içinde fail-loud raporlar.
-    `filters` bilinmiyor → `None` (acil satışta step/min_qty bilgisi yoksa
-    serbest bakiye olduğu gibi satılır).
+    3.16: `filters` imzasız public exchangeInfo'dan çekilir ve cache'lenir;
+    filtre alınamazsa runner fail-closed davranır (ham miktar asla gönderilmez).
+    Fiyat finite/pozitif değilse reddedilir.
     """
 
     def __init__(
@@ -60,6 +67,7 @@ class PublicPriceSource:
         self._session = session
         self._own_session = session is None
         self._timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+        self._filters_cache: dict[str, tuple[float, SymbolFilters]] = {}
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -85,12 +93,42 @@ class PublicPriceSource:
         if not isinstance(data, dict) or "price" not in data:
             raise RasatError(ErrorCode.INTERNAL_ERROR, f"fiyat kaynağı geçersiz yanıt ({symbol})")
         try:
-            return float(data["price"])
+            price = float(data["price"])
         except (TypeError, ValueError):
             raise RasatError(ErrorCode.INTERNAL_ERROR, f"fiyat kaynağı geçersiz fiyat ({symbol})") from None
+        # 3.16/M2: finite ve pozitif olmayan fiyat asla kabul edilmez.
+        if not math.isfinite(price) or price <= 0:
+            raise RasatError(ErrorCode.INTERNAL_ERROR, f"fiyat kaynağı finite/pozitif olmayan fiyat ({symbol})")
+        return price
+
+    async def _exchange_info(self) -> dict[str, dict]:
+        """Public exchangeInfo'yu çeker; sembol → ham entry dict döner (imzasız)."""
+        session = await self._get_session()
+        try:
+            async with session.get(f"{self.base_url}/api/v3/exchangeInfo", timeout=self._timeout) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise RasatError(ErrorCode.INTERNAL_ERROR, f"exchangeInfo alınamadı: {exc}") from exc
+        if not isinstance(data, dict) or not isinstance(data.get("symbols"), list):
+            raise RasatError(ErrorCode.INTERNAL_ERROR, "exchangeInfo geçersiz yanıt")
+        return {str(e.get("symbol", "")): e for e in data["symbols"] if e.get("symbol")}
 
     async def filters(self, symbol: str) -> SymbolFilters | None:
-        return None
+        now = time.time()
+        cached = self._filters_cache.get(symbol)
+        if cached is not None and now - cached[0] < _FILTERS_TTL_SECONDS:
+            return cached[1]
+        try:
+            info = await self._exchange_info()
+        except RasatError:
+            info = {}
+        entry = info.get(symbol)
+        if entry is None:
+            return None
+        filters = SymbolFilters.from_exchange_info(entry)
+        self._filters_cache[symbol] = (now, filters)
+        return filters
 
     async def close(self) -> None:
         if self._own_session and self._session is not None and not self._session.closed:
@@ -167,34 +205,54 @@ class EmergencyStopRunner:
                         "error": {"code": ErrorCode.ACCOUNT_NO_CREDENTIALS, "message": "credential yok — atlandı"}}
             raise
 
-        # 1) Açık emirleri iptal et
+        # 1) Açık emirleri iptal et — 3.15: done anahtarı hesap+sembol değil,
+        # HESAP+SEMBOL+EMİR KİMLİĞİ. Yeni bir açık emir (yeni client_order_id)
+        # eski cancel log'una takılıp atlanmaz, gerçekten iptal edilir.
         open_orders = await self.broker.get_all_open_orders(account_id=account_id)
-        symbols_with_orders = {o["symbol"] for o in open_orders if o.get("symbol")}
+        by_symbol: dict[str, list[dict]] = {}
+        for o in open_orders:
+            by_symbol.setdefault(o.get("symbol") or "", []).append(o)
         cancelled = 0
-        for symbol in sorted(symbols_with_orders):
+        for symbol, orders in sorted(by_symbol.items()):
             if dry_run:
                 continue
-            if self.log.is_action_done(CANCEL_LOG_ACTION, f"{account_id}:{symbol}"):
+            keys = [f"{account_id}:{symbol}:{o.get('client_order_id') or o.get('order_id')}" for o in orders]
+            if all(self.log.is_action_done(CANCEL_LOG_ACTION, k) for k in keys):
                 continue
             n = await self.broker.cancel_all_open_orders(account_id=account_id, symbol=symbol)
             cancelled += n
-            self.log.append(
-                actor="emergency_stop",
-                action=CANCEL_LOG_ACTION,
-                details={"idem_key": f"{account_id}:{symbol}", "account_id": account_id, "symbol": symbol, "cancelled": n},
-            )
+            for k in keys:
+                self.log.append(
+                    actor="emergency_stop",
+                    action=CANCEL_LOG_ACTION,
+                    details={"idem_key": k, "account_id": account_id, "symbol": symbol, "cancelled": n},
+                )
 
-        # 2) Base asset bakiyelerini topla → satış planı
+        # 2) Base asset bakiyelerini topla → satış planı (3.16: filtre fail-closed)
         balances = await self.broker.get_balance(account_id=account_id)
         plan: list[dict] = []
         price_errors: list[dict] = []
+        filter_errors: list[dict] = []
         for asset, free in balances.items():
             if asset == self.quote_asset or free <= 0:
                 continue
             symbol = f"{asset}{self.quote_asset}"
             filters = await self._symbol_filters(symbol)
-            qty = self._round_down(free, filters.step_size if filters else 0)
-            if filters is not None and qty < filters.min_qty:
+            if filters is None:
+                # 3.16: filtre bilgisi yoksa ham miktar ASLA gönderilmez (fail-closed)
+                filter_errors.append(
+                    {"symbol": symbol, "asset": asset,
+                     "error": {"code": ErrorCode.FILTER_VIOLATION,
+                               "message": "filtre bilgisi alınamadı — satış yapılmadı"}}
+                )
+                continue
+            qty = self._round_down(free, filters.step_size)
+            if qty < filters.min_qty:
+                filter_errors.append(
+                    {"symbol": symbol, "asset": asset,
+                     "error": {"code": ErrorCode.FILTER_VIOLATION,
+                               "message": f"miktar LOT_SIZE minQty altında: {qty} < {filters.min_qty}"}}
+                )
                 continue
             try:
                 price = await self._price(symbol, filters)
@@ -204,6 +262,13 @@ class EmergencyStopRunner:
                 price_errors.append(
                     {"symbol": symbol, "asset": asset,
                      "error": {"code": exc.code, "message": exc.message}}
+                )
+                continue
+            if qty * price < filters.min_notional:
+                filter_errors.append(
+                    {"symbol": symbol, "asset": asset,
+                     "error": {"code": ErrorCode.FILTER_VIOLATION,
+                               "message": f"tutar MIN_NOTIONAL altında: {qty * price:.6g} < {filters.min_notional}"}}
                 )
                 continue
             plan.append({"symbol": symbol, "asset": asset, "quantity": qty, "price": price,
@@ -221,14 +286,33 @@ class EmergencyStopRunner:
                         "error": {"code": "ABORTED", "message": "kullanıcı onaylamadı"},
                         "plan": plan}
 
+        # 3) Sat — 3.15: done anahtarı MİKTAR + run nonce'ı içerir; FILLED olmayan
+        # (NEW/PARTIALLY_FILLED/UNKNOWN) satış "done" sayılmaz, broker'dan gerçek
+        # durum sorgulanır (reconcile-before-resend). Aynı miktarın rebuy'ı dahi
+        # yeni run nonce'ı ile yeni SELL üretir.
+        run_nonce = uuid.uuid4().hex[:8]
         sold = []
         for p in plan:
             if dry_run:
                 sold.append({**p, "status": "DRY_RUN"})
                 continue
-            if self.log.is_action_done(SELL_LOG_ACTION, f"{account_id}:{p['symbol']}"):
-                sold.append({**p, "status": "SKIPPED_DONE"})
-                continue
+            sell_key = f"{account_id}:{p['symbol']}:{p['quantity']}:{run_nonce}"
+            cid = f"emergency-{account_id[:8]}-{run_nonce}"
+            # Bu sembolde işlemde kalmış bir emergency sell var mı?
+            prior = self._latest_sell_details(account_id, p["symbol"])
+            if prior is not None and prior.get("status") in ("NEW", "PARTIALLY_FILLED", "UNKNOWN"):
+                prior_cid = prior.get("cid") or f"emergency-{account_id[:8]}-{prior.get('run_nonce') or ''}"
+                try:
+                    found = await self.broker.query_order(
+                        account_id=account_id, symbol=p["symbol"], client_order_id=prior_cid,
+                    )
+                except RasatError:
+                    found = None
+                if found is not None and found.status in ("NEW", "PARTIALLY_FILLED", "UNKNOWN"):
+                    sold.append({**p, "status": found.status, "exchange_order_id": found.exchange_order_id})
+                    continue
+                # FILLED döndüyse önceki satış dolu; mevcut bakiye yeniden alınmış
+                # olabilir → yeni SELL yerleştir. Not found → önceki hiç gitmemiş → yeni SELL.
             try:
                 result = await self.broker.place_order(
                     account_id=account_id,
@@ -237,13 +321,15 @@ class EmergencyStopRunner:
                     order_type="MARKET",
                     quantity=p["quantity"],
                     price=None,
-                    client_order_id=f"emergency-{account_id[:8]}-{p['symbol']}",
+                    client_order_id=cid,
                 )
                 self.log.append(
                     actor="emergency_stop",
                     action=SELL_LOG_ACTION,
                     details={
-                        "idem_key": f"{account_id}:{p['symbol']}",
+                        "idem_key": sell_key,
+                        "cid": cid,
+                        "run_nonce": run_nonce,
                         "account_id": account_id,
                         "symbol": p["symbol"],
                         "quantity": p["quantity"],
@@ -258,12 +344,28 @@ class EmergencyStopRunner:
         sell_failed = any(s.get("status") == "FAILED" for s in sold)
         return {
             "account_id": account_id,
-            "ok": not price_errors and not sell_failed,
+            "ok": not price_errors and not filter_errors and not sell_failed,
             "cancelled_orders": cancelled,
             "sold": sold,
             "price_errors": price_errors,
+            "filter_errors": filter_errors,
             "plan": plan if dry_run else None,
         }
+
+    def _latest_sell_details(self, account_id: str, symbol: str) -> dict | None:
+        """Bu sembol için en son loglanmış emergency sell kaydı (yoksa None)."""
+        prefix = f"{account_id}:{symbol}:"
+        latest: dict | None = None
+        for row in self.log.entries():
+            if row.get("_corrupt"):
+                continue
+            details = row.get("details") or {}
+            if row.get("action") != SELL_LOG_ACTION:
+                continue
+            if not str(details.get("idem_key", "")).startswith(prefix):
+                continue
+            latest = details
+        return latest
 
     async def _symbol_filters(self, symbol: str) -> SymbolFilters | None:
         if self.market_price is not None and hasattr(self.market_price, "filters"):
@@ -317,19 +419,28 @@ async def run_emergency_stop(
         await run_migrations(db)
         accounts = AccountService(db, secret_store=SecretStore())
         budget = RateLimitBudget(max_weight=config.rate_limit_max_weight, window_seconds=60)
+        owned_broker = broker is None
         if broker is None:
             broker = BinanceOrderBroker(
                 config.rest_spot_base,
                 credentials=lambda account_id: accounts.get_credentials(account_id),
                 budget=budget,
             )
+        owned_price = market_price is None
         if market_price is None:
             market_price = PublicPriceSource(config.rest_spot_base)
         log = EmergencyLog(config.data_dir / "emergency_stop.log")
         runner = EmergencyStopRunner(
             config, accounts, broker, log, market_price=market_price
         )
-        return await runner.run(account_ids=account_ids, yes=yes, dry_run=dry_run)
+        try:
+            return await runner.run(account_ids=account_ids, yes=yes, dry_run=dry_run)
+        finally:
+            # 3.16/M2: runner'ın kendi açtığı HTTP session'ları kapat (sızıntı yok).
+            if owned_price and market_price is not None and hasattr(market_price, "close"):
+                await market_price.close()
+            if owned_broker and broker is not None and hasattr(broker, "close"):
+                await broker.close()
     finally:
         await db.stop()
 
