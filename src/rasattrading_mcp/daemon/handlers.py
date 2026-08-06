@@ -8,7 +8,7 @@ from typing import Any
 
 from .. import __version__
 from ..daemon.readiness import Readiness
-from ..envelope import FRESHNESS_FRESH, Meta, SOURCE_DAEMON, utc_iso
+from ..envelope import FRESHNESS_FRESH, FRESHNESS_STALE, Meta, SOURCE_DAEMON, utc_iso
 from ..errors import RasatError, ErrorCode
 from .server import ToolDispatcher
 

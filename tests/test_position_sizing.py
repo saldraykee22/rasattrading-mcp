@@ -285,6 +285,35 @@ async def test_calculate_position_size_rejects_stale_price(pipeline_ctx):
     assert exc_info.value.code == ErrorCode.STALE_DATA
 
 
+async def test_get_symbol_info_universe_error_returns_stale_freshness(pipeline_ctx):
+    # 3.10 regresyon: universe != ok iken FRESHNESS_STALE import eksikliği
+    # NameError yerine doğru freshness dönmeli.
+    dispatcher, ctx, pipeline = pipeline_ctx
+    pipeline.universe._status = "stale"
+    data, meta = await dispatcher.dispatch("get_symbol_info", {"symbol": "BTCUSDT"}, ctx)
+    assert data["symbol"] == "BTCUSDT"
+    assert meta.freshness == FRESHNESS_STALE
+
+
+async def test_calculate_position_size_no_ticker_returns_stale_not_internal(pipeline_ctx):
+    # 3.10 regresyon: ticker None iken FRESHNESS_STALE NameError yerine STALE_DATA
+    dispatcher, ctx, pipeline = pipeline_ctx
+    # ETHUSDT evrende ama ticker cache'inde yok → get_ticker None
+    with pytest.raises(RasatError) as exc_info:
+        await dispatcher.dispatch(
+            "calculate_position_size",
+            {
+                "symbol": "ETHUSDT",
+                "account_balance": 10000,
+                "risk_pct": 0.01,
+                "entry": 100,
+                "stop_loss": 95,
+            },
+            ctx,
+        )
+    assert exc_info.value.code == ErrorCode.STALE_DATA
+
+
 async def test_calculate_position_size_rejects_unknown_symbol(pipeline_ctx):
     dispatcher, ctx, _ = pipeline_ctx
     with pytest.raises(RasatError) as exc_info:
