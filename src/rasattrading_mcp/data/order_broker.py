@@ -17,11 +17,11 @@ import hashlib
 import hmac
 import logging
 import time
-import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol
 
 import aiohttp
+import yarl
 
 from ..errors import ErrorCode, RasatError
 from .rate_limit import RateLimitBudget
@@ -126,26 +126,32 @@ class BinanceOrderBroker:
             self._session = aiohttp.ClientSession(timeout=self._timeout)
         return self._session
 
-    async def _signed_params(self, account_id: str, params: dict) -> tuple[str, dict]:
+    async def _signed_request_url(self, account_id: str, path: str, params: dict) -> tuple[str, str]:
+        """İmzalı isteğin (api_key, tam URL) çiftini üretir.
+
+        İmza, yarl'ın üreteceği query string'in BİREBİR aynısı üzerinden
+        hesaplanır (Binance, gönderilen ham query sırasına göre doğrular).
+        aiohttp'e params= dict'i bırakılırsa yarl kendi ekleme sırasını kullanır
+        ve sorted() imzalı string'le uyuşmaz — canlı API'de -1022 üretir.
+        """
         api_key, api_secret = await self._credentials(account_id)
         base = dict(params)
         base["timestamp"] = int(time.time() * 1000)
         base["recvWindow"] = self._recv_window_ms
-        qs = urllib.parse.urlencode(sorted(base.items()))
-        signature = hmac.new(api_secret.encode("utf-8"), qs.encode("utf-8"), hashlib.sha256).hexdigest()
-        base["signature"] = signature
-        return api_key, base
+        url = yarl.URL(f"{self._base_url}{path}").with_query(base)
+        signature = hmac.new(api_secret.encode("utf-8"), url.query_string.encode("utf-8"), hashlib.sha256).hexdigest()
+        signed_url = str(url.with_query({**base, "signature": signature}))
+        return api_key, signed_url
 
     async def _request(self, method: str, path: str, account_id: str, params: dict) -> dict:
         if self._budget is not None:
             weight = 5 if path == "/api/v3/account" else 1
             await self._budget.acquire(weight)
-        api_key, signed = await self._signed_params(account_id, params)
+        api_key, signed_url = await self._signed_request_url(account_id, path, params)
         session = await self._get_session()
         headers = {"X-MBX-APIKEY": api_key}
-        url = f"{self._base_url}{path}"
         try:
-            async with session.request(method, url, params=signed, headers=headers, timeout=self._timeout) as resp:
+            async with session.request(method, signed_url, headers=headers, timeout=self._timeout) as resp:
                 used = resp.headers.get("x-mbx-used-weight-1m")
                 if used and used.isdigit() and self._budget is not None:
                     self._budget.note_used(int(used))

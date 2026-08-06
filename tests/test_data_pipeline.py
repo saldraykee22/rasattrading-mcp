@@ -87,6 +87,100 @@ async def test_binance_rest_401_maps_to_unauthorized():
             await client.close()
 
 
+async def test_signed_broker_signature_verifies_against_sent_query():
+    """İmza, gönderilen query string'in birebir aynısı üzerinden doğrulanmalı.
+
+    Binance imzayı alınan ham query sırasına göre hesaplar; istemci aiohttp'e
+    params= dict bırakıp sorted() string'i imzalarsa sıra farkı -1022 üretir
+    (canlı API'de yakalanan bug, f8fcd2b sonrası gerçek hesap doğrulaması).
+    """
+    import hashlib
+    import hmac
+
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+
+    from rasattrading_mcp.data.order_broker import BinanceOrderBroker
+
+    api_key = "TESTKEY0000000000000000000000000000"
+    api_secret = "TESTSECRET00000000000000000000000000"
+    received: dict = {}
+
+    def _verify(request) -> tuple[bool, dict]:
+        qs = request.query_string
+        params = dict(request.query)  # parse edilmiş
+        signature = params.pop("signature", None)
+        if not signature:
+            return False, {"code": -1022, "msg": "Signature for this request is not valid."}
+        signed_part = qs[: qs.index("&signature=")]
+        expected = hmac.new(api_secret.encode("utf-8"), signed_part.encode("utf-8"), hashlib.sha256).hexdigest()
+        if expected != signature:
+            return False, {"code": -1022, "msg": "Signature for this request is not valid."}
+        return True, {"code": 200}
+
+    app = web.Application()
+
+    async def account_handler(request):
+        ok, body = _verify(request)
+        received["account_qs"] = request.query_string
+        if not ok:
+            return web.json_response(body, status=400)
+        return web.json_response(
+            {"balances": [{"asset": "USDT", "free": "123.45", "locked": "0"}], "canTrade": True}
+        )
+
+    async def order_handler(request):
+        ok, body = _verify(request)
+        received["order_qs"] = request.query_string
+        if not ok:
+            return web.json_response(body, status=400)
+        return web.json_response(
+            {
+                "orderId": 12345,
+                "clientOrderId": "abc-1",
+                "status": "FILLED",
+                "executedQty": "0.001",
+                "cummulativeQuoteQty": "64.5",
+                "symbol": "BTCUSDT",
+                "side": "BUY",
+                "type": "MARKET",
+            }
+        )
+
+    app.router.add_get("/api/v3/account", account_handler)
+    app.router.add_post("/api/v3/order", order_handler)
+
+    async with TestServer(app) as server:
+        async def creds(_aid):
+            return (api_key, api_secret)
+
+        broker = BinanceOrderBroker(
+            server.make_url("/").human_repr(),
+            credentials=creds,
+            budget=RateLimitBudget(6000),
+        )
+        try:
+            balances = await broker.get_balance(account_id="a1")
+            assert balances["USDT"] == 123.45
+            assert received["account_qs"].startswith("timestamp=")
+            assert "recvWindow" in received["account_qs"]
+
+            result = await broker.place_order(
+                account_id="a1",
+                symbol="BTCUSDT",
+                side="BUY",
+                order_type="MARKET",
+                quantity=0.001,
+                price=None,
+                client_order_id="abc-1",
+            )
+            assert result.status == "FILLED"
+            assert result.exchange_order_id == "12345"
+            assert "symbol=BTCUSDT" in received["order_qs"]
+        finally:
+            await broker.close()
+
+
 # ---------- universe ----------
 
 async def test_universe_sync_filters(cfg, db):
