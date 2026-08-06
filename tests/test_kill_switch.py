@@ -85,7 +85,64 @@ async def _add_real_account(ex_ctx, label="main", balance_usdt=10000.0, base_hol
     return created["account_id"]
 
 
-# ---------- close_all_positions ----------
+# ---------- kill switch: close_all_positions ----------
+
+
+async def _plant_open_order(ex_ctx, account_id, idempotency_key):
+    """place_result=NEW ile açık (borsada duran) bir emir yerleştir."""
+    ctx = ex_ctx
+    ctx["broker"].place_result = {"status": "NEW"}
+    service = ctx["service"]
+    return await service.place_order(
+        account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="LIMIT",
+        quantity=0.5, price=80, idempotency_key=idempotency_key,
+    )
+
+
+async def test_close_all_positions_cancel_failure_not_marked_canceled(ex_ctx):
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
+    placed = await _plant_open_order(ctx, account_id, "open-fail")
+    cid = to_client_order_id("open-fail")
+    ctx["broker"].cancel_errors[cid] = RasatError(ErrorCode.TIMEOUT, "iptal ağ hatası")
+
+    service = ctx["service"]
+    result = await service.close_all_positions(account_id=account_id, actor="test")
+    detail = result["results"][0]
+    # iptal başarısız → hesap kapandı denmez; hata raporlanır
+    assert detail["closed"] is False
+    assert len(detail["cancel_errors"]) == 1
+    assert detail["cancel_errors"][0]["error"]["code"] == ErrorCode.TIMEOUT
+    assert "BTCUSDT" not in detail["cancelled"]
+
+    # yerel durum CANCELED değil → UNKNOWN + hata kodu
+    def _q(conn):
+        return dict(conn.execute("SELECT * FROM orders WHERE order_id = ?", (placed["order_id"],)).fetchone())
+
+    row = await ctx["db"].read(_q)
+    assert row["status"] != "CANCELED"
+    assert row["status"] == "UNKNOWN"
+    assert row["error_code"] == ErrorCode.TIMEOUT
+    assert len(ctx["broker"].cancelled) == 0  # borsaya iptal kaydı düşmedi
+
+
+async def test_close_all_positions_cancel_success_marks_canceled(ex_ctx):
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
+    placed = await _plant_open_order(ctx, account_id, "open-ok")
+
+    service = ctx["service"]
+    result = await service.close_all_positions(account_id=account_id, actor="test")
+    detail = result["results"][0]
+    assert detail["closed"] is True
+    assert detail["cancel_errors"] == []
+    assert "BTCUSDT" in detail["cancelled"]
+
+    def _q(conn):
+        return dict(conn.execute("SELECT * FROM orders WHERE order_id = ?", (placed["order_id"],)).fetchone())
+
+    row = await ctx["db"].read(_q)
+    assert row["status"] == "CANCELED"
 
 
 async def test_close_all_positions_single_account_sells_holdings(ex_ctx):

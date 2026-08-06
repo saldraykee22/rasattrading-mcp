@@ -90,10 +90,12 @@ class FakeOrderBroker:
     def __init__(self, balances: dict[str, dict] | None = None) -> None:
         self.placed: list[dict] = []
         self.queries: list[dict] = []
+        self.cancelled: list[dict] = []
         self.balances = balances or {}
         self.place_result: dict | None = None
         self.place_errors: dict[str, Exception] = {}
         self.query_results: dict[str, object | None] = {}
+        self.cancel_errors: dict[str, Exception] = {}
         self._seq = 1000
 
     async def place_order(self, *, account_id, symbol, side, order_type, quantity, price, client_order_id):
@@ -158,7 +160,8 @@ class FakeOrderBroker:
         return OrderResult(status="FILLED", exchange_order_id="EX1", executed_qty=match[0]["quantity"])
 
     async def cancel_order(self, *, account_id, symbol, client_order_id):
-        self.cancelled = getattr(self, "cancelled", [])
+        if client_order_id in self.cancel_errors:
+            raise self.cancel_errors[client_order_id]
         self.cancelled.append(
             {"account_id": account_id, "symbol": symbol, "client_order_id": client_order_id}
         )

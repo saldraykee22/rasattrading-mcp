@@ -922,6 +922,7 @@ class OrderService:
         account_id = account["account_id"]
         is_real = await self._is_real(account)
         cancelled: list[str] = []
+        cancel_errors: list[dict] = []
         sold: list[dict] = []
 
         # 1) Açık emirleri iptal et
@@ -944,8 +945,26 @@ class OrderService:
                         symbol=order["symbol"],
                         client_order_id=order["client_order_id"],
                     )
-                except RasatError:
-                    pass
+                except RasatError as exc:
+                    # 3.9: iptal başarısız → sessizce CANCELED yapma. Gerçek
+                    # durum bilinmiyor; UNKNOWN'a çek ve sonuçta açıkça raporla
+                    # (kısmi başarı sözleşmesi, kill switch dahil çağıran görür).
+                    def _unknown(conn: sqlite3.Connection, oid: str = order["order_id"], cerr: RasatError = exc) -> None:
+                        self._update_order(
+                            conn, oid, status="UNKNOWN",
+                            error_code=cerr.code, error_message=cerr.message,
+                        )
+
+                    await self.db.write(_unknown)
+                    cancel_errors.append(
+                        {
+                            "symbol": order["symbol"],
+                            "order_id": order["order_id"],
+                            "client_order_id": order["client_order_id"],
+                            "error": {"code": exc.code, "message": exc.message},
+                        }
+                    )
+                    continue
             cancelled.append(order["symbol"])
 
             def _cancel(conn: sqlite3.Connection, oid: str = order["order_id"]) -> None:
@@ -956,7 +975,7 @@ class OrderService:
         # 2) Base asset bakiyelerini sat
         if not is_real:
             return {"account_id": account_id, "closed": False, "mode": "paper",
-                    "cancelled": cancelled, "sold": sold}
+                    "cancelled": cancelled, "cancel_errors": cancel_errors, "sold": sold}
 
         balances = await self.broker.get_balance(account_id=account_id)
         quote_asset = "USDT"
@@ -993,8 +1012,8 @@ class OrderService:
             sold.append({"symbol": symbol, "quantity": result["quantity"],
                          "status": result["status"], "order_id": result["order_id"]})
 
-        return {"account_id": account_id, "closed": True, "mode": "real",
-                "cancelled": cancelled, "sold": sold}
+        return {"account_id": account_id, "closed": not cancel_errors, "mode": "real",
+                "cancelled": cancelled, "cancel_errors": cancel_errors, "sold": sold}
 
     # ---------- exposure + audit (3.5) ----------
 
