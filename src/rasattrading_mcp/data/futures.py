@@ -18,6 +18,7 @@ from typing import Any
 from ..config import Config
 from ..errors import ErrorCode, RasatError
 from ..storage.db import Database
+from ..timeutil import to_epoch_seconds
 from .binance_client import BinanceREST
 from .universe import UniverseService
 
@@ -47,7 +48,7 @@ class FuturesContextPoller:
                         item["symbol"],
                         "funding_rate",
                         float(rate),
-                        int(item.get("time", 0)),
+                        to_epoch_seconds(item.get("time", 0)),
                         {"next_funding_time": item.get("nextFundingTime")},
                     )
                 )
@@ -69,7 +70,7 @@ class FuturesContextPoller:
                         symbol,
                         "open_interest",
                         float(data.get("openInterest", 0)),
-                        int(data.get("time", 0)),
+                        to_epoch_seconds(data.get("time", 0)),
                         {},
                     )
                 ]
@@ -102,7 +103,10 @@ class FuturesContextPoller:
         rows: list[tuple] = []
         for o in data:
             try:
-                event_time = int(o.get("time", 0))
+                # `_last_liquidation_ts` API `startTime` paramı için ms tutulur;
+                # DB'ye saniye yazılır (tek birim standardı).
+                raw_ms = int(o.get("time", 0))
+                event_time = to_epoch_seconds(raw_ms)
                 price = float(o.get("price", 0))
                 qty = float(o.get("origQty", 0))
                 rows.append(
@@ -114,8 +118,8 @@ class FuturesContextPoller:
                         {"side": o.get("side"), "price": price, "qty": qty},
                     )
                 )
-                if event_time > self._last_liquidation_ts:
-                    self._last_liquidation_ts = event_time
+                if raw_ms > self._last_liquidation_ts:
+                    self._last_liquidation_ts = raw_ms
             except (TypeError, ValueError):
                 continue
         if rows:

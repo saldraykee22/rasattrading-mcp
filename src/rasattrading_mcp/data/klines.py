@@ -17,6 +17,7 @@ from ..config import Config, TIMEFRAME_SECONDS
 from ..envelope import FRESHNESS_FRESH, FRESHNESS_STALE
 from ..errors import ErrorCode, RasatError
 from ..storage.db import Database
+from ..timeutil import to_epoch_seconds
 from .binance_client import BinanceREST, kline_weight
 from .universe import UniverseService
 
@@ -28,13 +29,13 @@ PRIORITY_BACKFILL = 10
 
 
 def parse_klines(raw: list) -> list[dict]:
-    """Binance kline dizisini dict listesine çevirir."""
+    """Binance kline dizisini dict listesine çevirir (open_time saniyeye normalize)."""
     rows = []
     for item in raw:
         try:
             rows.append(
                 {
-                    "open_time": int(item[0]),
+                    "open_time": to_epoch_seconds(item[0]),
                     "open": float(item[1]),
                     "high": float(item[2]),
                     "low": float(item[3]),
