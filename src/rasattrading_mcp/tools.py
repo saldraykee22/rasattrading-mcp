@@ -276,6 +276,58 @@ register_tool(
     )
 )
 
+# ---------- Modül 3 / 3.3: doğruluk kontrolleri + position sizing ----------
+
+register_tool(
+    ToolSpec(
+        name="get_symbol_info",
+        description=(
+            "Binance exchangeInfo filtrelerini döner: LOT_SIZE (step_size/min_qty/max_qty), "
+            "MIN_NOTIONAL, PRICE_FILTER (tick_size/min_price/max_price) + sembol durumu. "
+            "meta.freshness exchangeInfo'nun güncelliğini gösterir."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string", "description": "Spot USDT çifti, örn. BTCUSDT"},
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["symbol"],
+            "additionalProperties": False,
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="calculate_position_size",
+        description=(
+            "Risk-bazlı pozisyon boyutu hesaplar (base asset): account_balance * risk_pct risk tutarı, "
+            "|entry - stop| risk-per-unit'e bölünür; fee düşülür; LOT_SIZE/MIN_NOTIONAL/PRICE_FILTER'e göre "
+            "aşağı yuvarlanır. Borsa filtreleri karşılanamıyorsa FILTER_VIOLATION döner (fail-closed). "
+            "Temel doğruluk kontrolleri her zaman aktiftir: stale fiyat / yanlış stop yönü / bilinmeyen "
+            "sembol / yetersiz bakiye reddedilir."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string", "description": "Spot USDT çifti, örn. BTCUSDT"},
+                "account_balance": {"type": "number", "exclusiveMinimum": 0, "description": "Kotasyon (USDT) bakiyesi"},
+                "risk_pct": {"type": "number", "exclusiveMinimum": 0, "maximum": 1, "description": "Hesap equity yüzdesi (0.02 = %2)"},
+                "entry": {"type": "number", "exclusiveMinimum": 0},
+                "stop_loss": {"type": "number", "exclusiveMinimum": 0},
+                "side": {"type": "string", "enum": ["BUY", "SELL"], "default": "BUY"},
+                "fee_rate": {"type": "number", "minimum": 0, "default": 0.001, "description": "Komisyon oranı"},
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["symbol", "account_balance", "risk_pct", "entry", "stop_loss"],
+            "additionalProperties": False,
+        },
+    )
+)
+
 
 def describe_tools() -> list[dict[str, Any]]:
     return [

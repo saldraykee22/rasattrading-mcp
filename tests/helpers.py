@@ -28,14 +28,26 @@ class FakeRest:
             )
         return rows
 
+    @staticmethod
+    def _symbol_entry(symbol: str, *, status: str = "TRADING", quote_asset: str = "USDT") -> dict:
+        return {
+            "symbol": symbol,
+            "status": status,
+            "baseAsset": symbol.replace(quote_asset, ""),
+            "quoteAsset": quote_asset,
+            "filters": [
+                {"filterType": "LOT_SIZE", "minQty": "0.00001", "maxQty": "100000", "stepSize": "0.00001"},
+                {"filterType": "MIN_NOTIONAL", "minNotional": "5.0", "applyToMarket": True, "avgPriceMins": 5},
+                {"filterType": "PRICE_FILTER", "minPrice": "0.01000000", "maxPrice": "1000000.00000000", "tickSize": "0.01000000"},
+            ],
+        }
+
     async def get(self, path: str, params: dict | None = None, weight: int = 1) -> object:
         params = dict(params or {})
         self.calls.append((path, params, weight))
 
         if path == "/api/v3/exchangeInfo":
-            symbols = [
-                {"symbol": s, "status": "TRADING", "quoteAsset": "USDT"} for s in self.symbols
-            ]
+            symbols = [self._symbol_entry(s) for s in self.symbols]
             symbols.extend(self.extra_exchange_entries)
             return {"timezone": "UTC", "symbols": symbols}
         if path == "/api/v3/klines":

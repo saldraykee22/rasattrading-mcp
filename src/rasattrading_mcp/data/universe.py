@@ -22,26 +22,29 @@ class UniverseService:
         self._rest = rest
         self._refresh_seconds = config.universe_refresh_seconds
         self._symbols: list[str] = []
+        self._info: dict[str, dict] = {}
         self._status = "unknown"  # unknown | ok | stale | error
         self._last_sync: float = 0.0
         self._last_error: str | None = None
 
     async def sync(self) -> int:
-        """exchangeInfo çekip USDT/TRADING evrenini günceller. Sembol sayısını döner."""
+        """exchangeInfo çekip USDT/TRADING evrenini ve sembol filtrelerini günceller."""
         try:
             data = await self._rest.get("/api/v3/exchangeInfo", weight=20)
+            entries = {s["symbol"]: s for s in data.get("symbols", [])}
             symbols = [
-                s["symbol"]
-                for s in data.get("symbols", [])
+                s
+                for s in entries.values()
                 if s.get("status") == "TRADING" and s.get("quoteAsset") == "USDT"
             ]
-            symbols.sort()
-            self._symbols = symbols
+            symbols.sort(key=lambda s: s["symbol"])
+            self._info = entries
+            self._symbols = [s["symbol"] for s in symbols]
             self._last_sync = time.time()
             self._status = "ok"
             self._last_error = None
-            logger.info("sembol evreni senkronize: %d USDT çifti", len(symbols))
-            return len(symbols)
+            logger.info("sembol evreni senkronize: %d USDT çifti", len(self._symbols))
+            return len(self._symbols)
         except Exception as exc:  # noqa: BLE001
             self._status = "error" if not self._symbols else "stale"
             self._last_error = str(exc)
@@ -53,6 +56,10 @@ class UniverseService:
 
     def snapshot(self) -> list[str]:
         return list(self._symbols)
+
+    def symbol_info(self, symbol: str) -> dict | None:
+        """exchangeInfo'nun ham sembol kaydı (filtreler dahil); bilinmiyorsa None."""
+        return self._info.get(symbol)
 
     @property
     def status(self) -> str:

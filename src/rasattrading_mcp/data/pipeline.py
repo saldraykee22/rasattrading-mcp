@@ -89,6 +89,12 @@ class DataPipeline:
     def get_ticker(self, symbol: str) -> dict | None:
         return self.ticker_cache.get(symbol)
 
+    def symbol_info(self, symbol: str) -> dict | None:
+        return self.universe.symbol_info(symbol)
+
+    def universe_snapshot(self) -> list[str]:
+        return self.universe.snapshot()
+
     async def get_candles(self, symbol: str, timeframe: str, limit: int = 300, source: str = "spot") -> list[dict]:
         return await self.klines.get_candles(symbol, timeframe, limit, source)
 

@@ -184,6 +184,71 @@ async def get_risk_policy_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
     return data, Meta(as_of=utc_iso(), source="sqlite-risk-policy", freshness=FRESHNESS_FRESH)
 
 
+def _require_symbol_filters(ctx: dict, symbol: str) -> dict:
+    """Return exchangeInfo filters for a symbol or raise INVALID_SYMBOL."""
+    pipeline = _require_pipeline(ctx)
+    info = pipeline.symbol_info(symbol)
+    if info is None:
+        raise RasatError(ErrorCode.INVALID_SYMBOL, f"evrende bilinmeyen sembol: {symbol}")
+    return info
+
+
+async def get_symbol_info_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    pipeline = _require_pipeline(ctx)
+    symbol = params.get("symbol")
+    if not isinstance(symbol, str) or not symbol:
+        raise RasatError(ErrorCode.INVALID_REQUEST, "symbol zorunlu (string)")
+    info = _require_symbol_filters(ctx, symbol)
+    from ..position_sizing import SymbolFilters
+
+    filters = SymbolFilters.from_exchange_info(info)
+    data = filters.to_dict()
+    data["status"] = filters.status
+    freshness = FRESHNESS_FRESH if pipeline.universe.status == "ok" else FRESHNESS_STALE
+    return data, Meta(as_of=utc_iso(), source="binance-rest-exchangeinfo", freshness=freshness)
+
+
+async def calculate_position_size_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    pipeline = _require_pipeline(ctx)
+    symbol = params.get("symbol")
+    if not isinstance(symbol, str) or not symbol:
+        raise RasatError(ErrorCode.INVALID_REQUEST, "symbol zorunlu (string)")
+    account_balance = params.get("account_balance")
+    risk_pct = params.get("risk_pct")
+    entry = params.get("entry")
+    stop_loss = params.get("stop_loss")
+    side = params.get("side", "BUY")
+    fee_rate = params.get("fee_rate", 0.001)
+    for name, value in (("account_balance", account_balance), ("risk_pct", risk_pct), ("entry", entry), ("stop_loss", stop_loss)):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise RasatError(ErrorCode.INVALID_REQUEST, f"{name} sayı olmalı")
+
+    # Temel doğruluk kontrolleri (her zaman aktif, kapatılamaz):
+    # 1) sembol geçerlilik / TRADING durumu
+    from ..accuracy import check_price_fresh, check_symbol_valid
+
+    check_symbol_valid(symbol, set(pipeline.universe_snapshot()))
+    # 2) fiyat staleness — daemon'ın kendi taze ticker'ına güvenilir
+    ticker = pipeline.get_ticker(symbol)
+    freshness = ticker["freshness"] if ticker else FRESHNESS_STALE
+    check_price_fresh(freshness, symbol)
+
+    info = _require_symbol_filters(ctx, symbol)
+    from ..position_sizing import SymbolFilters, calculate_position_size
+
+    result = calculate_position_size(
+        symbol=symbol,
+        account_balance=float(account_balance),
+        risk_pct=float(risk_pct),
+        entry=float(entry),
+        stop_loss=float(stop_loss),
+        filters=SymbolFilters.from_exchange_info(info),
+        side=side,
+        fee_rate=float(fee_rate),
+    )
+    return result, Meta(as_of=utc_iso(), source="daemon-position-sizing", freshness=FRESHNESS_FRESH)
+
+
 def build_dispatcher(ctx: dict) -> ToolDispatcher:
     from ..tools import REGISTRY
 
@@ -193,6 +258,8 @@ def build_dispatcher(ctx: dict) -> ToolDispatcher:
     if ctx.get("pipeline") is not None:
         dispatcher.register("get_candles", candles_handler)
         dispatcher.register("get_ticker", ticker_handler)
+        dispatcher.register("get_symbol_info", get_symbol_info_handler)
+        dispatcher.register("calculate_position_size", calculate_position_size_handler)
     dispatcher.register("add_account", add_account_handler)
     dispatcher.register("list_accounts", list_accounts_handler)
     dispatcher.register("remove_account", remove_account_handler)
