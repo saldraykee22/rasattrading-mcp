@@ -39,9 +39,21 @@ STATE_COOLDOWN = "cooldown"
 
 
 class AlarmService:
-    def __init__(self, db: Database, engine: PAEngine | None = None) -> None:
+    def __init__(self, db: Database, engine: PAEngine | None = None, compute_budget: int | None = None) -> None:
         self.db = db
         self.engine = engine
+        # K3: depolanmış analiz yokken talep üzerine `analyze` (ve dolayısıyla
+        # warm-up/backfill yükü) başıboş artmasın — her değerlendirme turunda
+        # sınırlı sayıda on-demand hesaplamaya izin verilir, aşanlar ertelenir.
+        if compute_budget is None:
+            cfg = engine.config if engine is not None else None
+            compute_budget = getattr(cfg, "alarm_compute_budget", 8) if cfg is not None else 8
+        self._compute_budget = max(0, int(compute_budget))
+        self._compute_used = 0
+
+    def begin_evaluation_pass(self) -> None:
+        """Yeni değerlendirme turu başlangıcı: on-demand PA hesap bütçesi sıfırlanır (K3)."""
+        self._compute_used = 0
 
     # ---------- CRUD ----------
 
@@ -212,6 +224,9 @@ class AlarmService:
         lz = await _read_current(self.db, "liquidity_zones", symbol, timeframe)
         ob = await _read_current(self.db, "order_blocks", symbol, timeframe)
         if ms is None or lz is None or ob is None:
+            if self._compute_used >= self._compute_budget:
+                return None  # K3: on-demand PA bütçesi doldu → bu turda ertelenir
+            self._compute_used += 1
             await self.engine.analyze(symbol, timeframe)
             ms = await _read_current(self.db, "market_structure", symbol, timeframe)
             lz = await _read_current(self.db, "liquidity_zones", symbol, timeframe)
