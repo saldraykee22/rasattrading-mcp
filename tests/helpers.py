@@ -112,6 +112,7 @@ class FakeOrderBroker:
         self.query_results: dict[str, object | None] = {}
         self.query_results_by_account: dict[str, object | None] = {}
         self.cancel_errors: dict[str, Exception] = {}
+        self.cancel_all_errors: dict[str, Exception] = {}
         self._seq = 1000
 
     async def place_order(self, *, account_id, symbol, side, order_type, quantity, price, client_order_id, stop_price=None):
@@ -225,6 +226,8 @@ class FakeOrderBroker:
         ]
 
     async def cancel_all_open_orders(self, *, account_id, symbol):
+        if symbol in getattr(self, "cancel_all_errors", {}):
+            raise self.cancel_all_errors[symbol]
         self.cancelled_all = getattr(self, "cancelled_all", [])
         self.cancelled_all.append({"account_id": account_id, "symbol": symbol})
         return 1

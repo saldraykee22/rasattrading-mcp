@@ -305,6 +305,10 @@ async def test_emergency_stop_nothing_to_sell_still_ok(em_ctx):
     assert detail["ok"] is True
     assert detail["sold"] == []
     assert detail["price_errors"] == []
+    # T03: plan boş → mevcut no-position semantiği korunur; pending/reconcile yok
+    assert detail["pending_count"] == 0
+    assert detail["reconcile_required"] is False
+    assert detail["cancel_errors"] == []
 
 
 async def test_run_emergency_stop_uses_public_price_source_by_default(tmp_path, monkeypatch):
@@ -394,6 +398,11 @@ async def test_emergency_stop_sells_and_cancels(em_ctx, monkeypatch):
     assert len(detail["sold"]) == 2
     statuses = {s["symbol"]: s["status"] for s in detail["sold"]}
     assert statuses == {"BTCUSDT": "FILLED", "ETHUSDT": "FILLED"}
+    # T03: tüm satışlar kesin FILLED → pending/reconcile/cancel error yok
+    assert detail["pending_count"] == 0
+    assert detail["pending"] == []
+    assert detail["reconcile_required"] is False
+    assert detail["cancel_errors"] == []
     # açık emirler iptal edildi
     assert len(ctx["broker"].cancelled_all) == 1  # BTCUSDT açık emri
     # log yazıldı (3.15: key miktar+nonce içerir, sembol prefix'i ile doğrula)
@@ -440,13 +449,20 @@ async def test_emergency_stop_rebuy_after_done_sells_again(em_ctx):
 async def test_emergency_stop_nonterminal_sell_reconciled_not_done(em_ctx):
     # 3.15: broker NEW dönerse bu "done" değildir; sonraki çalıştırma broker'a
     # sorar (reconcile-before-resend), körlemesine çift SELL göndermez.
+    # T03: NEW non-terminaldir → ok=False ve pending/reconcile görünür.
     ctx = em_ctx
     account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
     runner = ctx["runner"]
 
     ctx["broker"].place_result = {"status": "NEW", "exchange_order_id": None}
     first = await runner.run(account_ids=[account_id], yes=True)
-    assert first["results"][0]["sold"][0]["status"] == "NEW"
+    first_detail = first["results"][0]
+    assert first_detail["sold"][0]["status"] == "NEW"
+    assert first["ok"] is False
+    assert first_detail["ok"] is False
+    assert first_detail["pending_count"] == 1
+    assert first_detail["pending"][0]["symbol"] == "BTCUSDT"
+    assert first_detail["reconcile_required"] is True
 
     detail = runner._latest_sell_details(account_id, "BTCUSDT")
     assert detail is not None
@@ -455,8 +471,68 @@ async def test_emergency_stop_nonterminal_sell_reconciled_not_done(em_ctx):
     ctx["broker"].query_results[cid] = OrderResult(status="NEW", exchange_order_id="EX-INFLIGHT")
 
     second = await runner.run(account_ids=[account_id], yes=True)
+    second_detail = second["results"][0]
     assert len(ctx["broker"].placed) == 1  # çift satış yok
-    assert second["results"][0]["sold"][0]["status"] == "NEW"  # işlemde olarak raporlanır
+    assert second_detail["sold"][0]["status"] == "NEW"  # işlemde olarak raporlanır
+    assert second["ok"] is False
+    assert second_detail["ok"] is False
+    assert second_detail["pending_count"] == 1
+    assert second_detail["reconcile_required"] is True
+
+
+async def test_emergency_stop_partially_filled_sell_not_ok(em_ctx):
+    # T03 kabul: PARTIALLY_FILLED → ok=False ve pending/non-terminal görünür.
+    ctx = em_ctx
+    account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
+    runner = ctx["runner"]
+    ctx["broker"].place_result = {"status": "PARTIALLY_FILLED", "exchange_order_id": "EX-PARTIAL"}
+    result = await runner.run(account_ids=[account_id], yes=True)
+    detail = result["results"][0]
+    assert result["ok"] is False
+    assert detail["ok"] is False
+    sold = detail["sold"][0]
+    assert sold["status"] == "PARTIALLY_FILLED"
+    assert sold["pending"] is True
+    assert sold["reconcile_required"] is True
+    assert detail["pending_count"] == 1
+    assert detail["pending"][0]["symbol"] == "BTCUSDT"
+    assert detail["reconcile_required"] is True
+
+
+async def test_emergency_stop_unknown_sell_not_ok(em_ctx):
+    # T03 kabul: UNKNOWN → ok=False ve reconcile görünür.
+    ctx = em_ctx
+    account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
+    runner = ctx["runner"]
+    ctx["broker"].place_result = {"status": "UNKNOWN", "exchange_order_id": None}
+    result = await runner.run(account_ids=[account_id], yes=True)
+    detail = result["results"][0]
+    assert result["ok"] is False
+    assert detail["ok"] is False
+    sold = detail["sold"][0]
+    assert sold["status"] == "UNKNOWN"
+    assert sold["pending"] is True
+    assert sold["reconcile_required"] is True
+    assert detail["pending_count"] == 1
+    assert detail["reconcile_required"] is True
+
+
+async def test_emergency_stop_cancel_error_not_ok(em_ctx):
+    # T03: iptal hatası ok'u bozar ve cancel_errors alanında raporlanır;
+    # satış yine de denenir (kalan pozisyonlar kapanmaya devam eder).
+    ctx = em_ctx
+    account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
+    runner = ctx["runner"]
+    ctx["broker"].cancel_all_errors["BTCUSDT"] = RasatError(ErrorCode.INTERNAL_ERROR, "iptal servisi çöktü")
+    result = await runner.run(account_ids=[account_id], yes=True)
+    detail = result["results"][0]
+    assert result["ok"] is False
+    assert detail["ok"] is False
+    assert len(detail["cancel_errors"]) == 1
+    assert detail["cancel_errors"][0]["symbol"] == "BTCUSDT"
+    assert detail["cancelled_orders"] == 0
+    assert len(detail["sold"]) == 1  # satış yine de denenir
+    assert detail["sold"][0]["status"] == "FILLED"
 
 
 async def test_emergency_stop_missing_filters_fails_closed(em_ctx):

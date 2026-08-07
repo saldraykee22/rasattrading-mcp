@@ -43,6 +43,23 @@ CANCEL_LOG_ACTION = "emergency_cancel"
 
 _FILTERS_TTL_SECONDS = 3600.0
 
+# T03: bu durumlarla biten bir emergency satış non-terminaldir — pozisyon kesin
+# kapanmamıştır, broker'dan reconcile gerektirir ve `ok` asla True olamaz.
+_NON_TERMINAL_SELL_STATUSES = ("NEW", "PARTIALLY_FILLED", "UNKNOWN")
+
+
+def _mark_sell(entry: dict, status: str, **extra: Any) -> dict:
+    """Satış sonucuna T03 pending/reconcile etiketini ekler.
+
+    NEW/PARTIALLY_FILLED/UNKNOWN non-terminaldir: `pending=True` ve
+    `reconcile_required=True`. DRY_RUN/FILLED terminal-ok'tur; diğer tüm
+    durumlar (FAILED/CANCELED/REJECTED/EXPIRED) pending değildir ama `ok`
+    mantığında "kesin FILLED" sayılmaz.
+    """
+    pending = status in _NON_TERMINAL_SELL_STATUSES
+    return {**entry, "status": status, "pending": pending,
+            "reconcile_required": pending, **extra}
+
 
 class PublicPriceSource:
     """Binance public `/api/v3/ticker/price` + `/api/v3/exchangeInfo` — imzasız,
@@ -213,13 +230,20 @@ class EmergencyStopRunner:
         for o in open_orders:
             by_symbol.setdefault(o.get("symbol") or "", []).append(o)
         cancelled = 0
+        cancel_errors: list[dict] = []
         for symbol, orders in sorted(by_symbol.items()):
             if dry_run:
                 continue
             keys = [f"{account_id}:{symbol}:{o.get('client_order_id') or o.get('order_id')}" for o in orders]
             if all(self.log.is_action_done(CANCEL_LOG_ACTION, k) for k in keys):
                 continue
-            n = await self.broker.cancel_all_open_orders(account_id=account_id, symbol=symbol)
+            try:
+                n = await self.broker.cancel_all_open_orders(account_id=account_id, symbol=symbol)
+            except RasatError as exc:
+                # T03: iptal hatası `ok`'u bozar; raporlanır, kalan sembollerde
+                # satışa devam edilir. İptal log'lanmadığı için sonraki koşu yeniden dener.
+                cancel_errors.append({"symbol": symbol, "error": {"code": exc.code, "message": exc.message}})
+                continue
             cancelled += n
             for k in keys:
                 self.log.append(
@@ -294,13 +318,13 @@ class EmergencyStopRunner:
         sold = []
         for p in plan:
             if dry_run:
-                sold.append({**p, "status": "DRY_RUN"})
+                sold.append(_mark_sell(p, "DRY_RUN"))
                 continue
             sell_key = f"{account_id}:{p['symbol']}:{p['quantity']}:{run_nonce}"
             cid = f"emergency-{account_id[:8]}-{run_nonce}"
             # Bu sembolde işlemde kalmış bir emergency sell var mı?
             prior = self._latest_sell_details(account_id, p["symbol"])
-            if prior is not None and prior.get("status") in ("NEW", "PARTIALLY_FILLED", "UNKNOWN"):
+            if prior is not None and prior.get("status") in _NON_TERMINAL_SELL_STATUSES:
                 prior_cid = prior.get("cid") or f"emergency-{account_id[:8]}-{prior.get('run_nonce') or ''}"
                 try:
                     found = await self.broker.query_order(
@@ -308,8 +332,8 @@ class EmergencyStopRunner:
                     )
                 except RasatError:
                     found = None
-                if found is not None and found.status in ("NEW", "PARTIALLY_FILLED", "UNKNOWN"):
-                    sold.append({**p, "status": found.status, "exchange_order_id": found.exchange_order_id})
+                if found is not None and found.status in _NON_TERMINAL_SELL_STATUSES:
+                    sold.append(_mark_sell(p, found.status, exchange_order_id=found.exchange_order_id, cid=prior_cid))
                     continue
                 # FILLED döndüyse önceki satış dolu; mevcut bakiye yeniden alınmış
                 # olabilir → yeni SELL yerleştir. Not found → önceki hiç gitmemiş → yeni SELL.
@@ -337,16 +361,26 @@ class EmergencyStopRunner:
                         "exchange_order_id": result.exchange_order_id,
                     },
                 )
-                sold.append({**p, "status": result.status, "exchange_order_id": result.exchange_order_id})
+                sold.append(_mark_sell(p, result.status, exchange_order_id=result.exchange_order_id, cid=cid))
             except RasatError as exc:
-                sold.append({**p, "status": "FAILED", "error": {"code": exc.code, "message": exc.message}})
+                sold.append({**p, "status": "FAILED", "pending": False, "reconcile_required": False,
+                             "error": {"code": exc.code, "message": exc.message}})
 
-        sell_failed = any(s.get("status") == "FAILED" for s in sold)
+        # T03: `ok` yalnızca hiçbir hata/iptal hatası yoksa VE plan içindeki tüm
+        # satışlar kesin FILLED ise true. NEW/PARTIALLY_FILLED/UNKNOWN dahil her
+        # dolmayan durum (FAILED/CANCELED/REJECTED/EXPIRED) ok'u bozar. Plan boşsa
+        # (satılacak yok) hata yokluğunda mevcut no-position ok=True semantiği korunur.
+        sell_not_filled = any(s.get("status") not in ("FILLED", "DRY_RUN") for s in sold)
+        pending_sells = [s for s in sold if s.get("pending")]
         return {
             "account_id": account_id,
-            "ok": not price_errors and not filter_errors and not sell_failed,
+            "ok": not price_errors and not filter_errors and not cancel_errors and not sell_not_filled,
             "cancelled_orders": cancelled,
+            "cancel_errors": cancel_errors,
             "sold": sold,
+            "pending_count": len(pending_sells),
+            "pending": pending_sells,
+            "reconcile_required": bool(pending_sells),
             "price_errors": price_errors,
             "filter_errors": filter_errors,
             "plan": plan if dry_run else None,
