@@ -6,6 +6,12 @@ PA zincirini otomatik yeniden hesaplar — agent'ın `get_market_structure`
 çağrısını beklemeden. Sembolün mum verisi hedef kapalı bara yetişmemişse
 (stale / kline scheduler tamamlamadıysa) yeniden hesaplama atlanır; veri
 tazelenince bir sonraki turda işlenir. Concurrency semaphore ile sınırlanır.
+
+2.18: **Kalıcı yetersiz veri** (tokenized hisse senedi gibi yeni listelenmiş
+sembollerde `PA_LOOKBACK` kadarlık kapanmış mum bulunamaması) turu bloklamaz:
+o semboller `insufficient` sayılır, `_last_processed` ilerler ve yeni kapalı
+bar geldiğinde yeniden denenir. Aksi halde tek bloklayıcı sembol (örn. 1d'de
+2 mumluk SMCIBUSDT) her döngüde 489 sembolün tamamını yeniden işletiyordu.
 """
 
 from __future__ import annotations
@@ -16,6 +22,7 @@ import time
 
 from ..config import Config, TIMEFRAME_SECONDS
 from ..envelope import FRESHNESS_FRESH
+from ..errors import ErrorCode, RasatError
 from .analysis import PAEngine, PA_LOOKBACK
 
 logger = logging.getLogger("rasattrading.pa.worker")
@@ -45,13 +52,15 @@ class PAWorker:
                 logger.exception("PA worker döngü hatası")
 
     async def check_and_process(self) -> int:
-        """Yeni kapalı bar olan timeframe'ler için PA'yı yeniden hesaplar.
+        """Bir geçiş: yeni kapalı bar olan timeframe'ler için PA'yı yeniden hesaplar.
 
-        İşlenen sembol sayısını döndürür (gözlem/diagnostik). İlk turda her
+        İşlenen (başarılı) sembol sayısını döndürür (gözlem/diagnostik). İlk turda her
         timeframe işlenir (soğuk evren warm-up'ı) — `_last_processed` boştur.
         Marker yalnızca timeframe turu TAMAMEN başarılı olduğunda ilerler:
         stale/hatalı/boş kalan bir sembol varsa aynı kapalı bar bir sonraki
-        turda tekrar denenir (2.12 fix).
+        turda tekrar denenir (2.12 fix). **Kalıcı yetersiz veri sembolleri
+        (`insufficient`, 2.18) turu bloklamaz** — onlar yeni kapalı bar
+        geldiğinde yeniden denenir.
         """
         processed = 0
         for tf in self.config.kline_intervals:
@@ -66,16 +75,20 @@ class PAWorker:
                 *(self._process(symbol, tf) for symbol in symbols), return_exceptions=True
             )
             successes = sum(1 for r in results if r is True)
+            insufficient = sum(1 for r in results if r == "insufficient")
             processed += successes
-            if successes == len(symbols):
+            if successes + insufficient == len(symbols):
                 self._last_processed[tf] = latest_closed
         return processed
 
-    async def _process(self, symbol: str, tf: str) -> bool:
+    async def _process(self, symbol: str, tf: str) -> bool | str:
+        """Sembolü işler. `True` başarı, `"insufficient"` kalıcı yetersiz veri,
+        `False` geçici başarısızlık (sonraki turda yeniden denenir)."""
         async with self._sem:
             try:
                 candles = await self.engine._load_candles(symbol, tf, PA_LOOKBACK)
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("PA mum yüklenemedi (atlandı): %s %s — %r", symbol, tf, exc)
                 return False
             if not candles:
                 return False
@@ -85,6 +98,14 @@ class PAWorker:
             try:
                 await self.engine.analyze(symbol, tf)
                 return True
-            except Exception:  # noqa: BLE001
-                logger.warning("PA hesaplama başarısız: %s %s", symbol, tf)
+            except RasatError as exc:
+                if exc.code == ErrorCode.STALE_DATA:
+                    # Kalıcı yetersiz veri (örn. tokenized stock'ta 1d için az mum):
+                    # turu bloklamaz, yeni kapalı bar geldiğinde yeniden denenir.
+                    logger.info("PA veri yetersiz (atlandı): %s %s — %s", symbol, tf, exc.message)
+                    return "insufficient"
+                logger.warning("PA hesaplama başarısız: %s %s — %s", symbol, tf, exc.message)
+                return False
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("PA hesaplama başarısız: %s %s — %r", symbol, tf, exc)
                 return False
