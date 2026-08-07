@@ -6,6 +6,7 @@
 - `place_order` → emir gönderir (clientOrderId ile), gerçek Binance state'i döner.
 - `query_order` → reconcile-before-retry için tekil emri `clientOrderId` ile sorgular.
 - `query_oco` → OCO listesini `listClientOrderId` ile sorgular.
+- `cancel_oco` → OCO listesini `listClientOrderId` ile iptal eder (kill switch).
 - `get_balance` → daemon'ın kendi taze bakiye snapshot'ı (agent rakamlarına güvenilmez).
 
 Status değerleri Binance'in gerçek state machine'ini yansıtır:
@@ -26,6 +27,7 @@ import aiohttp
 import yarl
 
 from ..errors import ErrorCode, RasatError
+from .clock import BinanceClock
 from .rate_limit import RateLimitBudget
 
 logger = logging.getLogger("rasattrading.data.orders")
@@ -88,6 +90,14 @@ class OrderBroker(Protocol):
         client_order_id: str,
     ) -> OrderResult | None: ...
 
+    async def cancel_oco(
+        self,
+        *,
+        account_id: str,
+        symbol: str,
+        list_client_order_id: str,
+    ) -> OrderResult | None: ...
+
     async def get_all_open_orders(self, *, account_id: str) -> list[dict]: ...
 
     async def cancel_all_open_orders(self, *, account_id: str, symbol: str) -> int: ...
@@ -123,6 +133,7 @@ class BinanceOrderBroker:
         session: aiohttp.ClientSession | None = None,
         recv_window_ms: int = 10_000,
         timeout_seconds: float = 20.0,
+        clock: BinanceClock | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._credentials = credentials
@@ -131,11 +142,29 @@ class BinanceOrderBroker:
         self._own_session = session is None
         self._recv_window_ms = recv_window_ms
         self._timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+        #: T1-koord: imzalı istek timestamp'i için BinanceClock (server-time
+        #: offset'li). Verilirse `_signed_request_url` `clock.server_now()` kullanır;
+        #: verilmezse (veya clock fail-closed → None) eski `time.time()` fallback'i
+        #: korunur — geriye uyumluluk.
+        self._clock = clock
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(timeout=self._timeout)
         return self._session
+
+    def _now_ms(self) -> int:
+        """İmzalı istek timestamp'i (ms).
+
+        `clock` verilmişse ve `server_now()` güvenilir sunucu zamanı döndürüyorsa
+        onu kullan (host saat kaymasına karşı -1021/1022 koruması); clock yoksa
+        veya fail-closed (None) ise eski yerel `time.time()` fallback'i.
+        """
+        if self._clock is not None:
+            server_now = self._clock.server_now()
+            if server_now is not None:
+                return int(server_now * 1000)
+        return int(time.time() * 1000)
 
     async def _signed_request_url(self, account_id: str, path: str, params: dict) -> tuple[str, str]:
         """İmzalı isteğin (api_key, tam URL) çiftini üretir.
@@ -147,7 +176,8 @@ class BinanceOrderBroker:
         """
         api_key, api_secret = await self._credentials(account_id)
         base = dict(params)
-        base["timestamp"] = int(time.time() * 1000)
+        now = self._now_ms()
+        base["timestamp"] = now
         base["recvWindow"] = self._recv_window_ms
         url = yarl.URL(f"{self._base_url}{path}").with_query(base)
         signature = hmac.new(api_secret.encode("utf-8"), url.query_string.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -361,6 +391,42 @@ class BinanceOrderBroker:
                 return None
             raise
         return self._order_result(data)
+
+    async def cancel_oco(
+        self, *, account_id: str, symbol: str, list_client_order_id: str
+    ) -> OrderResult | None:
+        """OCO listesini `listClientOrderId` ile iptal eder (`DELETE /api/v3/orderList`).
+
+        OCO bacakları Binance'in kendi ürettiği clientOrderId'leri taşıdığı için
+        tekil `cancel_order` ile iptal edilemez — kill switch OCO satırlarında
+        `query_oco` ile eşleşen `listClientOrderId` üzerinden iptal etmelidir.
+        Yanıt `listOrderStatus` taşır: ALL_DONE → CANCELED, EXECUTING → NEW,
+        bilinmeyen → UNKNOWN (körlemesine "iptal edildi" varsayılmaz).
+        """
+        try:
+            data = await self._request(
+                "DELETE",
+                "/api/v3/orderList",
+                account_id,
+                {"symbol": symbol, "listClientOrderId": list_client_order_id},
+            )
+        except RasatError as exc:
+            # -2011 liste zaten iptal/dolmuş → None
+            if exc.code == ErrorCode.ORDER_REJECTED and exc.details and exc.details.get("binance_code") == -2011:
+                return None
+            raise
+        list_status = str(data.get("listOrderStatus") or "").upper()
+        if list_status == "ALL_DONE":
+            status = "CANCELED"
+        elif list_status == "EXECUTING":
+            status = "NEW"
+        else:
+            status = "UNKNOWN"
+        return OrderResult(
+            status=status,
+            exchange_order_id=str(data.get("orderListId")) if data.get("orderListId") is not None else None,
+            raw=data,
+        )
 
     async def get_all_open_orders(self, *, account_id: str) -> list[dict]:
         """Spot'taki tüm açık emirleri döner (sembol bazlı değil, global)."""
