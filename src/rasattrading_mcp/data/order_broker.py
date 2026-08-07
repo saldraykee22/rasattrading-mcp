@@ -243,25 +243,39 @@ class BinanceOrderBroker:
         stop_limit_price: float,
         client_order_id: str,
     ) -> OrderResult:
-        """Spot OCO emri (`/api/v3/orderList/oco`): LIMIT + STOP_LOSS_LIMIT tek istekte.
+        """Spot OCO emri (`/api/v3/orderList/oco`): LIMIT_MAKER + STOP_LOSS_LIMIT tek istekte.
 
         Biri dolunca diğeri borsada otomatik iptal olur (true OCO garantisi).
+        SELL (long kapatma): `above` = kâr hedefi (LIMIT_MAKER, fiyatın üstü),
+        `below` = stop (STOP_LOSS_LIMIT, fiyatın altı).
+        BUY (short kapatma): `above` = stop, `below` = kâr hedefi.
+
+        Binance `/orderList/oco` zorunlu `aboveType`/`belowType` taşır (2026-04+);
+        eski düz `price`/`stopPrice`/`stopLimitPrice` biçimi "Mandatory parameter
+        'aboveType' was not sent" ile reddedilir — canlı doğrulandı (07.08).
         `price` = kâr hedefi (limit), `stop_price` = stop tetikleme,
         `stop_limit_price` = stop tetiklenince satılacak limit fiyatı.
-        Aynı pozisyon için ayrı ayrı SL+TP emri bakiyeyi birbirinden çaldığı için
-        mümkün değildi; bu çağrı ikisini tek emir listesinde taşır.
         """
         params: dict[str, Any] = {
             "symbol": symbol,
             "side": side,
             "quantity": str(quantity),
-            "price": str(price),
-            "stopPrice": str(stop_price),
-            "stopLimitPrice": str(stop_limit_price),
-            "stopLimitTimeInForce": "GTC",
+            "listClientOrderId": client_order_id if client_order_id else None,
         }
-        if client_order_id:
-            params["listClientOrderId"] = client_order_id
+        if side.upper() == "BUY":
+            params["aboveType"] = "STOP_LOSS_LIMIT"
+            params["aboveStopPrice"] = str(stop_price)
+            params["abovePrice"] = str(stop_limit_price)
+            params["aboveTimeInForce"] = "GTC"
+            params["belowType"] = "LIMIT_MAKER"
+            params["belowPrice"] = str(price)
+        else:
+            params["aboveType"] = "LIMIT_MAKER"
+            params["abovePrice"] = str(price)
+            params["belowType"] = "STOP_LOSS_LIMIT"
+            params["belowStopPrice"] = str(stop_price)
+            params["belowPrice"] = str(stop_limit_price)
+            params["belowTimeInForce"] = "GTC"
         data = await self._request("POST", "/api/v3/orderList/oco", account_id, params)
         # OCO yanıtı orderListId taşır (orderId değil) — listeyi iz olarak sakla.
         return OrderResult(

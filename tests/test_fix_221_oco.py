@@ -37,7 +37,7 @@ async def db(cfg):
 
 
 async def test_broker_oco_sends_orderlist_params():
-    """place_oco → /api/v3/orderList/oco: price + stopPrice + stopLimitPrice + GTC."""
+    """place_oco → /api/v3/orderList/oco: aboveType/belowType + fiyatlar + GTC."""
     import hashlib
     import hmac
 
@@ -101,12 +101,73 @@ async def test_broker_oco_sends_orderlist_params():
                 client_order_id="oco-1",
             )
             assert received["path"] == "/api/v3/orderList/oco"
-            assert float(received["params"]["price"]) == 0.1378
-            assert float(received["params"]["stopPrice"]) == 0.1225
-            assert float(received["params"]["stopLimitPrice"]) == 0.1220
-            assert received["params"]["stopLimitTimeInForce"] == "GTC"
+            assert received["params"]["side"] == "SELL"
+            assert float(received["params"]["quantity"]) == 1464.09
+            # SELL: above = kâr hedefi (LIMIT_MAKER), below = stop (STOP_LOSS_LIMIT)
+            assert received["params"]["aboveType"] == "LIMIT_MAKER"
+            assert float(received["params"]["abovePrice"]) == 0.1378
+            assert received["params"]["belowType"] == "STOP_LOSS_LIMIT"
+            assert float(received["params"]["belowStopPrice"]) == 0.1225
+            assert float(received["params"]["belowPrice"]) == 0.1220
+            assert received["params"]["belowTimeInForce"] == "GTC"
             assert received["params"]["listClientOrderId"] == "oco-1"
+            # eski biçim gönderilmemeli (Binance reddediyor)
+            assert "price" not in received["params"]
+            assert "stopPrice" not in received["params"]
+            assert "stopLimitPrice" not in received["params"]
             assert result.exchange_order_id == "555"
+        finally:
+            await broker.close()
+
+
+async def test_broker_oco_buy_swaps_above_below():
+    """BUY OCO: above=STOP_LOSS_LIMIT, below=LIMIT_MAKER (kısa kapatma yönü)."""
+    import hashlib
+    import hmac
+
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+
+    from rasattrading_mcp.data.rate_limit import RateLimitBudget
+
+    api_key = "TESTKEY0000000000000000000000000000"
+    api_secret = "TESTSECRET00000000000000000000000000"
+    received: dict = {}
+
+    async def oco_handler(request):
+        received["params"] = dict(request.query)
+        return web.json_response(
+            {"orderListId": 666, "contingencyType": "OCO", "listStatusType": "EXEC_STARTED", "orders": []}
+        )
+
+    app = web.Application()
+    app.router.add_post("/api/v3/orderList/oco", oco_handler)
+    async with TestServer(app) as server:
+        async def creds(_aid):
+            return (api_key, api_secret)
+
+        broker = BinanceOrderBroker(
+            server.make_url("/").human_repr(),
+            credentials=creds,
+            budget=RateLimitBudget(6000),
+        )
+        try:
+            await broker.place_oco(
+                account_id="a1",
+                symbol="ALICEUSDT",
+                side="BUY",
+                quantity=100.0,
+                price=0.11,
+                stop_price=0.13,
+                stop_limit_price=0.135,
+                client_order_id="oco-buy-1",
+            )
+            assert received["params"]["aboveType"] == "STOP_LOSS_LIMIT"
+            assert float(received["params"]["aboveStopPrice"]) == 0.13
+            assert float(received["params"]["abovePrice"]) == 0.135
+            assert received["params"]["aboveTimeInForce"] == "GTC"
+            assert received["params"]["belowType"] == "LIMIT_MAKER"
+            assert float(received["params"]["belowPrice"]) == 0.11
         finally:
             await broker.close()
 
