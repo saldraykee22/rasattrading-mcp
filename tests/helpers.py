@@ -151,6 +151,35 @@ class FakeOrderBroker:
         self._apply_fill(account_id, symbol, side, result, quantity, price)
         return result
 
+    async def place_oco(self, *, account_id, symbol, side, quantity, price, stop_price, stop_limit_price, client_order_id):
+        """OCO emri: tek kayıt olarak placed listesine düşer (newOrderList simülasyonu)."""
+        self.placed.append(
+            {
+                "account_id": account_id,
+                "symbol": symbol,
+                "side": side,
+                "order_type": "OCO",
+                "quantity": quantity,
+                "price": price,
+                "stop_price": stop_price,
+                "stop_limit_price": stop_limit_price,
+                "client_order_id": client_order_id,
+            }
+        )
+        if account_id in self.place_errors_by_account:
+            raise self.place_errors_by_account[account_id]
+        if client_order_id in self.place_errors:
+            raise self.place_errors[client_order_id]
+        from rasattrading_mcp.data.order_broker import OrderResult
+
+        self._seq += 1
+        return OrderResult(
+            status="NEW",
+            exchange_order_id=f"OL{self._seq}",
+            executed_qty=0.0,
+            avg_price=0.0,
+        )
+
     def _apply_fill(self, account_id, symbol, side, result, quantity, price):
         """FILLED olursa bakiye simülasyonunu güncelle: USDT düş, base ekle."""
         if result.status != "FILLED" or not symbol.endswith("USDT"):

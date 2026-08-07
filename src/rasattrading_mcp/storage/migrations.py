@@ -320,6 +320,15 @@ def _m9_stop_price(conn: sqlite3.Connection) -> None:
     conn.execute("ALTER TABLE orders ADD COLUMN stop_price REAL")
 
 
+def _m10_stop_limit_price(conn: sqlite3.Connection) -> None:
+    """OCO emir kaydına stop_limit_price sütunu (2.21).
+
+    OCO'da stopPrice tetiklenince stopLimitPrice seviyesinde LIMIT satış girer;
+    üç fiyat da (price=TP, stop_price, stop_limit_price) kayıtta durmalı.
+    """
+    conn.execute("ALTER TABLE orders ADD COLUMN stop_limit_price REAL")
+
+
 MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (1, "initial_schema", _m1_initial_schema),
     (2, "indexes", _m2_indexes),
@@ -330,6 +339,7 @@ MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (7, "orders_equity_snapshot", _m7_orders_equity_snapshot),
     (8, "pending_orders", _m8_pending_orders),
     (9, "orders_stop_price", _m9_stop_price),
+    (10, "orders_stop_limit_price", _m10_stop_limit_price),
 ]
 
 

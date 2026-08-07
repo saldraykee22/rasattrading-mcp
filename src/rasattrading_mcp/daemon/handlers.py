@@ -579,6 +579,27 @@ async def place_order_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
     return data, Meta(as_of=utc_iso(), source="sqlite-orders", freshness=FRESHNESS_FRESH)
 
 
+async def place_oco_order_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    """OCO emri: LIMIT (kâr hedefi) + STOP_LOSS_LIMIT tek emir listesinde.
+
+    Biri dolunca diğeri borsada otomatik iptal olur — aynı pozisyon için
+    ayrı ayrı SL+TP emri bakiyeyi birbirinden çaldığı için tek çağrı şarttır.
+    """
+    service = _require_order_service(ctx)
+    data = await service.place_oco_order(
+        account_id=params.get("account_id"),
+        symbol=params.get("symbol"),
+        side=params.get("side"),
+        quantity=params.get("quantity"),
+        price=params.get("price"),
+        stop_price=params.get("stop_price"),
+        stop_limit_price=params.get("stop_limit_price"),
+        idempotency_key=params.get("idempotency_key"),
+        actor=str(ctx.get("actor", "mcp-agent")),
+    )
+    return data, Meta(as_of=utc_iso(), source="sqlite-orders", freshness=FRESHNESS_FRESH)
+
+
 async def close_all_positions_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
     service = _require_order_service(ctx)
     data = await service.close_all_positions(
@@ -648,6 +669,7 @@ def build_dispatcher(ctx: dict) -> ToolDispatcher:
     dispatcher.register("calculate_position_size", calculate_position_size_handler)
     dispatcher.register("execute_on_accounts", execute_on_accounts_handler)
     dispatcher.register("place_order", place_order_handler)
+    dispatcher.register("place_oco_order", place_oco_order_handler)
     dispatcher.register("close_all_positions", close_all_positions_handler)
     dispatcher.register("get_total_exposure", get_total_exposure_handler)
     dispatcher.register("get_account_balance", get_account_balance_handler)
