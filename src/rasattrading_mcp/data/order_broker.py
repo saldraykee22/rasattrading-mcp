@@ -13,6 +13,7 @@ NEW | PARTIALLY_FILLED | FILLED | CANCELED | REJECTED | EXPIRED | UNKNOWN.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -168,9 +169,11 @@ class BinanceOrderBroker:
                     msg = body.get("msg") or f"Binance {resp.status}"
                     raise RasatError(ErrorCode.ORDER_REJECTED, f"{msg} ({path})", details={"binance_code": code})
                 return await resp.json()
-        except (aiohttp.ClientError, RasatError) as exc:
+        except (aiohttp.ClientError, asyncio.TimeoutError, RasatError) as exc:
             if isinstance(exc, RasatError):
                 raise
+            # T01: asyncio.TimeoutError çıplak kaçmaz — canonical TIMEOUT'a map edilir.
+            # OrderService bu kodla tek reconcile yoluna girer; kör retry üretilmez.
             raise RasatError(ErrorCode.TIMEOUT, f"Binance istek zaman aşımı/hatası ({path}): {exc}") from exc
 
     @staticmethod

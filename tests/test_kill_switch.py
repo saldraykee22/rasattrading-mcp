@@ -107,6 +107,7 @@ async def test_close_all_positions_cancel_failure_not_marked_canceled(ex_ctx):
     placed = await _plant_open_order(ctx, account_id, "open-fail")
     cid = to_client_order_id("open-fail")
     ctx["broker"].cancel_errors[cid] = RasatError(ErrorCode.TIMEOUT, "iptal ağ hatası")
+    ctx["broker"].open_orders = []  # borsada başka yetim emir yok (T01 exchange scope)
 
     service = ctx["service"]
     result = await service.close_all_positions(account_id=account_id, actor="test")
@@ -132,6 +133,7 @@ async def test_close_all_positions_cancel_success_marks_canceled(ex_ctx):
     ctx = ex_ctx
     account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
     placed = await _plant_open_order(ctx, account_id, "open-ok")
+    ctx["broker"].open_orders = []  # borsada başka yetim emir yok (T01 exchange scope)
 
     service = ctx["service"]
     result = await service.close_all_positions(account_id=account_id, actor="test")

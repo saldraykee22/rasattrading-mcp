@@ -11,6 +11,8 @@ Tüm istekler `Authorization: Bearer <token>` ister. Daemon `ready` değilken sa
 from __future__ import annotations
 
 import asyncio
+import hmac
+import json
 import logging
 import time
 from typing import Any, Awaitable, Callable
@@ -22,11 +24,15 @@ from ..config import Config
 from ..daemon.readiness import Readiness
 from ..envelope import Meta, error_response, error_response_from_exc, ok_response, utc_iso
 from ..errors import ErrorCode, RasatError, http_status_for
-from ..tools import REGISTRY, ToolRegistry
+from ..schema_lite import validate_params
+from ..tools import ToolRegistry
 
 logger = logging.getLogger("rasattrading.daemon.http")
 
 HandlerFn = Callable[..., Awaitable[tuple[Any, Meta]]]
+
+#: /rpc istek gövdesi üst sınırı (schema'lar küçük; aşırı gövde reddedilir).
+MAX_BODY_BYTES = 1_000_000
 
 
 class ToolDispatcher:
@@ -40,6 +46,10 @@ class ToolDispatcher:
         if name not in self._registry:
             raise ValueError(f"registry'de olmayan tool handler'ı: {name}")
         self._handlers[name] = handler
+
+    def spec_for(self, name: str):
+        """Tool spec (input_schema/allowed_before_ready) — dispatcher'ın kendi registry'si."""
+        return self._registry.get(name)
 
     def names(self) -> list[str]:
         return list(self._handlers)
@@ -60,7 +70,28 @@ def _verify_token(expected_token: str, auth_header: str | None) -> bool:
         return False
     if scheme.lower() != "bearer" or not token:
         return False
-    return token == expected_token
+    # T01: constant-time karşılaştırma (timing oracle yok).
+    return hmac.compare_digest(token, expected_token)
+
+
+def _merge_transport_fields(body: dict, params: dict) -> dict:
+    """Top-level request_id/idempotency_key'i dispatch params'a birleştirir.
+
+    Aynı anahtar hem top-level hem params içinde verilirse ve değerler FARKLIYSa
+    çakışma hatası (INVALID_REQUEST); aynıysa/eşitse top-level değer kazanır.
+    """
+    merged = dict(params)
+    for key in ("request_id", "idempotency_key"):
+        top = body.get(key)
+        param_val = params.get(key)
+        if top is not None and param_val is not None and top != param_val:
+            raise RasatError(
+                ErrorCode.INVALID_REQUEST,
+                f"top-level ve params içindeki {key} değerleri çakışıyor",
+            )
+        if top is not None:
+            merged[key] = top
+    return merged
 
 
 def build_app(
@@ -91,9 +122,10 @@ def build_app(
                 status=exc.http_status or http_status_for(exc.code),
             )
         except Exception as exc:  # noqa: BLE001
+            # T01: ham exception/path/secret sızıntısı yok — yalnızca sunucu tarafı log.
             logger.exception("HTTP istek hatası: %s %s", request.method, request.path)
             return web.json_response(
-                error_response(ErrorCode.INTERNAL_ERROR, str(exc)),
+                error_response(ErrorCode.INTERNAL_ERROR, "iç hata"),
                 status=500,
             )
 
@@ -115,7 +147,13 @@ def build_app(
 
     async def rpc_handler(request: web.Request) -> web.Response:
         try:
-            body = await request.json()
+            raw = await request.read()
+        except Exception:  # noqa: BLE001
+            raise RasatError(ErrorCode.INVALID_REQUEST, "istek gövdesi okunamadı")
+        if len(raw) > MAX_BODY_BYTES:
+            raise RasatError(ErrorCode.INVALID_REQUEST, "istek gövdesi çok büyük")
+        try:
+            body = json.loads(raw)
         except Exception:  # noqa: BLE001
             raise RasatError(ErrorCode.INVALID_REQUEST, "istek gövdesi geçerli JSON değil")
 
@@ -130,10 +168,7 @@ def build_app(
         if not isinstance(params, dict):
             raise RasatError(ErrorCode.INVALID_REQUEST, "params alanı nesne olmalı")
 
-        request_id = body.get("request_id")
-        idempotency_key = body.get("idempotency_key")
-
-        spec = REGISTRY.get(tool)
+        spec = dispatcher.spec_for(tool)
         if spec is None:
             raise RasatError(ErrorCode.TOOL_NOT_FOUND, f"bilinmeyen tool: {tool}")
 
@@ -142,6 +177,13 @@ def build_app(
                 ErrorCode.NOT_READY,
                 f"daemon ready değil (state={readiness.state}) — tool çağrısı reddedildi",
             )
+
+        # T01: top-level request_id/idempotency_key dispatch params'a birleştirilir.
+        params = _merge_transport_fields(body, params)
+
+        # T01: defense-in-depth input schema doğrulaması — schema tek yetki değil
+        # ama service katmanına ulaşmadan bariz istemci hatalarını keser.
+        validate_params(params, spec.input_schema)
 
         try:
             data, meta = await dispatcher.dispatch(tool, params, ctx=extra)
@@ -157,10 +199,11 @@ def build_app(
                 ErrorCode.INVALID_REQUEST, f"{tool} eksik zorunlu parametre: {exc}"
             ) from exc
         except Exception as exc:  # noqa: BLE001
+            # T01: ham exception metni response'a sızmaz (sunucu log'da kalır).
             logger.exception("tool hatası: %s", tool)
-            raise RasatError(ErrorCode.INTERNAL_ERROR, f"{tool} başarısız: {exc}")
+            raise RasatError(ErrorCode.INTERNAL_ERROR, f"{tool} başarısız")
 
-        return web.json_response(ok_response(data=data, meta=meta, request_id=request_id))
+        return web.json_response(ok_response(data=data, meta=meta, request_id=params.get("request_id")))
 
     app.router.add_get("/health", health_handler)
     app.router.add_post("/rpc", rpc_handler)

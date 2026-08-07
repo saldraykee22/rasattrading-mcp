@@ -732,19 +732,21 @@ register_tool(
                     "description": (
                         "Opsiyonel: alarm tetiklenince onay bekleyen emir kaydı oluşturur "
                         "(awaiting_approval). Emir OTOMATİK açılmaz — approve_pending_order gerekir. "
-                        "Alanlar: account_id (zorunlu), symbol, side (BUY|SELL), order_type (market|limit), "
-                        "entry (limit için zorunlu), stop_loss, risk_pct (0,1]"
+                        "Alanlar: account_id (zorunlu), symbol (zorunlu), side (zorunlu, BUY|SELL), "
+                        "order_type (market|limit), risk_pct (ZORUNLU, (0,1] — boyutlandırma için), "
+                        "entry (order_type=limit ise zorunlu; sonlu sayı), stop_loss (sonlu sayı). "
+                        "Sayılar sonlu olmalıdır (NaN/Infinity kabul edilmez)."
                     ),
                     "properties": {
-                        "account_id": {"type": "string"},
-                        "symbol": {"type": "string"},
+                        "account_id": {"type": "string", "minLength": 1},
+                        "symbol": {"type": "string", "minLength": 1},
                         "side": {"type": "string", "enum": ["BUY", "SELL"]},
                         "order_type": {"type": "string", "enum": ["market", "limit"], "default": "market"},
-                        "entry": {"type": "number"},
-                        "stop_loss": {"type": "number"},
+                        "entry": {"type": "number", "exclusiveMinimum": 0},
+                        "stop_loss": {"type": "number", "exclusiveMinimum": 0},
                         "risk_pct": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
                     },
-                    "required": ["account_id", "symbol", "side"],
+                    "required": ["account_id", "symbol", "side", "risk_pct"],
                 },
             }
         ),
@@ -820,13 +822,22 @@ register_tool(
         description=(
             "Onay bekleyen emir kayıtlarını listeler (alarm order_spec'i tetiklenince "
             "awaiting_approval kaydı düşer). status filtresi: awaiting_approval|approved|"
-            "rejected|executed. Emirler otomatik açılmaz — approve_pending_order gerekir."
+            "executing|rejected|executed|reconcile_required|expired. Emirler otomatik "
+            "açılmaz — approve_pending_order gerekir."
         ),
         input_schema=_alarm_schema(
             {
                 "status": {
                     "type": "string",
-                    "enum": ["awaiting_approval", "approved", "rejected", "executed"],
+                    "enum": [
+                        "awaiting_approval",
+                        "approved",
+                        "executing",
+                        "rejected",
+                        "executed",
+                        "reconcile_required",
+                        "expired",
+                    ],
                 },
                 "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50},
             }

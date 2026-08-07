@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import sqlite3
 import time
 import uuid
@@ -30,6 +31,7 @@ from ..errors import ErrorCode, RasatError
 from ..envelope import FRESHNESS_FRESH
 from ..position_sizing import SymbolFilters, calculate_position_size
 from .accounts import AccountService
+from .order_validation import normalize_order_type, validate_execution_order
 from .audit import AuditLog
 from .db import Database
 from .risk_policy import RiskPolicyService
@@ -127,17 +129,21 @@ class OrderService:
 
     @staticmethod
     def _require_number(value: Any, name: str) -> float:
-        """Zorunlu sayısal parametre: eksik/geçersiz değer INVALID_REQUEST (3.20 M4).
+        """Zorunlu sayısal parametre: eksik/geçersiz/sonlu-olmayan değer INVALID_REQUEST.
 
         `float(None)` TypeError fırlatıp aşağıda UNKNOWN'a yutuluyordu; zorunlu
-        parametre eksikse canonical INVALID_REQUEST dönmelidir.
+        parametre eksikse canonical INVALID_REQUEST dönmelidir. Ayrıca NaN/Infinity
+        (JSON non-standard parse) karşılaştırmaları bypass etmemeli — T01.
         """
         if value is None or isinstance(value, bool):
             raise RasatError(ErrorCode.INVALID_REQUEST, f"{name} zorunlu (sayı)")
         try:
-            return float(value)
+            num = float(value)
         except (TypeError, ValueError):
             raise RasatError(ErrorCode.INVALID_REQUEST, f"{name} sayı olmalı")
+        if not math.isfinite(num):
+            raise RasatError(ErrorCode.INVALID_REQUEST, f"{name} sonlu (finite) bir sayı olmalı")
+        return num
 
     @staticmethod
     def _require_string(value: Any, name: str) -> str:
@@ -413,6 +419,7 @@ class OrderService:
         entry = self._require_number(entry, "entry")
         stop_loss = self._require_number(stop_loss, "stop_loss")
         risk_pct = self._require_number(risk_pct, "risk_pct")
+        order_type = normalize_order_type(order_type)
         targets = await self._resolve_targets(account_ids, tags)
         results = []
         for account in targets:
@@ -484,6 +491,16 @@ class OrderService:
             price = self._require_number(price, "price")
         if stop_price is not None:
             stop_price = self._require_number(stop_price, "stop_price")
+        # T01: broker/lock öncesi ortak validator — enum + koşullu alan + finite.
+        validated = validate_execution_order(
+            side=side,
+            order_type=order_type,
+            quantity=quantity,
+            price=price,
+            stop_price=stop_price,
+        )
+        side = validated["side"]
+        order_type = validated["order_type"]
         lock = self._lock(account_id.strip())
         async with lock:
             return await self._execute_one_direct(
@@ -529,11 +546,17 @@ class OrderService:
         price = self._require_number(price, "price")
         stop_price = self._require_number(stop_price, "stop_price")
         stop_limit_price = self._require_number(stop_limit_price, "stop_limit_price")
-        if side.upper() == "SELL" and stop_limit_price >= stop_price:
-            raise RasatError(
-                ErrorCode.INVALID_REQUEST,
-                "stop_limit_price stop_price'dan düşük olmalı (stop tetiklenince satış limiti)",
-            )
+        # T01: ortak validator — OCO geometrisi/koşullu alanlar servise ve
+        # hesaba ulaşmadan reddedilir (market/filters erişimi gerekmez).
+        validated = validate_execution_order(
+            side=side,
+            order_type="OCO",
+            quantity=quantity,
+            price=price,
+            stop_price=stop_price,
+            stop_limit_price=stop_limit_price,
+        )
+        side = validated["side"]
         lock = self._lock(account_id.strip())
         async with lock:
             return await self._execute_oco_direct(
@@ -571,26 +594,25 @@ class OrderService:
             raise RasatError(ErrorCode.INVALID_SYMBOL, f"evrende bilinmeyen sembol: {symbol}")
         market_price = await self.market.price(symbol)
         check_price_fresh(FRESHNESS_FRESH if market_price is not None else None, symbol)
-        # Stop yönü (spot OCO): SELL = eldeki long'u kapatmak → stop girişin ALTINDA.
-        # `check_stop_direction` SELL'i short-açma sayar (stop üstte ister); spot
-        # kapatma için ayrıca doğrulanır.
-        if side.upper() == "SELL" and stop_price >= market_price:
-            raise RasatError(
-                ErrorCode.INVALID_REQUEST,
-                "SELL OCO'da stop_price giriş fiyatının altında olmalı (long kapatma)",
-            )
-        if side.upper() == "BUY" and stop_price <= market_price:
-            raise RasatError(
-                ErrorCode.INVALID_REQUEST,
-                "BUY OCO'da stop_price giriş fiyatının üstünde olmalı",
-            )
-        notional = quantity * price
+        filters = await self.market.filters(symbol)
+        if filters is None:
+            raise RasatError(ErrorCode.FILTER_VIOLATION, f"exchangeInfo filtreleri yok: {symbol}")
+        # T01: ortak validator — yön/geometri + SymbolFilters, broker'a gitmeden.
+        validated = validate_execution_order(
+            side=side,
+            order_type="OCO",
+            quantity=quantity,
+            price=price,
+            stop_price=stop_price,
+            stop_limit_price=stop_limit_price,
+            filters=filters,
+            market_price=market_price,
+        )
+        side = validated["side"]
+        notional = validated["notional"]
 
         # 3.8: serbest bakiye gate'i — OCO iki emri de borsada kilitler, free yeterli olmalı.
-        filters = await self.market.filters(symbol)
-        base_asset = filters.base_asset if filters else (
-            symbol[: -len("USDT")] if symbol.endswith("USDT") else symbol
-        )
+        base_asset = filters.base_asset
         balances = await self.broker.get_balance(account_id=account_id)
         self._check_available_balance(
             balances=balances, side=(side or "BUY").upper(), symbol=symbol,
@@ -679,7 +701,9 @@ class OrderService:
                 stop_limit_price=stop_limit_price,
                 client_order_id=client_order_id,
             )
-        except RasatError as exc:
+        except (RasatError, asyncio.TimeoutError) as exc:
+            if isinstance(exc, asyncio.TimeoutError):
+                exc = RasatError(ErrorCode.TIMEOUT, "OCO gönderimi zaman aşımı")
             if exc.code == ErrorCode.TIMEOUT:
                 return await self._reconcile_after_timeout(
                     account, order, symbol, client_order_id, actor
@@ -867,6 +891,21 @@ class OrderService:
         quantity = sized["quantity"]
         notional = quantity * price
 
+        # T01: ortak validator — enum/finite + SymbolFilters. LIMIT/STOP_LOSS_LIMIT
+        # fiyatı = entry, STOP_LOSS_LIMIT stop tetikleyicisi = stop_loss olarak geçer;
+        # aksi halde STOP_LOSS_LIMIT her zaman "price zorunlu" ile reddedilirdi.
+        validated = validate_execution_order(
+            side=side,
+            order_type=order_type,
+            quantity=quantity,
+            price=(entry if order_type in ("LIMIT", "STOP_LOSS_LIMIT") else None),
+            stop_price=(stop_loss if order_type == "STOP_LOSS_LIMIT" else None),
+            filters=filters,
+            market_price=price,
+        )
+        side = validated["side"]
+        order_type = validated["order_type"]
+
         # 3) Serbest bakiye gate'i (3.8): BUY → serbest USDT, SELL → serbest base.
         #    Market fiyatı entry'den yüksekse sizing'in entry-bazlı cap'i yetmez;
         #    bu gate nihai notional/fee üzerinden borsaya gitmeden reddeder.
@@ -883,10 +922,12 @@ class OrderService:
             account, policy, symbol, notional, exposure_after, idempotency_key
         )
 
-        # 5) Emri gönder
+        # 5) Emri gönder — STOP_LOSS_LIMIT için stop_price chokepoint validator'ına
+        #    da geçer (aksi halde _place_and_record yine "stop_price zorunlu" der).
         return await self._place_and_record(
             account, is_real, symbol, side, order_type, quantity, entry, notional, price,
             idempotency_key, equity, actor,
+            stop_price=(stop_loss if order_type == "STOP_LOSS_LIMIT" else None),
         )
 
     async def _execute_one_direct(
@@ -915,15 +956,29 @@ class OrderService:
             raise RasatError(ErrorCode.INVALID_SYMBOL, f"evrende bilinmeyen sembol: {symbol}")
         market_price = await self.market.price(symbol)
         check_price_fresh(FRESHNESS_FRESH if market_price is not None else None, symbol)
-        if price is None:
-            price = market_price
-        notional = quantity * price
+        # T01: LIMIT/STOP için fiyat artık piyasa fiyatına DÜŞMEZ — açık fiyat zorunlu.
+        # Ortak validator enum/koşullu alan + SymbolFilters'ı broker'a gitmeden keser.
+        filters = await self.market.filters(symbol)
+        if filters is None:
+            raise RasatError(ErrorCode.FILTER_VIOLATION, f"exchangeInfo filtreleri yok: {symbol}")
+        validated = validate_execution_order(
+            side=side,
+            order_type=order_type,
+            quantity=quantity,
+            price=price,
+            stop_price=stop_price,
+            filters=filters,
+            market_price=market_price,
+        )
+        side = validated["side"]
+        order_type = validated["order_type"]
+        price = validated["price"]
+        stop_price = validated["stop_price"]
+        quantity = validated["quantity"]
+        notional = validated["notional"]
 
         # 3.8: serbest bakiye gate'i (BUY → USDT, SELL → base) — equity değil.
-        filters = await self.market.filters(symbol)
-        base_asset = filters.base_asset if filters else (
-            symbol[: -len("USDT")] if symbol.endswith("USDT") else symbol
-        )
+        base_asset = filters.base_asset
         balances = await self.broker.get_balance(account_id=account_id)
         self._check_available_balance(
             balances=balances, side=(side or "BUY").upper(), symbol=symbol,
@@ -1001,6 +1056,15 @@ class OrderService:
         account_id = account["account_id"]
         from ..data.order_broker import to_client_order_id
 
+        # T01: tek broker chokepoint'inde defense-in-depth — enum/koşullu/finite.
+        validate_execution_order(
+            side=side,
+            order_type=order_type,
+            quantity=quantity,
+            price=price,
+            stop_price=stop_price,
+            market_price=reference_price,
+        )
         client_order_id = to_client_order_id(idempotency_key)
 
         if not is_real:
@@ -1074,7 +1138,9 @@ class OrderService:
                 client_order_id=client_order_id,
                 stop_price=stop_price,
             )
-        except RasatError as exc:
+        except (RasatError, asyncio.TimeoutError) as exc:
+            if isinstance(exc, asyncio.TimeoutError):
+                exc = RasatError(ErrorCode.TIMEOUT, "emir gönderimi zaman aşımı")
             if exc.code == ErrorCode.TIMEOUT:
                 # Reconcile-before-retry: Binance'ten gerçek durumu sor.
                 return await self._reconcile_after_timeout(
@@ -1406,7 +1472,10 @@ class OrderService:
         cancel_errors: list[dict] = []
         sold: list[dict] = []
 
-        # 1) Açık emirleri iptal et
+        # 1) Açık emirleri iptal et (T01): gerçek hesapta borsadaki TÜM açık emirler
+        #    sorgulanır — local DB'de kaydı olmayan yetim emirler dahil — ve local
+        #    satırlar broker sonucuyla senkronize edilir. İptal belirsizse UNKNOWN
+        #    ve closed=False; her transition audit'e yazılır.
         def _open_orders(conn: sqlite3.Connection) -> list[dict]:
             return [
                 dict(r)
@@ -1418,40 +1487,171 @@ class OrderService:
             ]
 
         open_orders = await self.db.read(_open_orders)
-        for order in open_orders:
-            if is_real:
-                try:
-                    await self.broker.cancel_order(
-                        account_id=account_id,
-                        symbol=order["symbol"],
-                        client_order_id=order["client_order_id"],
-                    )
-                except RasatError as exc:
-                    # 3.9: iptal başarısız → sessizce CANCELED yapma. Gerçek
-                    # durum bilinmiyor; UNKNOWN'a çek ve sonuçta açıkça raporla
-                    # (kısmi başarı sözleşmesi, kill switch dahil çağıran görür).
-                    def _unknown(conn: sqlite3.Connection, oid: str = order["order_id"], cerr: RasatError = exc) -> None:
-                        self._update_order(
-                            conn, oid, status="UNKNOWN",
-                            error_code=cerr.code, error_message=cerr.message,
-                        )
+        local_by_cid = {o["client_order_id"]: o for o in open_orders}
 
-                    await self.db.write(_unknown)
+        exchange_open: list[dict] = []
+        exchange_by_cid: dict[str, dict] = {}
+        if is_real:
+            exchange_open = await self.broker.get_all_open_orders(account_id=account_id) or []
+            exchange_by_cid = {
+                str(o["client_order_id"]): o for o in exchange_open if o.get("client_order_id")
+            }
+
+        async def _query_safe(symbol: str, cid: str):
+            try:
+                return await self.broker.query_order(
+                    account_id=account_id, symbol=symbol, client_order_id=cid
+                )
+            except RasatError:
+                return None
+
+        def _write_cancel(order: dict):
+            def _apply(conn: sqlite3.Connection, oid: str = order["order_id"]) -> None:
+                self._update_order(conn, oid, status="CANCELED")
+                if self.audit is not None:
+                    self.audit.append_in_connection(
+                        conn, actor=actor, action="order_canceled",
+                        details={
+                            "account_id": account_id,
+                            "order_id": order["order_id"],
+                            "symbol": order["symbol"],
+                            "client_order_id": order["client_order_id"],
+                        },
+                    )
+
+            return _apply
+
+        def _write_unknown(order: dict, exc: RasatError):
+            def _apply(conn: sqlite3.Connection, oid: str = order["order_id"], cerr: RasatError = exc) -> None:
+                self._update_order(
+                    conn, oid, status="UNKNOWN",
+                    error_code=cerr.code, error_message=cerr.message,
+                )
+                if self.audit is not None:
+                    self.audit.append_in_connection(
+                        conn, actor=actor, action="order_cancel_failed",
+                        details={
+                            "account_id": account_id,
+                            "order_id": order["order_id"],
+                            "symbol": order["symbol"],
+                            "error_code": cerr.code,
+                        },
+                    )
+
+            return _apply
+
+        def _write_sync(order: dict, found: Any):
+            def _apply(conn: sqlite3.Connection, oid: str = order["order_id"], f: Any = found) -> None:
+                self._update_order(
+                    conn, oid, status=f.status, exchange_order_id=f.exchange_order_id,
+                    executed_qty=f.executed_qty, avg_price=f.avg_price,
+                )
+                if self.audit is not None:
+                    self.audit.append_in_connection(
+                        conn, actor=actor, action="order_reconciled",
+                        details={
+                            "account_id": account_id,
+                            "order_id": order["order_id"],
+                            "symbol": order["symbol"],
+                            "status": f.status,
+                        },
+                    )
+
+            return _apply
+
+        async def _cancel_one(cid: str, symbol: str, order: dict | None) -> None:
+            """Tek client_order_id iptalini dener; local satır varsa senkronize eder."""
+            try:
+                res = await self.broker.cancel_order(
+                    account_id=account_id, symbol=symbol, client_order_id=cid
+                )
+            except RasatError as exc:
+                # 3.9: iptal başarısız → sessizce CANCELED yapma. Gerçek durum
+                # bilinmiyor; UNKNOWN'a çek ve sonuçta açıkça raporla.
+                if order is not None:
+                    await self.db.write(_write_unknown(order, exc))
+                cancel_errors.append(
+                    {
+                        "symbol": symbol,
+                        "order_id": order["order_id"] if order else None,
+                        "client_order_id": cid,
+                        "error": {"code": exc.code, "message": exc.message},
+                    }
+                )
+                return
+            if res is None:
+                # -2011: borsada yok (iptal edilmiş/dolmuş olabilir) → gerçek durumu sor.
+                found = await _query_safe(symbol, cid)
+                if found is None:
+                    if order is not None:
+                        await self.db.write(_write_cancel(order))
+                    if symbol not in cancelled:
+                        cancelled.append(symbol)
+                elif found.status in ("NEW", "PARTIALLY_FILLED", "UNKNOWN"):
+                    unknown = RasatError(ErrorCode.ORDER_UNKNOWN, "iptal durumu doğrulanamadı")
+                    if order is not None:
+                        await self.db.write(_write_unknown(order, unknown))
                     cancel_errors.append(
                         {
-                            "symbol": order["symbol"],
-                            "order_id": order["order_id"],
-                            "client_order_id": order["client_order_id"],
+                            "symbol": symbol,
+                            "order_id": order["order_id"] if order else None,
+                            "client_order_id": cid,
+                            "error": {"code": ErrorCode.ORDER_UNKNOWN, "message": unknown.message},
+                        }
+                    )
+                else:
+                    if order is not None:
+                        await self.db.write(_write_sync(order, found))
+                    if symbol not in cancelled:
+                        cancelled.append(symbol)
+                return
+            if res.status == "CANCELED":
+                if order is not None:
+                    await self.db.write(_write_cancel(order))
+                if symbol not in cancelled:
+                    cancelled.append(symbol)
+                return
+            # Diğer terminal durum (örn. FILLED) → açık emir kalmadı; local senkron.
+            if order is not None:
+                await self.db.write(_write_sync(order, res))
+            if res.status != "FILLED" and symbol not in cancelled:
+                cancelled.append(symbol)
+
+        # İptal hedefi = local açık emirler ∪ borsadaki açık emirler
+        targets: dict[str, tuple[str, dict | None]] = {}
+        for cid, order in local_by_cid.items():
+            targets[cid] = (order["symbol"], order)
+        for cid, ex in exchange_by_cid.items():
+            if cid not in targets:
+                targets[cid] = (str(ex.get("symbol") or ""), None)
+        # client_order_id'siz borsa emirleri → sembol bazlı toplu iptal
+        for ex in exchange_open:
+            if not ex.get("client_order_id"):
+                symbol = str(ex.get("symbol") or "")
+                if not symbol:
+                    continue
+                try:
+                    await self.broker.cancel_all_open_orders(account_id=account_id, symbol=symbol)
+                    if symbol not in cancelled:
+                        cancelled.append(symbol)
+                except RasatError as exc:
+                    cancel_errors.append(
+                        {
+                            "symbol": symbol,
+                            "order_id": ex.get("order_id"),
                             "error": {"code": exc.code, "message": exc.message},
                         }
                     )
-                    continue
-            cancelled.append(order["symbol"])
 
-            def _cancel(conn: sqlite3.Connection, oid: str = order["order_id"]) -> None:
-                self._update_order(conn, oid, status="CANCELED")
-
-            await self.db.write(_cancel)
+        for cid, (symbol, order) in targets.items():
+            if not symbol:
+                continue
+            if is_real:
+                await _cancel_one(cid, symbol, order)
+            elif order is not None:
+                await self.db.write(_write_cancel(order))
+                if symbol not in cancelled:
+                    cancelled.append(symbol)
 
         # 2) Base asset bakiyelerini sat
         if not is_real:
@@ -1553,14 +1753,35 @@ class OrderService:
         return by_symbol
 
     async def get_total_exposure(self) -> dict[str, Any]:
-        """Tüm hesapların toplam exposure'ı: sembol bazlı risk görünümü."""
+        """Tüm hesapların toplam exposure'ı: sembol bazlı risk görünümü.
+
+        T01: hesap hataları sessizce yutulmaz. Bir hesabın bakiye/fiyat sorgusu
+        başarısız olursa `errors` içinde `{account_id, error}` taşınır ve
+        `complete=false` döner; eksik exposure hiçbir zaman tam total gibi sunulmaz.
+        """
         accounts = (await self.accounts.list_accounts())["accounts"]
         by_symbol: dict[str, float] = {}
         per_account: dict[str, float] = {}
+        errors: list[dict] = []
         for account in accounts:
             try:
                 per = await self._exposure_by_symbol(account["account_id"])
-            except Exception:  # noqa: BLE001
+            except RasatError as exc:
+                errors.append(
+                    {
+                        "account_id": account["account_id"],
+                        "error": {"code": exc.code, "message": exc.message},
+                    }
+                )
+                continue
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("exposure hesabı başarısız: %s", account["account_id"], exc_info=True)
+                errors.append(
+                    {
+                        "account_id": account["account_id"],
+                        "error": {"code": ErrorCode.INTERNAL_ERROR, "message": "hesap exposure'ı hesaplanamadı"},
+                    }
+                )
                 continue
             per_account[account["account_id"]] = sum(per.values())
             for symbol, value in per.items():
@@ -1571,6 +1792,8 @@ class OrderService:
             "by_symbol": ordered,
             "per_account": per_account,
             "account_count": len(accounts),
+            "complete": not errors,
+            "errors": errors,
         }
 
     async def get_account_balance(self, *, account_id: str) -> dict[str, Any]:
