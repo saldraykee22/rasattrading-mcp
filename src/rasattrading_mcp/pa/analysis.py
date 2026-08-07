@@ -151,6 +151,21 @@ class PAEngine:
         self.config = config
         self.alarm_service = None  # 2.6'da bağlanır (event-driven değerlendirme)
 
+    def _now(self) -> float:
+        """PA katmanının ortak `now` kaynağı (T2).
+
+        Veri katmanı (`data/klines.py`) kapanış/freshness kararlarını Binance
+        server clock (`pipeline.clock.server_now()`) ile yapar. Host saati
+        kayarsa PA kararları da kaymasın diye buradan aynı server clock
+        kullanılır; pipeline/clock yoksa yerel saate düşülür.
+        """
+        clock = getattr(self.pipeline, "clock", None) if self.pipeline is not None else None
+        if clock is not None:
+            server_now = clock.server_now()
+            if server_now is not None:
+                return server_now
+        return time.time()
+
     # ---------- mum okuma ----------
 
     async def _read_candles(self, symbol: str, timeframe: str, lookback: int, source: str = "spot") -> list[dict]:
@@ -180,7 +195,7 @@ class PAEngine:
         candles = await self._load_candles(symbol, timeframe, lookback)
         if not candles:
             raise RasatError(ErrorCode.STALE_DATA, f"{symbol} {timeframe} için mum verisi yok")
-        candles = filter_closed_candles(candles, timeframe)
+        candles = filter_closed_candles(candles, timeframe, now=self._now())
         if len(candles) < 2 * SWING_LOOKBACK + 1:
             raise RasatError(ErrorCode.STALE_DATA, f"{symbol} {timeframe} için yeterli kapanmış mum yok")
 
@@ -329,7 +344,7 @@ class PAEngine:
     # ---------- freshness ----------
 
     @staticmethod
-    def freshness_for(timeframe: str, as_of: int | None) -> str:
+    def freshness_for(timeframe: str, as_of: int | None, now: float | None = None) -> str:
         """PA snapshot'ının tazelik etiketi (2.15 fix — semantik netleşti).
 
         `fresh`, analizin timeframe'in **son kapanmış mumunu** içerdiği anlamına
@@ -338,9 +353,18 @@ class PAEngine:
         Gerçek zaman (ticker) ile aynı anlık snapshot değildir — bar bazlı analiz
         doğası gereği en fazla bir period geride kalır. Bir period'tan daha eskiye
         dayanan analiz (son kapanmış mum eksikken) `stale` olur.
+
+        `now` verilmezse yerel saat kullanılır; veri katmanıyla tutarlılık için
+        örnek üzerinden `PAEngine.freshness()` (server clock, T2) tercih edilir.
         """
         if as_of is None:
             return FRESHNESS_STALE
         period = TIMEFRAME_SECONDS[timeframe]
-        latest_closed = int(time.time() // period) * period - period
+        if now is None:
+            now = time.time()
+        latest_closed = int(now // period) * period - period
         return FRESHNESS_FRESH if as_of >= latest_closed else FRESHNESS_STALE
+
+    def freshness(self, timeframe: str, as_of: int | None) -> str:
+        """Örnek clock'una bağlı freshness: pipeline server clock'u, yoksa yerel saat (T2)."""
+        return self.freshness_for(timeframe, as_of, now=self._now())

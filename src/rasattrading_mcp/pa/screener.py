@@ -369,10 +369,25 @@ def _signal_summary(f: dict, ctx: dict) -> str:
 
 
 class Screener:
-    def __init__(self, db: Database, engine: PAEngine | None = None, pipeline=None) -> None:
+    def __init__(self, db: Database, engine: PAEngine | None = None, pipeline=None, compute_budget: int | None = None) -> None:
         self.db = db
         self.engine = engine or PAEngine(db, pipeline=pipeline)
         self.pipeline = pipeline
+        # T2 (K3 deseni — bkz. pa/alarms.py): depolanmış analiz yokken talep
+        # üzerine `analyze` (ve dolayısıyla warm-up/backfill yükü) soğuk evrende
+        # başıboş artmasın — her scan turunda sınırlı on-demand hesaplamaya izin
+        # verilir, aşan semboller ertelenir (`deferred_analysis`).
+        if compute_budget is None:
+            cfg = self.engine.config if self.engine is not None else None
+            compute_budget = getattr(cfg, "alarm_compute_budget", 8) if cfg is not None else 8
+        self._compute_budget = max(0, int(compute_budget))
+        self._compute_used = 0
+        self._compute_deferred = 0
+
+    def begin_evaluation_pass(self) -> None:
+        """Yeni scan turu başlangıcı: on-demand PA hesap bütçesi sıfırlanır (T2)."""
+        self._compute_used = 0
+        self._compute_deferred = 0
 
     async def _candidate_symbols(self) -> list[str]:
         if self.pipeline is not None and hasattr(self.pipeline, "universe"):
@@ -395,7 +410,7 @@ class Screener:
             return None
         from .swings import filter_closed_candles
 
-        candles = filter_closed_candles(candles, timeframe)
+        candles = filter_closed_candles(candles, timeframe, now=self.engine._now())
         if not candles:
             return None
         ctx: dict[str, Any] = {
@@ -409,6 +424,12 @@ class Screener:
             lz = await _read_current(self.db, "liquidity_zones", symbol, timeframe)
             ob = await _read_current(self.db, "order_blocks", symbol, timeframe)
             if ms is None or lz is None or ob is None:
+                # T2: soğuk evrende her sembol için bütçesiz analyze çağrısı scan'i
+                # dakikalarca sürdürebiliyordu — K3 deseniyle sınırlandırılır.
+                if self._compute_used >= self._compute_budget:
+                    self._compute_deferred += 1
+                    return None
+                self._compute_used += 1
                 await self.engine.analyze(symbol, timeframe)
                 ms = await _read_current(self.db, "market_structure", symbol, timeframe)
                 lz = await _read_current(self.db, "liquidity_zones", symbol, timeframe)
@@ -453,12 +474,14 @@ class Screener:
         limit: int = 50,
         cursor: int | None = None,
         timeframe: str = "1h",
+        require_fresh: bool = True,
     ) -> dict:
         root = validate_filters(filters, combine)
         if not 1 <= limit <= 250:
             raise RasatError(ErrorCode.INVALID_REQUEST, f"limit 1-250 arası olmalı (verildi: {limit})")
         if sort_by not in ("symbol", "price_change", "volume_change"):
             raise RasatError(ErrorCode.INVALID_REQUEST, f"bilinmeyen sort_by: {sort_by}")
+        self.begin_evaluation_pass()
 
         def _collect(node, acc):
             if node["type"] in ("and", "or"):
@@ -473,6 +496,7 @@ class Screener:
 
         symbols = await self._candidate_symbols()
         matched: list[dict] = []
+        stale_symbols: list[dict] = []
         any_stale = False
         for symbol in symbols:
             valid = self._symbol_validity(symbol)
@@ -485,20 +509,24 @@ class Screener:
             ok, matched_nodes = _eval_with_matches(root, ctx)
             if not ok:
                 continue
-            stale = PAEngine.freshness_for(timeframe, ctx["as_of"]) != FRESHNESS_FRESH
+            stale = self.engine.freshness(timeframe, ctx["as_of"]) != FRESHNESS_FRESH
             any_stale = any_stale or stale
-            matched.append(
-                {
-                    "symbol": symbol,
-                    "data_stale": stale,
-                    "symbol_valid": valid,
-                    "price": ctx["close"],
-                    "as_of": ctx["as_of"],
-                    "matched_filters": [n["type"] for n in matched_nodes],
-                    "signal_summary": "; ".join(_signal_summary(n, ctx) for n in matched_nodes),
-                    "sort_value": self._sort_value(sort_by, ctx),
-                }
-            )
+            entry = {
+                "symbol": symbol,
+                "data_stale": stale,
+                "symbol_valid": valid,
+                "price": ctx["close"],
+                "as_of": ctx["as_of"],
+                "matched_filters": [n["type"] for n in matched_nodes],
+                "signal_summary": "; ".join(_signal_summary(n, ctx) for n in matched_nodes),
+                "sort_value": self._sort_value(sort_by, ctx),
+            }
+            if stale and require_fresh:
+                # T2: stale semboller filtre sonucuna karışık tazelikte girmesin
+                # (alarmlarla aynı fail-closed davranış); ayrı raporda görünür kalır.
+                stale_symbols.append({"symbol": symbol, "as_of": ctx["as_of"]})
+                continue
+            matched.append(entry)
 
         matched.sort(key=lambda r: (r["sort_value"], r["symbol"]))
         total = len(matched)
@@ -524,7 +552,10 @@ class Screener:
             "total_matched": total,
             "next_cursor": next_cursor,
             "combine": combine.upper(),
-            "freshness": FRESHNESS_STALE if any_stale else FRESHNESS_FRESH,
+            "freshness": FRESHNESS_STALE if (any_stale and not require_fresh) else FRESHNESS_FRESH,
+            "stale_symbols": stale_symbols,
+            "stale_total": len(stale_symbols),
+            "deferred_analysis": self._compute_deferred,
         }
 
     @staticmethod
