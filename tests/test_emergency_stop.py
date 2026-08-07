@@ -410,6 +410,30 @@ async def test_emergency_stop_sells_and_cancels(em_ctx, monkeypatch):
     assert ctx["log"].verify() == []
 
 
+async def test_emergency_stop_distinct_cid_per_symbol(em_ctx):
+    # T4: aynı run'da birden fazla base asset (BTC+ETH) satılırken her SELL emri
+    # FARKLI clientOrderId taşımalı — aksi halde Binance ikinci emri reddeder
+    # (pozisyon korumasız kalır) veya reconcile yanlış sembolde arar.
+    ctx = em_ctx
+    account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0, "ETH": 2.0})
+    runner = ctx["runner"]
+
+    result = await runner.run(account_ids=[account_id], yes=True)
+    assert result["ok"] is True
+    detail = result["results"][0]
+    assert {s["symbol"] for s in detail["sold"]} == {"BTCUSDT", "ETHUSDT"}
+
+    sells = [p for p in ctx["broker"].placed if p["side"] == "SELL"]
+    assert len(sells) == 2
+    cids = [p["client_order_id"] for p in sells]
+    assert len(set(cids)) == 2  # aynı run içinde iki sembol → iki farklı cid
+    for p in sells:
+        # cid, sembolü taşır (reconcile/query doğru sembolle eşleşir)
+        assert p["symbol"][:8] in p["client_order_id"]
+        # Binance clientOrderId sınırı (36 char) aşılmaz
+        assert len(p["client_order_id"]) <= 36
+
+
 async def test_emergency_stop_no_double_sell(em_ctx):
     ctx = em_ctx
     account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
@@ -619,6 +643,43 @@ async def test_emergency_stop_requires_confirmation(em_ctx, monkeypatch):
     result = await runner.run(account_ids=[account_id], yes=False)
     assert result["ok"] is False
     assert result["results"][0]["error"]["code"] == "ABORTED"
+    assert len(ctx["broker"].placed) == 0
+
+
+async def test_emergency_stop_closed_stdin_fails_closed(em_ctx, monkeypatch):
+    # T4: stdin kapalıyken (headless/CI) input() EOFError fırlatır — iç hata
+    # sızdırılmaz; sabit "confirmation required, use --yes" hatası döner.
+    ctx = em_ctx
+    account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
+    runner = ctx["runner"]
+
+    def _raise_eof(*a, **k):
+        raise EOFError("stdin kapalı")
+
+    monkeypatch.setattr("builtins.input", _raise_eof)
+    result = await runner.run(account_ids=[account_id], yes=False)
+    assert result["ok"] is False
+    detail = result["results"][0]
+    assert detail["ok"] is False
+    assert detail["error"]["code"] == "CONFIRMATION_REQUIRED"
+    assert detail["error"]["message"] == "confirmation required, use --yes for non-interactive"
+    assert "EOFError" not in detail["error"]["message"]
+    assert len(ctx["broker"].placed) == 0  # hiçbir şey gönderilmedi
+
+
+async def test_emergency_stop_closed_stdin_flag_reported(em_ctx, monkeypatch):
+    # T4: sys.stdin.closed=True ön-kontrolü de aynı fail-closed hatayı döner.
+    ctx = em_ctx
+    account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
+    runner = ctx["runner"]
+
+    class _ClosedStdin:
+        closed = True
+
+    monkeypatch.setattr("sys.stdin", _ClosedStdin())
+    result = await runner.run(account_ids=[account_id], yes=False)
+    assert result["ok"] is False
+    assert result["results"][0]["error"]["code"] == "CONFIRMATION_REQUIRED"
     assert len(ctx["broker"].placed) == 0
 
 

@@ -300,11 +300,26 @@ class EmergencyStopRunner:
 
         # Onay: hangi sembol/miktar satılacağı gösterilir (headless: yes bayrağı)
         if plan and not yes and not dry_run:
+            # T4: stdin yoksa/kapalıysa (headless/CI) input() EOFError/OSError
+            # fırlatır ve genel except'e iç hata olarak sızar. Onay akışına
+            # girmeden önce fail-closed, sabit bir hata döndürülür (--yes gerekir).
+            if getattr(sys.stdin, "closed", False):
+                return {"account_id": account_id, "ok": False,
+                        "error": {"code": "CONFIRMATION_REQUIRED",
+                                  "message": "confirmation required, use --yes for non-interactive"},
+                        "plan": plan}
             lines = [f"  {p['symbol']}: {p['quantity']} @ ~{p['price']:.6g} ≈ {p['notional']:.4g} {self.quote_asset}"
                      for p in plan]
             print(f"EMERGENCY STOP — {account_id} şunları satacak:")
             print("\n".join(lines))
-            answer = input("Onaylıyor musun? [y/N]: ").strip().lower()
+            try:
+                answer = input("Onaylıyor musun? [y/N]: ").strip().lower()
+            except (EOFError, OSError):
+                # T4: kapalı/okunamaz stdin → iç exception sızdırılmaz (fail-closed).
+                return {"account_id": account_id, "ok": False,
+                        "error": {"code": "CONFIRMATION_REQUIRED",
+                                  "message": "confirmation required, use --yes for non-interactive"},
+                        "plan": plan}
             if answer not in ("y", "yes"):
                 return {"account_id": account_id, "ok": False,
                         "error": {"code": "ABORTED", "message": "kullanıcı onaylamadı"},
@@ -321,11 +336,15 @@ class EmergencyStopRunner:
                 sold.append(_mark_sell(p, "DRY_RUN"))
                 continue
             sell_key = f"{account_id}:{p['symbol']}:{p['quantity']}:{run_nonce}"
-            cid = f"emergency-{account_id[:8]}-{run_nonce}"
+            # T4: cid, sembolü de içerir — aynı run'da birden fazla base asset
+            # satılırken (örn. BTC+ETH) her SELL ayrı clientOrderId alır; Binance
+            # clientOrderId çakışması ikinci emrin reddine yol açabilir. Uzunluk
+            # 36 char sınırının altındadır (e- + 6 + - + 8 + - + 8 = 26 max).
+            cid = f"e-{account_id[:6]}-{run_nonce}-{p['symbol'][:8]}"
             # Bu sembolde işlemde kalmış bir emergency sell var mı?
             prior = self._latest_sell_details(account_id, p["symbol"])
             if prior is not None and prior.get("status") in _NON_TERMINAL_SELL_STATUSES:
-                prior_cid = prior.get("cid") or f"emergency-{account_id[:8]}-{prior.get('run_nonce') or ''}"
+                prior_cid = prior.get("cid") or f"e-{account_id[:6]}-{prior.get('run_nonce') or ''}-{p['symbol'][:8]}"
                 try:
                     found = await self.broker.query_order(
                         account_id=account_id, symbol=p["symbol"], client_order_id=prior_cid,
