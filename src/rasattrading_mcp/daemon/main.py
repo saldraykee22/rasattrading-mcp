@@ -194,6 +194,15 @@ class DaemonRunner:
             except Exception:  # noqa: BLE001
                 logger.exception("açık emir reconcile edilemedi (3.13)")
 
+            # T3: crash sonrası `executing`'de kalan onaylı emirleri açılışta
+            # kurtar — emir sonucu işlenmeden daemon düşmüş olabilir.
+            try:
+                res = await alarm_service.reconcile_pending_executions()
+                if res["scanned"]:
+                    logger.info("pending execution reconcile (T3): %s", res)
+            except Exception:  # noqa: BLE001
+                logger.exception("pending execution reconcile edilemedi (T3)")
+
         ctx = {
             "config": self.config,
             "readiness": self.readiness,
@@ -229,7 +238,10 @@ class DaemonRunner:
                 alarm_watch.cancel()
             tasks = [watch] + ([alarm_watch] if alarm_watch is not None else [])
             await asyncio.gather(*tasks, return_exceptions=True)
-        await self.stop()
+            # stop() her çıkış yolunda çalışır: normal bitiş, CancelledError
+            # (Windows Ctrl+C) ve herhangi bir exception. Aksi halde DB writer
+            # executor/kilit kapanmadan CancelledError yayılır ve daemon asılı kalır.
+            await self.stop()
         return 0
 
     async def _alarm_eval_loop(self) -> None:
@@ -334,11 +346,26 @@ async def run_daemon(config: Config) -> int:
         return 0  # zaten çalışıyor; arayan (adapter) kilidi kullanmaya devam edecek
 
     loop = asyncio.get_running_loop()
+
+    def _signal_fallback(signum: int, frame) -> None:
+        # Windows'ta loop.add_signal_handler NotImplementedError verir; sinyali
+        # loop thread'ine güvenli biçimde iletip graceful shutdown başlatırız.
+        try:
+            loop.call_soon_threadsafe(runner.request_stop)
+        except RuntimeError:
+            logger.warning("sinyal işlenirken loop kapalı — yok sayılıyor (sig=%s)", signum)
+
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, runner.request_stop)
         except (NotImplementedError, RuntimeError):
-            break  # Windows'ta bazı sinyaller desteklenmez
+            # Windows (veya signal handler desteklemeyen platform): signal.signal
+            # fallback'i — main thread'de çalışır, handler loop'a request_stop iletir.
+            try:
+                signal.signal(sig, _signal_fallback)
+                logger.info("sinyal handler fallback kuruldu (sig=%s, signal.signal)", sig)
+            except (ValueError, OSError, RuntimeError):
+                logger.warning("sinyal handler kurulamadı (sig=%s)", sig, exc_info=True)
 
     return await runner.run()
 

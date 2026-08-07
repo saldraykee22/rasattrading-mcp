@@ -13,12 +13,14 @@ Kapsar:
 
 import asyncio
 import json
+import time
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from rasattrading_mcp.config import Config
 from rasattrading_mcp.data.order_broker import OrderResult, to_client_order_id
+from rasattrading_mcp.daemon.handlers import approve_pending_order_handler
 from rasattrading_mcp.daemon.readiness import Readiness
 from rasattrading_mcp.daemon.server import ToolDispatcher, build_app
 from rasattrading_mcp.errors import ErrorCode, RasatError
@@ -942,3 +944,75 @@ async def test_rpc_generic_error_redacts_exception(cfg):
             body = await resp.json()
             assert body["error"]["code"] == ErrorCode.INTERNAL_ERROR
             assert "süper gizli" not in body["error"]["message"]
+
+
+# =====================================================================
+# T3: market emir entry doldurma + geçici hata eşlemesi (approve handler)
+# =====================================================================
+
+
+def test_transient_error_codes_exclude_permanent_ones():
+    """Geçici hata seti kalıcı hataları içermez — rejected kararı güvenilir kalır."""
+    from rasattrading_mcp.daemon import handlers
+
+    transient = handlers._PENDING_TRANSIENT_ERRORS
+    assert ErrorCode.TIMEOUT in transient
+    assert ErrorCode.STALE_DATA in transient
+    assert ErrorCode.RATE_LIMITED in transient
+    assert ErrorCode.ORDER_UNKNOWN in transient
+    for permanent in (
+        ErrorCode.INSUFFICIENT_BALANCE,
+        ErrorCode.INVALID_REQUEST,
+        ErrorCode.ACCOUNT_NOT_FOUND,
+        ErrorCode.FILTER_VIOLATION,
+        ErrorCode.ORDER_REJECTED,
+        ErrorCode.ORDER_EXPIRED,
+    ):
+        assert permanent not in transient
+
+
+async def test_approve_handler_market_missing_entry_uses_market_feed(ex_db, ex_ctx):
+    """Approve handler, market emirde entry boşsa market feed'den fiyatı doldurur."""
+    import uuid
+
+    from rasattrading_mcp.pa.alarms import AlarmService
+    from rasattrading_mcp.pa.analysis import PAEngine
+    from rasattrading_mcp.storage.state import PENDING_AWAITING_APPROVAL
+
+    from tests.test_execution import FakeMarket
+
+    db = ex_db
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx, balance_usdt=10000.0)
+    oid = uuid.uuid4().hex
+    now = int(time.time())
+
+    def _ins(conn):
+        conn.execute(
+            "INSERT INTO pending_orders (order_id, alert_id, account_id, symbol, side, order_type, "
+            "entry, stop_loss, risk_pct, status, created_at, note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (oid, "alert-x", account_id, "BTCUSDT", "BUY", "market", None, 95.0, 0.01,
+             PENDING_AWAITING_APPROVAL, now, None),
+        )
+
+    await db.write(_ins)
+    market = FakeMarket()
+    engine = PAEngine(db)
+    alarms = AlarmService(db, engine=engine)
+    handler_ctx = {
+        "db": db,
+        "alarm_service": alarms,
+        "order_service": ctx["service"],
+        "market": market,
+        "actor": "test",
+    }
+
+    data, _meta = await approve_pending_order_handler({"order_id": oid}, handler_ctx)
+    assert data["status"] == "executed"
+
+    def _q(conn):
+        return dict(conn.execute("SELECT * FROM pending_orders WHERE order_id=?", (oid,)).fetchone())
+
+    rec = await db.read(_q)
+    assert rec["entry"] == pytest.approx(100.0)  # FakeMarket BTCUSDT fiyatı
+    assert rec["status"] == "executed"
