@@ -110,6 +110,43 @@ async def test_rpc_invalid_body(cfg, client):
     assert body["error"]["code"] == "INVALID_REQUEST"
 
 
+async def test_rpc_missing_required_param_still_400_with_service(cfg):
+    """Alarm servisi mevcutken eksik parametre 400 döner (canlı daemon senaryosu).
+
+    Handler'lar `params["x"]` deseniyle okur; eksik anahtar KeyError üretip
+    generic except'e düşüyordu → 500. İstemci hatasıdır, doğru kod 400'tür.
+    """
+    class _StubAlarmService:
+        async def create_alert(self, symbol, timeframe, condition, **kwargs):
+            raise AssertionError("handler eksik parametreyi servise ulaştırmamalı")
+
+    readiness = Readiness()
+    for s in ["starting", "migrating", "warming_up", "ready"]:
+        readiness.set_state(s)
+    ctx = {
+        "config": cfg,
+        "readiness": readiness,
+        "started_at": 0,
+        "pid": 12345,
+        "pipeline": None,
+        "alarm_service": _StubAlarmService(),
+    }
+    dispatcher = build_dispatcher(ctx)
+    app = build_app(cfg, readiness, TOKEN, dispatcher, extra=ctx)
+    async with TestServer(app) as server:
+        async with TestClient(server) as client:
+            resp = await client.post(
+                "/rpc",
+                data=_json_body({"tool": "create_alert", "params": {"symbol": "BTCUSDT"}}),
+                headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+            )
+            assert resp.status == 400
+            body = await resp.json()
+            assert body["ok"] is False
+            assert body["error"]["code"] == "INVALID_REQUEST"
+            assert "eksik zorunlu parametre" in body["error"]["message"]
+
+
 async def test_not_ready_fails_closed_for_regular_tool(cfg):
     # normal bir tool ready olmadan reddedilmeli (NOT_READY fail-closed)
     REGISTRY.register(

@@ -149,6 +149,13 @@ def build_app(
             raise
         except RasatError:
             raise
+        except KeyError as exc:
+            # Handler eksik/zorunlu parametreye `params["x"]` ile erişiyordu →
+            # KeyError generic except'e düşüp 500 üretiyordu. İstemci hatasıdır.
+            logger.warning("tool %s eksik parametre: %s", tool, exc)
+            raise RasatError(
+                ErrorCode.INVALID_REQUEST, f"{tool} eksik zorunlu parametre: {exc}"
+            ) from exc
         except Exception as exc:  # noqa: BLE001
             logger.exception("tool hatası: %s", tool)
             raise RasatError(ErrorCode.INTERNAL_ERROR, f"{tool} başarısız: {exc}")
