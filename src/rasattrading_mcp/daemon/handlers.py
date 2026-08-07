@@ -514,6 +514,9 @@ async def set_risk_policy_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
         max_notional_per_order=params.get("max_notional_per_order"),
         max_aggregate_exposure=params.get("max_aggregate_exposure"),
         allowed_symbols=params.get("allowed_symbols"),
+        clear_max_notional=params.get("clear_max_notional", False),
+        clear_max_exposure=params.get("clear_max_exposure", False),
+        clear_allowed_symbols=params.get("clear_allowed_symbols", False),
         actor=str(ctx.get("actor", "mcp-agent")),
     )
     return data, Meta(as_of=utc_iso(), source="sqlite-risk-policy", freshness=FRESHNESS_FRESH)

@@ -192,10 +192,12 @@ class OrderService:
         for asset, free in balances.items():
             if asset == quote_asset:
                 continue
+            if free <= 0:
+                continue
             symbol = f"{asset}{quote_asset}"
             price = await self.market.price(symbol)
             if price is None:
-                continue  # fiyatı bilinmeyen varlık exposure'a katılmaz (sessizce 0 sayılmaz)
+                raise RasatError(ErrorCode.STALE_DATA, f"exposure fiyatı alınamadı: {symbol}")
             held_value += free * price
         return open_notional + held_value
 
@@ -1419,6 +1421,8 @@ class OrderService:
         - `account_id == "all"` ise tüm hesaplar; değilse o hesap.
         - Spot long-only: "pozisyon kapat" = elde tutulan base asset bakiyesini satmak.
         - Kısmi başarı: her hesap ayrı sonuç; hangi hesabın kapandığı/kapanamadığı açıkça raporlanır.
+        - Paper hesapta gerçek bakiye sorgulanmaz/satılmaz; yalnızca yerel açık emirler
+          iptal edilir ve yanıt `closed=False, simulated=True` döner.
         - 3.14: her `_close_one` çağrısı kendi close-run nonce'ını üretir; idem key
           `account+symbol+qty+run` bileşimidir. Bu, eşit miktarlı rebuy'da dahi yeni
           SELL üretir (eskiden FILLED dedup eşit miktar alımını atlıyordu) ve
@@ -1456,7 +1460,10 @@ class OrderService:
                         {
                             "account_id": account["account_id"],
                             "closed": False,
-                            "error": {"code": ErrorCode.INTERNAL_ERROR, "message": str(exc)},
+                            "error": {
+                                "code": ErrorCode.INTERNAL_ERROR,
+                                "message": "pozisyon kapatma başarısız",
+                            },
                         }
                     )
 
@@ -1502,6 +1509,8 @@ class OrderService:
                 return await self.broker.query_order(
                     account_id=account_id, symbol=symbol, client_order_id=cid
                 )
+            except asyncio.TimeoutError:
+                return RasatError(ErrorCode.TIMEOUT, "iptal durumu sorgusu zaman aşımına uğradı")
             except RasatError:
                 return None
 
@@ -1565,9 +1574,11 @@ class OrderService:
                 res = await self.broker.cancel_order(
                     account_id=account_id, symbol=symbol, client_order_id=cid
                 )
-            except RasatError as exc:
+            except (RasatError, asyncio.TimeoutError) as exc:
                 # 3.9: iptal başarısız → sessizce CANCELED yapma. Gerçek durum
                 # bilinmiyor; UNKNOWN'a çek ve sonuçta açıkça raporla.
+                if isinstance(exc, asyncio.TimeoutError):
+                    exc = RasatError(ErrorCode.TIMEOUT, "iptal isteği zaman aşımına uğradı")
                 if order is not None:
                     await self.db.write(_write_unknown(order, exc))
                 cancel_errors.append(
@@ -1582,6 +1593,18 @@ class OrderService:
             if res is None:
                 # -2011: borsada yok (iptal edilmiş/dolmuş olabilir) → gerçek durumu sor.
                 found = await _query_safe(symbol, cid)
+                if isinstance(found, RasatError):
+                    if order is not None:
+                        await self.db.write(_write_unknown(order, found))
+                    cancel_errors.append(
+                        {
+                            "symbol": symbol,
+                            "order_id": order["order_id"] if order else None,
+                            "client_order_id": cid,
+                            "error": {"code": found.code, "message": found.message},
+                        }
+                    )
+                    return
                 if found is None:
                     if order is not None:
                         await self.db.write(_write_cancel(order))
@@ -1602,7 +1625,7 @@ class OrderService:
                 else:
                     if order is not None:
                         await self.db.write(_write_sync(order, found))
-                    if symbol not in cancelled:
+                    if found.status == "CANCELED" and symbol not in cancelled:
                         cancelled.append(symbol)
                 return
             if res.status == "CANCELED":
@@ -1611,11 +1634,22 @@ class OrderService:
                 if symbol not in cancelled:
                     cancelled.append(symbol)
                 return
+            if res.status in ("NEW", "PARTIALLY_FILLED", "UNKNOWN"):
+                unknown = RasatError(ErrorCode.ORDER_RECONCILE_REQUIRED, "iptal sonucu terminal değil")
+                if order is not None:
+                    await self.db.write(_write_unknown(order, unknown))
+                cancel_errors.append(
+                    {
+                        "symbol": symbol,
+                        "order_id": order["order_id"] if order else None,
+                        "client_order_id": cid,
+                        "error": {"code": unknown.code, "message": unknown.message},
+                    }
+                )
+                return
             # Diğer terminal durum (örn. FILLED) → açık emir kalmadı; local senkron.
             if order is not None:
                 await self.db.write(_write_sync(order, res))
-            if res.status != "FILLED" and symbol not in cancelled:
-                cancelled.append(symbol)
 
         # İptal hedefi = local açık emirler ∪ borsadaki açık emirler
         targets: dict[str, tuple[str, dict | None]] = {}
@@ -1632,9 +1666,41 @@ class OrderService:
                     continue
                 try:
                     await self.broker.cancel_all_open_orders(account_id=account_id, symbol=symbol)
+                    if self.audit is not None:
+                        await self.db.write(
+                            lambda conn, ex_order=ex, sym=symbol: self.audit.append_in_connection(
+                                conn,
+                                actor=actor,
+                                action="order_canceled",
+                                details={
+                                    "account_id": account_id,
+                                    "order_id": ex_order.get("order_id"),
+                                    "symbol": sym,
+                                    "client_order_id": None,
+                                    "scope": "exchange_open_order_without_client_id",
+                                },
+                            )
+                        )
                     if symbol not in cancelled:
                         cancelled.append(symbol)
-                except RasatError as exc:
+                except (RasatError, asyncio.TimeoutError) as exc:
+                    if isinstance(exc, asyncio.TimeoutError):
+                        exc = RasatError(ErrorCode.TIMEOUT, "toplu iptal isteği zaman aşımına uğradı")
+                    if self.audit is not None:
+                        await self.db.write(
+                            lambda conn, ex_order=ex, sym=symbol, cerr=exc: self.audit.append_in_connection(
+                                conn,
+                                actor=actor,
+                                action="order_cancel_failed",
+                                details={
+                                    "account_id": account_id,
+                                    "order_id": ex_order.get("order_id"),
+                                    "symbol": sym,
+                                    "error_code": cerr.code,
+                                    "scope": "exchange_open_order_without_client_id",
+                                },
+                            )
+                        )
                     cancel_errors.append(
                         {
                             "symbol": symbol,
@@ -1655,8 +1721,21 @@ class OrderService:
 
         # 2) Base asset bakiyelerini sat
         if not is_real:
-            return {"account_id": account_id, "closed": False, "mode": "paper",
-                    "cancelled": cancelled, "cancel_errors": cancel_errors, "sold": sold}
+            # Paper hesapta borsa bakiyesi okunmadığı için pozisyonun gerçekten
+            # kapandığı iddia edilmez. Yerel açık emirler iptal edilmiş olabilir;
+            # çağıran bunu `simulated` ve `position_close_supported` alanlarından
+            # ayırt eder.
+            return {
+                "account_id": account_id,
+                "closed": False,
+                "mode": "paper",
+                "simulated": True,
+                "position_close_supported": False,
+                "reason": "paper hesapta yalnızca yerel açık emirler iptal edildi; gerçek bakiye satışı yapılmadı",
+                "cancelled": cancelled,
+                "cancel_errors": cancel_errors,
+                "sold": sold,
+            }
 
         # 3.14: her close run'ı kendi nonce'ını taşır — aynı (account, symbol, qty)
         # rebuy'da dahi yeni idem key → yeni SELL; REJECTED retry'i UNIQUE'e takılmaz.
@@ -1745,10 +1824,12 @@ class OrderService:
         for asset, free in balances.items():
             if asset == "USDT":
                 continue
+            if free <= 0:
+                continue
             symbol = f"{asset}USDT"
             price = await self.market.price(symbol)
             if price is None:
-                continue
+                raise RasatError(ErrorCode.STALE_DATA, f"exposure fiyatı alınamadı: {symbol}")
             by_symbol[symbol] = by_symbol.get(symbol, 0.0) + free * price
         return by_symbol
 

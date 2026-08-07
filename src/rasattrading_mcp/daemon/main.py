@@ -42,10 +42,17 @@ class DaemonRunner:
         self.account_service = None
         self.risk_service = None
         self.order_service = None
+        self.order_broker = None
         self.pipeline = None  # 1.4'te doldurulur
         self.http_site = None
         self.http_runner = None
         self.dispatcher = None
+        self.pa_engine = None
+        self.alarm_service = None
+        self.pa_worker = None
+        self._pa_worker_task = None
+        self._shutdown_lock = asyncio.Lock()
+        self._shutdown_complete = False
 
     # ---------- startup ----------
 
@@ -70,8 +77,18 @@ class DaemonRunner:
 
         logger.info("kilit alındı pid=%s nonce=%s", self.lock_info.pid, self.lock_info.nonce[:8])
 
-        await self._startup_sequence()
-        await self._start_http()  # 1.3'te gerçek sunucu; 1.1'de no-op
+        try:
+            await self._startup_sequence()
+            await self._start_http()  # 1.3'te gerçek sunucu; 1.1'de no-op
+        except asyncio.CancelledError:
+            await asyncio.shield(self.stop())
+            raise
+        except Exception:
+            # Startup'ın herhangi bir aşaması yarıda kalırsa kilit, DB, pipeline
+            # ve oluşturulmuş broker session'ı geride bırakılmamalı. stop()
+            # bileşenleri kısmi durumda da güvenli biçimde temizler.
+            await self.stop()
+            raise
 
         self.readiness.set_state("ready")
         self.lock_mgr.update_state(self.readiness.state)
@@ -151,10 +168,9 @@ class DaemonRunner:
         from ..data.order_broker import BinanceOrderBroker
         from ..storage.orders import OrderService, PipelineMarketFeed
 
-        order_broker = None
         order_service = None
         if self.pipeline is not None and self.account_service is not None:
-            order_broker = BinanceOrderBroker(
+            self.order_broker = BinanceOrderBroker(
                 self.config.rest_spot_base,
                 credentials=lambda account_id: self.account_service.get_credentials(account_id),
                 budget=self.pipeline.budget,
@@ -163,7 +179,7 @@ class DaemonRunner:
                 self.db,
                 accounts=self.account_service,
                 risk=self.risk_service,
-                broker=order_broker,
+                broker=self.order_broker,
                 market=PipelineMarketFeed(self.pipeline),
                 audit=self.audit,
             )
@@ -190,7 +206,7 @@ class DaemonRunner:
             "risk_service": self.risk_service,
             "risk_policy_service": self.risk_service,
             "order_service": order_service,
-            "order_broker": order_broker,
+            "order_broker": self.order_broker,
             "pipeline": self.pipeline,
             "pa_engine": pa_engine,
             "alarm_service": alarm_service,
@@ -258,31 +274,56 @@ class DaemonRunner:
     # ---------- shutdown ----------
 
     async def stop(self) -> None:
-        logger.info("daemon kapanıyor")
-        if self._pa_worker_task is not None:
-            self._pa_worker_task.cancel()
-            await asyncio.gather(self._pa_worker_task, return_exceptions=True)
-        if self.http_site is not None:
+        async with self._shutdown_lock:
+            if self._shutdown_complete:
+                return
+            logger.info("daemon kapanıyor")
+            self._stop.set()
+
             try:
-                await self.http_site.stop()
-            except Exception:  # noqa: BLE001
-                logger.exception("HTTP site durdurulamadı")
-        if self.http_runner is not None:
-            try:
-                await self.http_runner.cleanup()
-            except Exception:  # noqa: BLE001
-                logger.exception("HTTP runner temizlenemedi")
-        if self.pipeline is not None:
-            try:
-                await self.pipeline.stop()
-            except Exception:  # noqa: BLE001
-                logger.exception("pipeline durdurulamadı")
-        if self.db is not None:
-            try:
-                await self.db.stop()
-            except Exception:  # noqa: BLE001
-                logger.exception("db durdurulamadı")
-        self.lock_mgr.release()
+                pa_task = self._pa_worker_task
+                if pa_task is not None:
+                    pa_task.cancel()
+                    await asyncio.gather(pa_task, return_exceptions=True)
+
+                if self.http_site is not None:
+                    try:
+                        await self.http_site.stop()
+                    except Exception:  # noqa: BLE001
+                        logger.exception("HTTP site durdurulamadı")
+                if self.http_runner is not None:
+                    try:
+                        await self.http_runner.cleanup()
+                    except Exception:  # noqa: BLE001
+                        logger.exception("HTTP runner temizlenemedi")
+
+                # Broker HTTP session'ı, handler'lar kapandıktan sonra ve
+                # pipeline/DB kapanmadan önce kapatılır. Böylece hiçbir yeni
+                # emir/REST çağrısı kaynakları kapatılırken başlatılamaz.
+                broker = self.order_broker
+                close_broker = getattr(broker, "close", None) if broker is not None else None
+                if close_broker is not None:
+                    try:
+                        await close_broker()
+                    except Exception:  # noqa: BLE001
+                        logger.exception("order broker session kapatılamadı")
+
+                if self.pipeline is not None:
+                    try:
+                        await self.pipeline.stop()
+                    except Exception:  # noqa: BLE001
+                        logger.exception("pipeline durdurulamadı")
+                if self.db is not None:
+                    try:
+                        await self.db.stop()
+                    except Exception:  # noqa: BLE001
+                        logger.exception("db durdurulamadı")
+            finally:
+                try:
+                    self.lock_mgr.release()
+                except Exception:  # noqa: BLE001
+                    logger.exception("daemon kilidi bırakılamadı")
+                self._shutdown_complete = True
 
 
 async def run_daemon(config: Config) -> int:

@@ -28,6 +28,7 @@ import uuid
 from typing import Any
 
 from ..errors import ErrorCode, RasatError
+from ..numeric import require_finite
 from .audit import AuditLog
 from .db import Database
 
@@ -94,10 +95,16 @@ def _validate_optional_amount(value: Any, field: str) -> float | None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise RasatError(ErrorCode.INVALID_REQUEST, f"{field} pozitif sayı olmalı")
-    amount = float(value)
+    amount = require_finite(value, field)
     if amount <= 0:
         raise RasatError(ErrorCode.INVALID_REQUEST, f"{field} sıfırdan büyük olmalı")
     return amount
+
+
+def _validate_clear_flag(value: Any, field: str) -> bool:
+    if not isinstance(value, bool):
+        raise RasatError(ErrorCode.INVALID_REQUEST, f"{field} boolean olmalı")
+    return value
 
 
 def _validate_symbols(value: Any) -> list[str]:
@@ -167,6 +174,9 @@ class RiskPolicyService:
         max_notional_per_order: Any = None,
         max_aggregate_exposure: Any = None,
         allowed_symbols: Any = None,
+        clear_max_notional: Any = False,
+        clear_max_exposure: Any = False,
+        clear_allowed_symbols: Any = False,
         actor: str = "mcp-agent",
     ) -> dict[str, Any]:
         if not isinstance(account_id, str) or not account_id.strip():
@@ -175,6 +185,9 @@ class RiskPolicyService:
         max_notional = _validate_optional_amount(max_notional_per_order, "max_notional_per_order")
         max_aggregate = _validate_optional_amount(max_aggregate_exposure, "max_aggregate_exposure")
         symbols = _validate_symbols(allowed_symbols)
+        clear_notional = _validate_clear_flag(clear_max_notional, "clear_max_notional")
+        clear_aggregate = _validate_clear_flag(clear_max_exposure, "clear_max_exposure")
+        clear_symbols = _validate_clear_flag(clear_allowed_symbols, "clear_allowed_symbols")
 
         def _upsert(conn: sqlite3.Connection) -> dict[str, Any]:
             if conn.execute("SELECT 1 FROM accounts WHERE account_id = ?", (account_id,)).fetchone() is None:
@@ -187,15 +200,18 @@ class RiskPolicyService:
                 version = 1
                 changed = True
                 created_at = updated_at = int(time.time())
+                merged_notional = None if clear_notional else max_notional
+                merged_aggregate = None if clear_aggregate else max_aggregate
+                merged_symbols = [] if clear_symbols else symbols
                 conn.execute(
                     "INSERT INTO risk_policy "
                     "(account_id, max_notional_per_order, max_aggregate_exposure, allowed_symbols, policy_version, created_at, updated_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
                         account_id,
-                        max_notional,
-                        max_aggregate,
-                        json.dumps(symbols, ensure_ascii=False, separators=(",", ":")),
+                        merged_notional,
+                        merged_aggregate,
+                        json.dumps(merged_symbols, ensure_ascii=False, separators=(",", ":")),
                         version,
                         created_at,
                         updated_at,
@@ -203,20 +219,29 @@ class RiskPolicyService:
                 )
             else:
                 prev_symbols = _parse_symbols(row["allowed_symbols"])
+                prev_notional = row["max_notional_per_order"]
+                prev_aggregate = row["max_aggregate_exposure"]
+                # `None` means no-op. Empty allowed_symbols is also a no-op;
+                # clearing is explicit so callers cannot accidentally remove a
+                # symbol allowlist while constructing a partial patch.
+                merged_notional = None if clear_notional else (
+                    max_notional if max_notional is not None else prev_notional
+                )
+                merged_aggregate = None if clear_aggregate else (
+                    max_aggregate if max_aggregate is not None else prev_aggregate
+                )
+                merged_symbols = [] if clear_symbols else (
+                    symbols if allowed_symbols is not None and symbols else prev_symbols
+                )
                 changed = (
-                    max_notional is not None and max_notional != row["max_notional_per_order"]
-                ) or (
-                    max_aggregate is not None and max_aggregate != row["max_aggregate_exposure"]
-                ) or (
-                    symbols and symbols != prev_symbols
+                    merged_notional != prev_notional
+                    or merged_aggregate != prev_aggregate
+                    or merged_symbols != prev_symbols
                 )
                 version = int(row["policy_version"])
                 if changed:
                     version += 1
-                merged_notional = max_notional if max_notional is not None else row["max_notional_per_order"]
-                merged_aggregate = max_aggregate if max_aggregate is not None else row["max_aggregate_exposure"]
-                merged_symbols = symbols if symbols else prev_symbols
-                updated_at = int(time.time())
+                updated_at = int(time.time()) if changed else int(row["updated_at"])
                 conn.execute(
                     "UPDATE risk_policy SET max_notional_per_order = ?, max_aggregate_exposure = ?, "
                     "allowed_symbols = ?, policy_version = ?, updated_at = ? WHERE account_id = ?",
@@ -243,22 +268,25 @@ class RiskPolicyService:
                     details={
                         "account_id": account_id,
                         "policy_version": version,
-                        "max_notional_per_order": max_notional,
-                        "max_aggregate_exposure": max_aggregate,
-                        "allowed_symbols": symbols,
+                        "max_notional_per_order": merged_notional,
+                        "max_aggregate_exposure": merged_aggregate,
+                        "allowed_symbols": merged_symbols,
+                        "clear_max_notional": clear_notional,
+                        "clear_max_exposure": clear_aggregate,
+                        "clear_allowed_symbols": clear_symbols,
                         "changed": changed,
                     },
                 )
             return {
                 "account_id": account_id,
-                "max_notional_per_order": max_notional,
-                "max_aggregate_exposure": max_aggregate,
-                "allowed_symbols": symbols,
+                "max_notional_per_order": merged_notional,
+                "max_aggregate_exposure": merged_aggregate,
+                "allowed_symbols": merged_symbols,
                 "policy_version": version,
                 "configured": True,
                 "changed": changed,
                 "created_at": created_at,
-                "updated_at": int(time.time()),
+                "updated_at": updated_at,
             }
 
         return await self.db.write(_upsert)
