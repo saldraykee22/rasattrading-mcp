@@ -317,3 +317,85 @@ async def test_approve_unknown_status_keeps_reconcile_not_executed(t02_ctx):
     rec = await _pending_status(ctx["db"], oid)
     assert rec["status"] == PENDING_RECONCILE_REQUIRED
     assert rec["executed_order_id"] is None
+
+
+# ---------- broker status eşlemesi (yalnızca FILLED/paper kesin başarı) ----------
+
+
+async def test_approve_real_filled_uses_exchange_order_id(t02_ctx):
+    """Real hesapta FILLED kesin başarıdır; executed_order_id exchange id doldurur."""
+    ctx = t02_ctx
+    account_id = await _add_real_account(ctx)
+    oid = await _insert_pending(ctx["db"], account_id=account_id)
+
+    data, _meta = await approve_pending_order_handler({"order_id": oid}, ctx)
+
+    assert data["status"] == "executed"
+    rec = await _pending_status(ctx["db"], oid)
+    assert rec["status"] == "executed"
+    assert rec["executed_order_id"].startswith("EX")  # exchange emir kimliği
+
+
+async def test_approve_broker_new_is_reconcile_not_executed(t02_ctx):
+    """NEW (bekleyen limit emri) kesin başarı DEĞİL → reconcile_required, id boş."""
+    ctx = t02_ctx
+    account_id = await _add_real_account(ctx)
+    ctx["broker"].place_result = {"status": "NEW", "exchange_order_id": "EX-NEW-1"}
+    oid = await _insert_pending(ctx["db"], account_id=account_id)
+
+    with pytest.raises(RasatError) as exc_info:
+        await approve_pending_order_handler({"order_id": oid}, ctx)
+    assert exc_info.value.code == ErrorCode.ORDER_RECONCILE_REQUIRED
+
+    rec = await _pending_status(ctx["db"], oid)
+    assert rec["status"] == PENDING_RECONCILE_REQUIRED
+    assert rec["executed_order_id"] is None
+
+
+async def test_approve_broker_partially_filled_is_reconcile(t02_ctx):
+    """PARTIALLY_FILLED non-terminal → reconcile_required, executed_order_id boş."""
+    ctx = t02_ctx
+    account_id = await _add_real_account(ctx)
+    ctx["broker"].place_result = {"status": "PARTIALLY_FILLED", "exchange_order_id": "EX-PF-1"}
+    oid = await _insert_pending(ctx["db"], account_id=account_id)
+
+    with pytest.raises(RasatError) as exc_info:
+        await approve_pending_order_handler({"order_id": oid}, ctx)
+    assert exc_info.value.code == ErrorCode.ORDER_RECONCILE_REQUIRED
+
+    rec = await _pending_status(ctx["db"], oid)
+    assert rec["status"] == PENDING_RECONCILE_REQUIRED
+    assert rec["executed_order_id"] is None
+
+
+async def test_approve_broker_canceled_is_rejected(t02_ctx):
+    """CANCELED deterministic rejected → pending rejected, executed_order_id boş."""
+    ctx = t02_ctx
+    account_id = await _add_real_account(ctx)
+    ctx["broker"].place_result = {"status": "CANCELED", "exchange_order_id": "EX-C-1"}
+    oid = await _insert_pending(ctx["db"], account_id=account_id)
+
+    with pytest.raises(RasatError):
+        await approve_pending_order_handler({"order_id": oid}, ctx)
+
+    rec = await _pending_status(ctx["db"], oid)
+    assert rec["status"] == PENDING_REJECTED
+    assert rec["executed_order_id"] is None
+    assert rec["execution_error_code"] == ErrorCode.ORDER_REJECTED
+
+
+async def test_approve_broker_expired_is_rejected(t02_ctx):
+    """EXPIRED deterministic rejected → pending rejected, executed_order_id boş."""
+    ctx = t02_ctx
+    account_id = await _add_real_account(ctx)
+    ctx["broker"].place_result = {"status": "EXPIRED", "exchange_order_id": "EX-E-1"}
+    oid = await _insert_pending(ctx["db"], account_id=account_id)
+
+    with pytest.raises(RasatError) as exc_info:
+        await approve_pending_order_handler({"order_id": oid}, ctx)
+    assert exc_info.value.code == ErrorCode.ORDER_EXPIRED
+
+    rec = await _pending_status(ctx["db"], oid)
+    assert rec["status"] == PENDING_REJECTED
+    assert rec["executed_order_id"] is None
+    assert rec["execution_error_code"] == ErrorCode.ORDER_EXPIRED

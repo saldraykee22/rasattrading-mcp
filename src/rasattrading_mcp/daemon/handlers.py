@@ -10,12 +10,22 @@ from .. import __version__
 from ..daemon.readiness import Readiness
 from ..envelope import FRESHNESS_FRESH, FRESHNESS_STALE, Meta, SOURCE_DAEMON, utc_iso
 from ..errors import RasatError, ErrorCode
+from ..storage.orders import STATUS_PAPER
 from ..storage.state import (
     PENDING_AWAITING_APPROVAL,
     PENDING_RECONCILE_REQUIRED,
     PENDING_REJECTED,
 )
 from .server import ToolDispatcher
+
+
+# T02: execution sonucu status'u → pending terminal eşlemesi.
+# Yalnızca kesin borsa dolumu (FILLED) veya yerel paper simülasyonu kesin başarıdır;
+# NEW/PARTIALLY_FILLED gibi non-terminal ve bilinmeyen durumlar reconcile_required
+# taşır; REJECTED/CANCELED/EXPIRED deterministik rejected'dir. executed_order_id
+# yalnızca kesin başarıda doldurulur.
+_PENDING_DEFINITE_SUCCESS = frozenset({"FILLED", STATUS_PAPER})
+_PENDING_DEFINITE_REJECTED = frozenset({"REJECTED", "CANCELED", "EXPIRED"})
 
 
 async def ping_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
@@ -318,9 +328,11 @@ async def approve_pending_order_handler(params: dict, ctx: dict) -> tuple[dict, 
       (iki eşzamanlı approve yalnızca bir execution claim üretir).
     - `execute_on_accounts` structured REJECTED/UNKNOWN sonucu başarı sayılmaz;
       exception sonrası kayıt `approved` kilidinde kalmaz.
-    - Kesin başarıda `executing → executed` (`executed_order_id` yalnızca kesin
-      emir kimliğiyle doldurulur); deterministic rejection'da `rejected`;
-      timeout/UNKNOWN/ambiguous durumda `reconcile_required`.
+    - Kesin başarı yalnızca `status == FILLED` (borsa dolumu) veya paper
+      simülasyonudur → `executed` (`executed_order_id` kesin emir kimliğiyle
+      doldurulur). REJECTED/CANCELED/EXPIRED → deterministic `rejected`;
+      NEW/PARTIALLY_FILLED/UNKNOWN ve bilinmeyen status → `reconcile_required`
+      (non-terminal/ambiguous; executed_order_id boş kalır).
     """
     alarm = _require_alarm_service(ctx)
     order_id = params["order_id"]
@@ -386,41 +398,47 @@ async def approve_pending_order_handler(params: dict, ctx: dict) -> tuple[dict, 
         raise RasatError(ErrorCode.ORDER_RECONCILE_REQUIRED, "emir sonucu belirsiz; reconcile gerekli")
 
     status = result.get("status")
-    if status in ("REJECTED", "UNKNOWN"):
-        error = result.get("error") or {}
-        if status == "REJECTED":
-            code = error.get("code") or ErrorCode.ORDER_REJECTED
-            message = error.get("message") or "emir reddedildi"
+    error = result.get("error") or {}
+    if status in _PENDING_DEFINITE_SUCCESS:
+        # Kesin başarı: yalnızca FILLED (borsa dolumu) veya paper simülasyonu.
+        executed_order_id = result.get("exchange_order_id") or result.get("order_id")
+        if not executed_order_id:
             await alarm.fail_pending_execution(
-                order_id, status=PENDING_REJECTED, error_code=code, error_message=message
+                order_id,
+                status=PENDING_RECONCILE_REQUIRED,
+                error_code=ErrorCode.ORDER_UNKNOWN,
+                error_message="kesin emir kimliği alınamadı; reconcile gerekli",
             )
-            raise RasatError(code, message)
-        # UNKNOWN/ambiguous → reconcile_required; detay kayıtta tutulur.
-        code = error.get("code") or ErrorCode.ORDER_UNKNOWN
-        message = error.get("message") or "emir durumu bilinmiyor; reconcile gerekli"
-        await alarm.fail_pending_execution(
-            order_id, status=PENDING_RECONCILE_REQUIRED, error_code=code, error_message=message
-        )
-        raise RasatError(ErrorCode.ORDER_RECONCILE_REQUIRED, "emir durumu belirsiz; reconcile gerekli")
+            raise RasatError(ErrorCode.ORDER_RECONCILE_REQUIRED, "kesin emir kimliği alınamadı")
+        await alarm.complete_pending_execution(order_id, executed_order_id)
+        return {
+            "order_id": order_id,
+            "status": "executed",
+            "executed_order_id": executed_order_id,
+            "executed": executed,
+        }, Meta(as_of=utc_iso(), source="order-service", freshness=FRESHNESS_FRESH)
 
-    # Kesin başarı: emir kimliği mevcut (real → exchange id, paper → yerel kayıt).
-    executed_order_id = result.get("exchange_order_id") or result.get("order_id")
-    if not executed_order_id:
+    if status in _PENDING_DEFINITE_REJECTED:
+        # Deterministik red: borsa emri kesin reddedildi/iptal/süresi doldu.
+        code = error.get("code") or {
+            "REJECTED": ErrorCode.ORDER_REJECTED,
+            "EXPIRED": ErrorCode.ORDER_EXPIRED,
+            "CANCELED": ErrorCode.ORDER_REJECTED,
+        }.get(status, ErrorCode.ORDER_REJECTED)
+        message = error.get("message") or f"emir kesin sonlandı (borsa durumu: {status})"
         await alarm.fail_pending_execution(
-            order_id,
-            status=PENDING_RECONCILE_REQUIRED,
-            error_code=ErrorCode.ORDER_UNKNOWN,
-            error_message="kesin emir kimliği alınamadı; reconcile gerekli",
+            order_id, status=PENDING_REJECTED, error_code=code, error_message=message
         )
-        raise RasatError(ErrorCode.ORDER_RECONCILE_REQUIRED, "kesin emir kimliği alınamadı")
+        raise RasatError(code, message)
 
-    await alarm.complete_pending_execution(order_id, executed_order_id)
-    return {
-        "order_id": order_id,
-        "status": "executed",
-        "executed_order_id": executed_order_id,
-        "executed": executed,
-    }, Meta(as_of=utc_iso(), source="order-service", freshness=FRESHNESS_FRESH)
+    # Diğer tüm durumlar (UNKNOWN, NEW, PARTIALLY_FILLED ve bilinmeyen status):
+    # non-terminal/ambiguous → reconcile_required; executed_order_id doldurulmaz.
+    code = error.get("code") or ErrorCode.ORDER_UNKNOWN
+    message = error.get("message") or f"emir durumu kesin değil (borsa durumu: {status}); reconcile gerekli"
+    await alarm.fail_pending_execution(
+        order_id, status=PENDING_RECONCILE_REQUIRED, error_code=code, error_message=message
+    )
+    raise RasatError(ErrorCode.ORDER_RECONCILE_REQUIRED, "emir kesin dolmadı; reconcile gerekli")
 
 
 async def reject_pending_order_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
