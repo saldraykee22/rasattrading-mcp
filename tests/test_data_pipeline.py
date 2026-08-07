@@ -8,6 +8,7 @@ from rasattrading_mcp.config import Config, TIMEFRAME_SECONDS
 from rasattrading_mcp.data.binance_client import BinanceREST, kline_weight
 from rasattrading_mcp.data.futures import FuturesContextPoller
 from rasattrading_mcp.data.klines import KlineService, parse_klines
+from rasattrading_mcp.data.liquidation_ws import LiquidationWSClient, parse_force_order_arr
 from rasattrading_mcp.data.miniticker import MiniTickerClient, TickerCache, parse_miniticker_arr
 from rasattrading_mcp.data.pipeline import DataPipeline
 from rasattrading_mcp.data.rate_limit import RateLimitBudget, backoff_delay
@@ -585,7 +586,6 @@ async def test_futures_pollers_write_context(cfg, db):
     n = await poller.poll_funding()
     assert n == 1
     await poller.poll_open_interest()
-    await poller.poll_liquidations()
 
     def _q(conn):
         rows = conn.execute("SELECT symbol, type, event_time, freshness, value FROM futures_context").fetchall()
@@ -593,61 +593,118 @@ async def test_futures_pollers_write_context(cfg, db):
 
     rows = await db.read(_q)
     types = {r["type"] for r in rows}
-    assert {"funding_rate", "open_interest", "liquidation"} <= types
+    assert {"funding_rate", "open_interest"} <= types
     assert all(r["freshness"] == "fresh" for r in rows)
-    # event_time ile fetched_at ayrı saklanır
-    liq = next(r for r in rows if r["type"] == "liquidation")
-    assert liq["value"] == 90000.0 * 0.5
 
 
-async def test_liquidation_polls_correct_endpoint(cfg, db):
-    """1.6: `/fapi/v1/allForceOrders` canlı API'de 404 — doğru path `/fapi/v1/forceOrders`."""
-    from tests.helpers import FakeRest
+# ---------- liquidation ws ----------
 
-    fake = FakeRest(["BTCUSDT"])
-    universe = UniverseService(fake, cfg)
-    await universe.sync()
-    poller = FuturesContextPoller(fake, db, universe, cfg)
+FORCE_ORDER_PAYLOAD = json.dumps(
+    {
+        "e": "forceOrder",
+        "E": 1700000000000,
+        "o": {
+            "s": "BTCUSDT",
+            "S": "SELL",
+            "o": "LIMIT",
+            "f": "IOC",
+            "q": "0.5",
+            "p": "90000.0",
+            "ap": "90000.0",
+            "X": "FILLED",
+            "l": "0.5",
+            "z": "0.5",
+            "T": 1700000000000,
+        },
+    }
+)
 
-    await poller.poll_liquidations()
-    paths = [c[0] for c in fake.calls]
-    assert any(p == "/fapi/v1/forceOrders" for p in paths)
-    assert not any("allForceOrders" in p for p in paths)
-    assert poller.status()["liquidation"] == "ok"
+FORCE_ORDER_PAYLOAD_COMBINED = json.dumps(
+    {"stream": "!forceOrder@arr", "data": json.loads(FORCE_ORDER_PAYLOAD)}
+)
 
 
-async def test_liquidation_unauthorized_reports_not_configured(cfg, db):
-    """1.6: 401 (API key yok) → `error` değil `not_configured` — kalıcı hata görünmez."""
-    from tests.helpers import FakeRest
+def test_parse_force_order():
+    events = parse_force_order_arr(FORCE_ORDER_PAYLOAD)
+    assert len(events) == 1
+    e = events[0]
+    assert e.symbol == "BTCUSDT"
+    assert e.side == "SELL"
+    assert e.price == 90000.0
+    assert e.qty == 0.5
+    # `E` ms'dir; tek birim standardı gereği saniyeye iner
+    assert e.event_time == 1700000000
 
-    class _AuthRest(FakeRest):
-        def __init__(self, symbols):
-            super().__init__(symbols)
-            self.fail_liquidation = False
 
-        async def get(self, path, params=None, weight=1):
-            if path == "/fapi/v1/forceOrders" and self.fail_liquidation:
-                raise RasatError(ErrorCode.UNAUTHORIZED, "API key gerekiyor")
-            return await super().get(path, params, weight)
+def test_parse_force_order_combined_stream_envelope():
+    """Binance combined stream sarmalı ({stream, data}) ayrıştırılmalı."""
+    events = parse_force_order_arr(FORCE_ORDER_PAYLOAD_COMBINED)
+    assert len(events) == 1
+    assert events[0].symbol == "BTCUSDT"
+    assert events[0].event_time == 1700000000
 
-    fake = _AuthRest(["BTCUSDT"])
-    universe = UniverseService(fake, cfg)
-    await universe.sync()
-    poller = FuturesContextPoller(fake, db, universe, cfg)
 
-    fake.fail_liquidation = True
-    n = await poller.poll_liquidations()
-    assert n == 0
-    assert poller.status()["liquidation"] == "not_configured"
-    # devre dışı kaldıktan sonra tekrar poll edilse bile hata yükselmez
-    n2 = await poller.poll_liquidations()
-    assert n2 == 0
-    assert poller.status()["liquidation"] == "not_configured"
-    # likidite skoruna veri yok → unknown bileşeni
-    from rasattrading_mcp.pa.liquidity import liquidity_score
+def test_parse_force_order_garbage_and_bad_fields():
+    assert parse_force_order_arr("not json") == []
+    assert parse_force_order_arr(json.dumps({"stream": "x"})) == []
+    # eksik/bozuk alan → event atlanır (hata yükseltilmez)
+    assert parse_force_order_arr(json.dumps({"o": {"s": "BTCUSDT"}})) == []
+    assert parse_force_order_arr(json.dumps({"e": "forceOrder", "o": {"s": "BTCUSDT", "p": "x"}})) == []
 
-    score = liquidity_score([], None)
-    assert score["components"]["liquidation"]["status"] == "unknown"
+
+async def test_liquidation_ws_writes_db_and_marks_stale(cfg, db):
+    """Gerçek WS sunucusundan gelen event DB'ye yazılmalı; kopuk bağlantı `disconnected` yapmalı."""
+    import websockets
+
+    frame = json.loads(FORCE_ORDER_PAYLOAD)
+
+    async def handler(ws):
+        await ws.send(json.dumps({"stream": "!forceOrder@arr", "data": frame}))
+        await asyncio.sleep(30)
+
+    server = await websockets.serve(handler, "127.0.0.1", 0)
+    try:
+        port = server.sockets[0].getsockname()[1]
+        client = LiquidationWSClient(f"ws://127.0.0.1:{port}/ws", db, stale_after=30)
+        stop = asyncio.Event()
+        task = asyncio.create_task(client.run(stop))
+        for _ in range(100):
+            if client.status == "connected":
+                break
+            await asyncio.sleep(0.05)
+        assert client.status == "connected"
+
+        def _q(conn):
+            rows = conn.execute(
+                "SELECT symbol, type, event_time, freshness, value, extra FROM futures_context"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+        rows = await db.read(_q)
+        liq = [r for r in rows if r["type"] == "liquidation"]
+        assert len(liq) == 1
+        assert liq[0]["symbol"] == "BTCUSDT"
+        assert liq[0]["value"] == 90000.0 * 0.5
+        assert liq[0]["freshness"] == "fresh"
+        extra = json.loads(liq[0]["extra"])
+        assert extra["side"] == "SELL"
+        assert client.events_written == 1
+
+        # Bağlantıyı kes → WS kopar → durum `disconnected`
+        server.close()
+        await server.wait_closed()
+        for _ in range(100):
+            if client.status == "disconnected":
+                break
+            await asyncio.sleep(0.05)
+        assert client.status == "disconnected"
+
+        stop.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    finally:
+        server.close()
+        await server.wait_closed()
 
 
 # ---------- pipeline ----------
@@ -672,4 +729,19 @@ async def test_pipeline_status_and_ticker(cfg, db):
     t = pipeline.get_ticker("BTCUSDT")
     assert t is not None and t["freshness"] == FRESHNESS_FRESH
     assert await pipeline.ensure_symbol("NOPEUSDT") is False
+
+
+async def test_pipeline_status_derives_liquidation_from_ws(cfg, db):
+    """Liquidation durumu REST poll'dan değil, WS client'tan türetilir."""
+    from tests.helpers import FakeRest
+
+    fake = FakeRest(["BTCUSDT"])
+    pipeline = DataPipeline(cfg, db, rest=fake, futures_rest=fake)
+    pipeline.universe = UniverseService(fake, cfg)
+
+    status = pipeline.status()
+    assert status["futures"]["liquidation"] == "disconnected"
+
+    pipeline.liquidation_ws.mark_connected()
+    assert pipeline.status()["futures"]["liquidation"] == "connected"
 

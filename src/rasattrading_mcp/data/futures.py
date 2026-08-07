@@ -1,14 +1,14 @@
-"""Futures bağlam verisi (salt-okunur): funding rate, open interest, liquidation.
+"""Futures bağlam verisi (salt-okunur): funding rate, open interest.
 
 REST periyodik çekim. Her kayıt Binance'in `event_time`'ı ve daemon'un `fetched_at`'iyle
 ayrı ayrı saklanır — ikisi arasındaki fark gecikmeyi gösterir. `freshness` alanı
 fresh|stale|unknown olabilir; `unknown` sembol girdisi likidite skoruna katılmaz.
 
-Liquidation (`/fapi/v1/forceOrders`, signed USER_DATA) API key ister; anahtar yoksa
-Binance 401 döner → `_liquidation_available=False` ile sessizce devre dışı kalır ve
-durum `not_configured` olur (hata değil — veri eksikliği `unknown` olarak görünür,
-sistemi durdurmaz). 1.6: eski path `/fapi/v1/allForceOrders` canlı API'de 404
-dönüyordu (path mevcut değil) → kalıcı `error`; doğru path `/fapi/v1/forceOrders`.
+Liquidation REST ile çekilmez: `/fapi/v1/forceOrders` imzalı USER_DATA endpoint'idir
+(piyasa geneli değil, yalnızca o hesabın likidasyonları) ve imzasız çağrı hep 401
+dönerdi. Piyasa geneli likidasyonlar public `!forceOrder@arr` WebSocket stream'i ile
+alınır — bkz. `data/liquidation_ws.py`. Poller'ın `_last_status["liquidation"]`'ı
+artık pipeline tarafından WS client durumundan (`connected`/`disconnected`) türetilir.
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any
 
 from ..config import Config
 from ..errors import ErrorCode, RasatError
@@ -34,8 +33,6 @@ class FuturesContextPoller:
         self._db = db
         self._universe = universe
         self._config = config
-        self._last_liquidation_ts: int = 0
-        self._liquidation_available: bool = True
         self._last_status: dict[str, str] = {}
         self._futures_symbols: set[str] | None = None
         self._futures_sync_at: float = 0.0
@@ -125,53 +122,6 @@ class FuturesContextPoller:
             self._last_status["open_interest"] = "ok"
         return total
 
-    async def poll_liquidations(self) -> int:
-        if not self._liquidation_available:
-            return 0
-        params: dict[str, Any] = {"limit": 1000}
-        if self._last_liquidation_ts:
-            params["startTime"] = self._last_liquidation_ts
-        try:
-            # TODO(T3): poll_liquidations imzasız REST client kullanıyor, bu yüzden
-            # /fapi/v1/forceOrders her zaman 401 dönüyor (signed USER_DATA endpoint);
-            # gerçek düzeltme daemon/main.py'da signed broker wiring gerektirir —
-            # burada yalnızca belgelenir, davranış değişmez.
-            data = await self._rest.get("/fapi/v1/forceOrders", params=params, weight=10)
-        except RasatError as exc:
-            if exc.code == ErrorCode.UNAUTHORIZED:
-                self._liquidation_available = False
-                self._last_status["liquidation"] = "not_configured"
-                logger.info("liquidation verisi API key gerektiriyor — devre dışı (not_configured)")
-                return 0
-            raise
-
-        rows: list[tuple] = []
-        for o in data:
-            try:
-                # `_last_liquidation_ts` API `startTime` paramı için ms tutulur;
-                # DB'ye saniye yazılır (tek birim standardı).
-                raw_ms = int(o.get("time", 0))
-                event_time = to_epoch_seconds(raw_ms)
-                price = float(o.get("price", 0))
-                qty = float(o.get("origQty", 0))
-                rows.append(
-                    (
-                        o.get("symbol", "?"),
-                        "liquidation",
-                        price * qty,
-                        event_time,
-                        {"side": o.get("side"), "price": price, "qty": qty},
-                    )
-                )
-                if raw_ms > self._last_liquidation_ts:
-                    self._last_liquidation_ts = raw_ms
-            except (TypeError, ValueError):
-                continue
-        if rows:
-            await self._store(rows)
-        self._last_status["liquidation"] = "ok"
-        return len(rows)
-
     async def _store(self, rows: list[tuple]) -> None:
         if not rows:
             return
@@ -216,7 +166,12 @@ class FuturesContextPoller:
         return aged
 
     async def run_loop(self, stop: asyncio.Event) -> None:
-        """Funding + OI `futures_poll_seconds`'ta, liquidation `liquidation_poll_seconds`'ta."""
+        """Funding + OI poll'ü her `liquidation_poll_seconds`'ta çalıştırır.
+
+        Liquidation bu döngüden ayrıdır — `data/liquidation_ws.py` WebSocket akışı
+        tarafından beslenir (`_last_status["liquidation"]`'ı pipeline, WS client
+        durumundan set eder).
+        """
         while not stop.is_set():
             try:
                 try:
@@ -233,11 +188,6 @@ class FuturesContextPoller:
                 except RasatError as exc:
                     logger.warning("OI poll başarısız: %s", exc.message)
                     self._last_status["open_interest"] = "error"
-                try:
-                    await self.poll_liquidations()
-                except RasatError as exc:
-                    logger.warning("liquidation poll başarısız: %s", exc.message)
-                    self._last_status["liquidation"] = "error"
             except asyncio.CancelledError:
                 return
             except Exception:  # noqa: BLE001
@@ -246,6 +196,14 @@ class FuturesContextPoller:
                 await asyncio.wait_for(stop.wait(), timeout=self._config.liquidation_poll_seconds)
             except asyncio.TimeoutError:
                 pass
+
+    def set_liquidation_status(self, status: str) -> None:
+        """Pipeline, WS client durumunu (`connected`/`disconnected`) buraya yazar.
+
+        REST liquidation poll kaldırıldığı için durum artık `data/liquidation_ws.py`
+        tarafından beslenen public WebSocket stream'inden türetilir.
+        """
+        self._last_status["liquidation"] = status
 
     def status(self) -> dict:
         return dict(self._last_status)

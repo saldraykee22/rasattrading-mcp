@@ -48,6 +48,7 @@ class Config:
     rest_spot_base: str = "https://api.binance.com"
     rest_futures_base: str = "https://fapi.binance.com"
     ws_spot_base: str = "wss://stream.binance.com:9443"
+    ws_futures_base: str = "wss://fstream.binance.com"
     kline_intervals: tuple[str, ...] = ("15m", "1h", "4h", "1d")
     universe_refresh_seconds: float = 1800.0
     futures_poll_seconds: float = 300.0
@@ -88,6 +89,11 @@ class Config:
     @property
     def ws_all_miniticker_url(self) -> str:
         return f"{self.ws_spot_base}/stream?streams=!miniTicker@arr"
+
+    @property
+    def ws_force_order_url(self) -> str:
+        """Tüm sembollerdeki piyasa geneli likidasyon emirleri (public, imza gerekmez)."""
+        return f"{self.ws_futures_base}/ws/!forceOrder@arr"
 
     @classmethod
     def from_env(cls, overrides: dict | None = None) -> "Config":

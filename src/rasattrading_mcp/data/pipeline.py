@@ -1,4 +1,4 @@
-"""Veri toplama pipeline'ı: universe + miniTicker WS + kline scheduler + futures poll + retention."""
+"""Veri toplama pipeline'ı: universe + miniTicker WS + kline scheduler + futures poll + liquidation WS + retention."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from .binance_client import BinanceREST
 from .clock import BinanceClock
 from .futures import FuturesContextPoller
 from .klines import KlineService
+from .liquidation_ws import LiquidationWSClient
 from .miniticker import MiniTickerClient, TickerCache
 from .rate_limit import RateLimitBudget
 from .universe import UniverseService
@@ -44,6 +45,7 @@ class DataPipeline:
         self.clock = BinanceClock(self.rest)
         self.ticker_cache = TickerCache()
         self.miniticker = MiniTickerClient(config.ws_all_miniticker_url, self.ticker_cache)
+        self.liquidation_ws = LiquidationWSClient(config.ws_force_order_url, db)
         self.klines = KlineService(self.rest, self.futures_rest, db, self.universe, config, self.clock)
         self.futures = FuturesContextPoller(self.futures_rest, db, self.universe, config)
         self._stop = asyncio.Event()
@@ -64,6 +66,7 @@ class DataPipeline:
         self.clock.start()
 
         self._tasks.append(asyncio.create_task(self.miniticker.run(self._stop)))
+        self._tasks.append(asyncio.create_task(self.liquidation_ws.run(self._stop)))
         await self.klines.start()
         self._tasks.append(asyncio.create_task(self.universe.run_loop(self._stop)))
         self._tasks.append(asyncio.create_task(self.futures.run_loop(self._stop)))
@@ -113,6 +116,9 @@ class DataPipeline:
         return self.klines.freshness_for(symbol, timeframe, rows)
 
     def status(self) -> dict:
+        # Liquidation REST poll kaldırıldı — durum WS client'tan (connected/disconnected)
+        # türetilir ve poller'ın `_last_status["liquidation"]`'ına okuma anında yazılır.
+        self.futures.set_liquidation_status(self.liquidation_ws.status)
         return {
             "universe": self.universe.status_dict(),
             "ws": self.ticker_cache.health(),
