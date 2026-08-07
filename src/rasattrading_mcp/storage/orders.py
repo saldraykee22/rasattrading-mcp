@@ -1896,6 +1896,42 @@ class OrderService:
             )
         return await self._account_balance_breakdown(account_id, "USDT")
 
+    async def get_open_orders(self, *, account_id: str) -> dict[str, Any]:
+        """Borsadaki (Binance) gerçek açık emirleri döner — MCP'nin kendi onay
+        kuyruğu (`get_pending_orders`) veya audit log'dan farklı: burada
+        görünen, borsada fiilen bekleyen emirdir (locked bakiyenin kaynağı)."""
+        account_id = self._require_string(account_id, "account_id")
+        account = await self.accounts.get_account(account_id)
+        if not account["credentials_configured"]:
+            raise RasatError(
+                ErrorCode.ACCOUNT_NO_CREDENTIALS,
+                "açık emir sorgusu için credential'lı (authenticated) hesap gerekli",
+            )
+        raw_orders = await self.broker.get_all_open_orders(account_id=account_id) or []
+        orders = []
+        for o in raw_orders:
+            raw = o.get("raw") or {}
+            orders.append(
+                {
+                    "symbol": o.get("symbol"),
+                    "order_id": o.get("order_id"),
+                    "client_order_id": o.get("client_order_id"),
+                    "order_list_id": str(raw.get("orderListId"))
+                    if raw.get("orderListId") not in (None, -1)
+                    else None,
+                    "side": o.get("side"),
+                    "type": raw.get("type"),
+                    "status": raw.get("status"),
+                    "price": float(raw["price"]) if raw.get("price") not in (None, "") else None,
+                    "stop_price": float(raw["stopPrice"])
+                    if raw.get("stopPrice") not in (None, "", "0.00000000")
+                    else None,
+                    "quantity": o.get("quantity"),
+                    "time": raw.get("time"),
+                }
+            )
+        return {"orders": orders, "count": len(orders)}
+
     async def get_audit_log(self, *, limit: int = 50) -> dict[str, Any]:
         """Hash-chain doğrulamalı audit log sorgusu (3.5)."""
         if self.audit is None:

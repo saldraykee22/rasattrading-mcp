@@ -773,3 +773,103 @@ async def test_get_account_balance_dispatches_via_tool(ex_ctx):
     assert data["holdings_value"] == pytest.approx(50.0)
     assert data["total"] == pytest.approx(175.0)
     assert meta.source == "binance"
+
+
+# ---------- get_open_orders: borsadaki gerçek açık emirler ----------
+
+
+async def test_get_open_orders_legacy_broker_shape_and_dispatch(ex_ctx):
+    # FakeOrderBroker'ın legacy shape'inde `raw` yok; bu servis çağrısı
+    # fallback alanları None ile güvenle dönmeli ve handler üzerinden de çalışmalı.
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx, balance_usdt=100.0)
+    service = ctx["service"]
+
+    result = await service.get_open_orders(account_id=account_id)
+
+    assert result["count"] == 1
+    assert result["orders"] == [
+        {
+            "symbol": "BTCUSDT",
+            "order_id": "O1",
+            "client_order_id": "open-1",
+            "order_list_id": None,
+            "side": "BUY",
+            "type": None,
+            "status": None,
+            "price": None,
+            "stop_price": None,
+            "quantity": 0.5,
+            "time": None,
+        }
+    ]
+
+    from rasattrading_mcp.daemon.handlers import build_dispatcher
+    from rasattrading_mcp.daemon.readiness import Readiness
+
+    dispatcher_ctx = {
+        "order_service": service,
+        "readiness": Readiness(),
+        "started_at": 0,
+        "pipeline": None,
+    }
+    dispatcher = build_dispatcher(dispatcher_ctx)
+    assert "get_open_orders" in set(dispatcher.names())
+    data, meta = await dispatcher.dispatch(
+        "get_open_orders", {"account_id": account_id}, dispatcher_ctx
+    )
+    assert data == result
+    assert meta.source == "binance"
+
+
+async def test_get_open_orders_parses_binance_raw_fields(ex_ctx):
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx, balance_usdt=100.0)
+    ctx["broker"].open_orders = [
+        {
+            "symbol": "ZECUSDT",
+            "order_id": "O2",
+            "client_order_id": "oco-stop",
+            "side": "SELL",
+            "quantity": 2.5,
+            "raw": {
+                "type": "STOP_LOSS_LIMIT",
+                "price": "94.50",
+                "stopPrice": "95.00",
+                "status": "NEW",
+                "time": 1712345678901,
+                "orderListId": 321,
+            },
+        }
+    ]
+
+    result = await ctx["service"].get_open_orders(account_id=account_id)
+
+    assert result == {
+        "count": 1,
+        "orders": [
+            {
+                "symbol": "ZECUSDT",
+                "order_id": "O2",
+                "client_order_id": "oco-stop",
+                "order_list_id": "321",
+                "side": "SELL",
+                "type": "STOP_LOSS_LIMIT",
+                "status": "NEW",
+                "price": 94.5,
+                "stop_price": 95.0,
+                "quantity": 2.5,
+                "time": 1712345678901,
+            }
+        ],
+    }
+
+
+async def test_get_open_orders_no_credentials_rejected(ex_ctx):
+    ctx = ex_ctx
+    account_id = await _add_paper_account(ctx, label="pub")
+
+    with pytest.raises(RasatError) as exc_info:
+        await ctx["service"].get_open_orders(account_id=account_id)
+
+    assert exc_info.value.code == ErrorCode.ACCOUNT_NO_CREDENTIALS

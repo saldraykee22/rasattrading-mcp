@@ -510,6 +510,28 @@ register_tool(
 
 register_tool(
     ToolSpec(
+        name="get_open_orders",
+        description=(
+            "Borsadaki (Binance) GERÇEK açık emirleri döner — `get_pending_orders`'ın "
+            "aksine bu MCP'nin dahili onay kuyruğu değil, borsada fiilen bekleyen "
+            "emirlerdir (OCO/stop-loss/limit dahil; hesap bakiyesindeki `locked` "
+            "miktarın kaynağı budur). Salt-okunur, hiçbir emri değiştirmez/iptal etmez."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "account_id": {"type": "string", "minLength": 1},
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["account_id"],
+            "additionalProperties": False,
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
         name="get_audit_log",
         description=(
             "Hash-chain doğrulamalı audit log sorgusu. verified=true ise zincir sağlam; "
