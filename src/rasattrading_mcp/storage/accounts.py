@@ -13,11 +13,17 @@ from ..errors import ErrorCode, RasatError
 from .audit import AuditLog
 from .credentials import SecretDecryptError, SecretStore, SecretStoreError
 from .db import Database
+from .state import ORDER_RECONCILE_REQUIRED, PENDING_ACTIVE_STATUSES
 
 logger = logging.getLogger("rasattrading.storage.accounts")
 
 _MAX_LABEL_LENGTH = 200
 _ALLOWED_MARKET = "spot"
+
+#: Açık/aktif sayılan emir durumları — varlığında hesap silinemez (T04).
+#: RECONCILE_REQUIRED, T00 state sözleşmesindeki canonical durumdur (UNKNOWN gibi
+#: belirsiz/çözülmemiş emir) ve fail-closed olarak silme engelidir.
+_ACTIVE_ORDER_STATUSES = ("NEW", "PARTIALLY_FILLED", "UNKNOWN", ORDER_RECONCILE_REQUIRED)
 _ACCOUNT_FIELDS = (
     "account_id",
     "label",
@@ -94,6 +100,52 @@ def _validate_credentials(api_key: Any, api_secret: Any) -> tuple[str | None, st
     if not api_key or not api_secret:
         raise RasatError(ErrorCode.INVALID_REQUEST, "api_key ve api_secret boş olamaz")
     return api_key, api_secret
+
+
+def _removal_reasons(conn: sqlite3.Connection, account_id: str, row: sqlite3.Row) -> list[str]:
+    """Hesabın silinmesini engelleyen bağımlılıkları döner (boş = silme serbest).
+
+    - Real trading kilidi açıksa hesap ASLA silinemez (fail-closed).
+    - Açık emir, aktif pending veya risk policy/override kaydı varsa silme
+      reddedilir — aksi halde bu satırlar orphan kalır (foreign key/cascade yok).
+    - Tarihsel (terminal) order/pending kayıtları engel DEĞİLDİR; onlar cascade
+      ile silinmez, hesap silinse bile yerinde kalır.
+    """
+    reasons: list[str] = []
+    if str(row["trading_lock"]) == "real":
+        reasons.append("trading_lock=real")
+
+    order_marks = ", ".join("?" * len(_ACTIVE_ORDER_STATUSES))
+    open_orders = conn.execute(
+        f"SELECT COUNT(*) AS c FROM orders WHERE account_id = ? AND status IN ({order_marks})",
+        (account_id, *_ACTIVE_ORDER_STATUSES),
+    ).fetchone()
+    if open_orders and int(open_orders["c"]) > 0:
+        reasons.append(f"open_orders={int(open_orders['c'])}")
+
+    pending_marks = ", ".join("?" * len(PENDING_ACTIVE_STATUSES))
+    active_pending = conn.execute(
+        f"SELECT COUNT(*) AS c FROM pending_orders WHERE account_id = ? AND status IN ({pending_marks})",
+        (account_id, *PENDING_ACTIVE_STATUSES),
+    ).fetchone()
+    if active_pending and int(active_pending["c"]) > 0:
+        reasons.append(f"active_pending_orders={int(active_pending['c'])}")
+
+    policy_row = conn.execute(
+        "SELECT COUNT(*) AS c FROM risk_policy WHERE account_id = ?",
+        (account_id,),
+    ).fetchone()
+    if policy_row and int(policy_row["c"]) > 0:
+        reasons.append(f"risk_policy={int(policy_row['c'])}")
+
+    override_row = conn.execute(
+        "SELECT COUNT(*) AS c FROM risk_override WHERE account_id = ?",
+        (account_id,),
+    ).fetchone()
+    if override_row and int(override_row["c"]) > 0:
+        reasons.append(f"risk_overrides={int(override_row['c'])}")
+
+    return reasons
 
 
 class AccountService:
@@ -212,11 +264,26 @@ class AccountService:
         }
 
     async def remove_account(self, account_id: Any, *, actor: str = "mcp-agent") -> dict[str, Any]:
+        """Hesabı yalnızca kullanımda değilken siler (fail-closed, T04).
+
+        - ``trading_lock=real`` hesap ASLA silinemez.
+        - Açık/UNKNOWN emir, aktif pending veya risk policy/override kaydı varken
+          silme canonical ``ACCOUNT_IN_USE`` ile reddedilir; DB (hesap/emir/
+          pending/risk satırları) ve credentials değiştirilmez.
+        - Kontrol + delete aynı tek-yazıcı DB transaction'ında çalışır; araya
+          yazma giremez, check-then-delete yarışı oluşmaz.
+        - Tarihsel order/audit kayıtları cascade ile silinmez.
+        - Credentials yalnızca başarılı ve izin verilen silme sonrası temizlenir.
+        - Red durumunda audit'e secret içermeyen ``remove_account_refused`` kaydı
+          düşer (transaction ile birlikte commit edilir).
+        """
         if not isinstance(account_id, str) or not account_id.strip():
             raise RasatError(ErrorCode.INVALID_REQUEST, "account_id zorunlu (string)")
         account_id = account_id.strip()
 
-        def _remove(conn: sqlite3.Connection) -> tuple[dict[str, Any], bytes | None, bytes | None] | None:
+        def _remove(
+            conn: sqlite3.Connection,
+        ) -> dict[str, Any] | tuple[dict[str, Any], bytes | None, bytes | None] | None:
             row = conn.execute(
                 "SELECT " + ", ".join(_ACCOUNT_FIELDS) + " FROM accounts WHERE account_id = ?",
                 (account_id,),
@@ -224,6 +291,18 @@ class AccountService:
             if row is None:
                 return None
             public = _public_account(row)
+
+            reasons = _removal_reasons(conn, account_id, row)
+            if reasons:
+                if self.audit is not None:
+                    self.audit.append_in_connection(
+                        conn,
+                        actor=actor or "mcp-agent",
+                        action="remove_account_refused",
+                        details={"account_id": account_id, "label": public["label"], "reasons": reasons},
+                    )
+                return {"refused": True, "reasons": reasons}
+
             conn.execute("DELETE FROM accounts WHERE account_id = ?", (account_id,))
             if self.audit is not None:
                 self.audit.append_in_connection(
@@ -245,6 +324,12 @@ class AccountService:
         removed = await self.db.write(_remove)
         if removed is None:
             raise RasatError(ErrorCode.ACCOUNT_NOT_FOUND, f"account bulunamadı: {account_id}")
+        if isinstance(removed, dict) and removed.get("refused"):
+            raise RasatError(
+                ErrorCode.ACCOUNT_IN_USE,
+                f"account silinemedi; hesap kullanımda: {', '.join(removed['reasons'])}",
+                details={"account_id": account_id, "reasons": removed["reasons"]},
+            )
         result, encrypted_api_key, encrypted_secret = removed
 
         # DPAPI blobs need no cleanup.  A keyring fallback does, and cleanup is

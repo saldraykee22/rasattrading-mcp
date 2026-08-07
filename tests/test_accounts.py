@@ -1,4 +1,7 @@
+import asyncio
 import json
+import time
+import uuid
 
 import pytest
 
@@ -11,6 +14,7 @@ from rasattrading_mcp.storage.audit import AuditLog
 from rasattrading_mcp.storage.credentials import SecretStore
 from rasattrading_mcp.storage.db import Database
 from rasattrading_mcp.storage.migrations import run_migrations
+from rasattrading_mcp.storage.risk_policy import RiskPolicyService
 
 
 @pytest.fixture
@@ -124,3 +128,191 @@ async def test_account_tools_are_registered_and_dispatch(account_service):
     assert listed["count"] == 1
     removed, _ = await dispatcher.dispatch("remove_account", {"account_id": created["account_id"]}, ctx)
     assert removed["removed"] is True
+
+
+# ---------- T04: account removal guard (fail-closed) ----------
+
+
+async def _insert_order(db, account_id, *, status="NEW", order_id=None):
+    def _ins(conn):
+        oid = order_id or uuid.uuid4().hex
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO orders "
+            "(order_id, account_id, idempotency_key, symbol, side, order_type, quantity, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'BTCUSDT', 'BUY', 'LIMIT', 1.0, ?, ?, ?)",
+            (oid, account_id, f"idem-{oid}", status, now, now),
+        )
+
+    await db.write(_ins)
+
+
+async def _insert_pending(db, account_id, *, status="awaiting_approval", order_id=None):
+    def _ins(conn):
+        oid = order_id or uuid.uuid4().hex
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO pending_orders "
+            "(order_id, alert_id, account_id, symbol, side, order_type, status, created_at) "
+            "VALUES (?, ?, ?, 'BTCUSDT', 'BUY', 'market', ?, ?)",
+            (oid, f"alert-{oid}", account_id, status, now),
+        )
+
+    await db.write(_ins)
+
+
+async def _order_count(db, account_id):
+    def _count(conn):
+        return int(conn.execute("SELECT COUNT(*) c FROM orders WHERE account_id = ?", (account_id,)).fetchone()["c"])
+
+    return await db.read(_count)
+
+
+async def test_remove_real_account_refused_fail_closed(account_service, account_db):
+    created = await account_service.add_account(label="real", api_key="AK_REAL", api_secret="AS_REAL")
+    await account_service.enable_real_trading(created["account_id"], actor="test")
+
+    with pytest.raises(RasatError) as exc_info:
+        await account_service.remove_account(created["account_id"], actor="test-agent")
+    err = exc_info.value
+    assert err.code == ErrorCode.ACCOUNT_IN_USE
+    assert "trading_lock=real" in err.details["reasons"]
+    assert err.details["account_id"] == created["account_id"]
+
+    # DB ve credentials değişmedi.
+    assert (await account_service.list_accounts())["count"] == 1
+    assert await account_service.get_credentials(created["account_id"]) == ("AK_REAL", "AS_REAL")
+
+    # Red audit kaydı düştü, zincir sağlam ve secret içermiyor.
+    assert await AuditLog(account_db).verify() == []
+    entries = await AuditLog(account_db).tail(10)
+    refused = [e for e in entries if e["action"] == "remove_account_refused"]
+    assert refused
+    serialized = json.dumps(refused, ensure_ascii=False)
+    assert "AK_REAL" not in serialized
+    assert "AS_REAL" not in serialized
+
+
+@pytest.mark.parametrize("status", ["NEW", "PARTIALLY_FILLED", "UNKNOWN", "RECONCILE_REQUIRED"])
+async def test_remove_paper_account_with_open_order_refused(account_service, account_db, status):
+    created = await account_service.add_account(label="paper")
+    await _insert_order(account_db, created["account_id"], status=status)
+
+    with pytest.raises(RasatError) as exc_info:
+        await account_service.remove_account(created["account_id"])
+    assert exc_info.value.code == ErrorCode.ACCOUNT_IN_USE
+    assert any(r.startswith("open_orders=") for r in exc_info.value.details["reasons"])
+
+    # Hesap ve emir yerinde kaldı; hiçbir şey cascade ile silinmedi.
+    assert (await account_service.list_accounts())["count"] == 1
+    assert await _order_count(account_db, created["account_id"]) == 1
+
+
+@pytest.mark.parametrize("status", ["awaiting_approval", "approved", "executing", "reconcile_required"])
+async def test_remove_paper_account_with_active_pending_refused(account_service, account_db, status):
+    created = await account_service.add_account(label="paper")
+    await _insert_pending(account_db, created["account_id"], status=status)
+
+    with pytest.raises(RasatError) as exc_info:
+        await account_service.remove_account(created["account_id"])
+    assert exc_info.value.code == ErrorCode.ACCOUNT_IN_USE
+    assert any(r.startswith("active_pending_orders=") for r in exc_info.value.details["reasons"])
+    assert (await account_service.list_accounts())["count"] == 1
+
+
+async def test_remove_paper_account_with_risk_policy_refused(account_service, account_db):
+    created = await account_service.add_account(label="paper")
+    risk = RiskPolicyService(account_db, audit=AuditLog(account_db))
+    await risk.set_risk_policy(created["account_id"], max_notional_per_order=1000, actor="test")
+
+    with pytest.raises(RasatError) as exc_info:
+        await account_service.remove_account(created["account_id"])
+    assert exc_info.value.code == ErrorCode.ACCOUNT_IN_USE
+    assert any(r.startswith("risk_policy=") for r in exc_info.value.details["reasons"])
+    assert (await account_service.list_accounts())["count"] == 1
+
+
+async def test_remove_paper_account_with_risk_override_refused(account_service, account_db):
+    created = await account_service.add_account(label="paper")
+    risk = RiskPolicyService(account_db, audit=AuditLog(account_db))
+    await risk.create_override(created["account_id"], reason="deneme", idempotency_key="ov-1", actor="test")
+
+    with pytest.raises(RasatError) as exc_info:
+        await account_service.remove_account(created["account_id"])
+    assert exc_info.value.code == ErrorCode.ACCOUNT_IN_USE
+    assert any(r.startswith("risk_overrides=") for r in exc_info.value.details["reasons"])
+    assert (await account_service.list_accounts())["count"] == 1
+
+
+@pytest.mark.parametrize("status", ["executed", "rejected", "expired"])
+async def test_remove_paper_account_with_terminal_pending_allowed(account_service, account_db, status):
+    created = await account_service.add_account(label="paper")
+    await _insert_pending(account_db, created["account_id"], status=status)
+
+    removed = await account_service.remove_account(created["account_id"])
+    assert removed["removed"] is True
+    assert (await account_service.list_accounts())["count"] == 0
+
+
+async def test_remove_paper_account_keeps_historical_orders(account_service, account_db):
+    created = await account_service.add_account(label="paper")
+    await _insert_order(account_db, created["account_id"], status="FILLED", order_id="hist-1")
+
+    removed = await account_service.remove_account(created["account_id"])
+    assert removed["removed"] is True
+    assert (await account_service.list_accounts())["count"] == 0
+    # Tarihsel kayıtlar cascade ile silinmez.
+    assert await _order_count(account_db, created["account_id"]) == 1
+
+
+async def test_remove_credentialed_paper_account_cleans_credentials(account_service, account_db):
+    created = await account_service.add_account(label="temporary", api_key="AK_TMP", api_secret="AS_TMP")
+    removed = await account_service.remove_account(created["account_id"])
+    assert removed["removed"] is True
+    assert removed["read_only"] is False
+
+    with pytest.raises(RasatError) as exc_info:
+        await account_service.get_credentials(created["account_id"])
+    assert exc_info.value.code == ErrorCode.ACCOUNT_NOT_FOUND
+
+
+async def test_remove_races_with_dependency_insert_stays_consistent(account_service, account_db):
+    created = await account_service.add_account(label="race")
+    account_id = created["account_id"]
+
+    def _insert_open_order_if_account_exists(conn):
+        if conn.execute("SELECT 1 FROM accounts WHERE account_id = ?", (account_id,)).fetchone() is None:
+            raise RasatError(ErrorCode.ACCOUNT_NOT_FOUND, "account silindi")
+        oid = uuid.uuid4().hex
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO orders "
+            "(order_id, account_id, idempotency_key, symbol, side, order_type, quantity, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'BTCUSDT', 'BUY', 'LIMIT', 1.0, 'NEW', ?, ?)",
+            (oid, account_id, f"idem-{oid}", now, now),
+        )
+        return oid
+
+    remove_task = asyncio.create_task(account_service.remove_account(account_id, actor="race-agent"))
+    insert_task = asyncio.create_task(account_db.write(_insert_open_order_if_account_exists))
+    results = await asyncio.gather(remove_task, insert_task, return_exceptions=True)
+
+    def _snapshot(conn):
+        acc = conn.execute("SELECT 1 FROM accounts WHERE account_id = ?", (account_id,)).fetchone()
+        count = int(
+            conn.execute("SELECT COUNT(*) c FROM orders WHERE account_id = ?", (account_id,)).fetchone()["c"]
+        )
+        return acc is not None, count
+
+    acc_present, open_order_count = await account_db.read(_snapshot)
+
+    # Tek writer altında ya insert kazandı (remove ACCOUNT_IN_USE, hesap duruyor)
+    # ya da remove kazandı (hesap gitti, orphan emir kalmadı). İkisi birden asla.
+    assert not (acc_present is False and open_order_count > 0)
+    if acc_present:
+        assert isinstance(results[0], RasatError)
+        assert results[0].code == ErrorCode.ACCOUNT_IN_USE
+        assert open_order_count == 1
+    else:
+        assert open_order_count == 0
+        assert isinstance(results[1], RasatError)
