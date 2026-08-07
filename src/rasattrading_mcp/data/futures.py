@@ -37,6 +37,28 @@ class FuturesContextPoller:
         self._last_liquidation_ts: int = 0
         self._liquidation_available: bool = True
         self._last_status: dict[str, str] = {}
+        self._futures_symbols: set[str] | None = None
+        self._futures_sync_at: float = 0.0
+
+    async def _futures_symbol_set(self) -> set[str]:
+        """fapi exchangeInfo'dan TRADING USDT çifti kümesi (TTL'li).
+
+        Spot evrenindeki her sembol futures'ta yoktur (tokenized hisse senetleri,
+        spot-only çiftler). OI poll'ü yalnızca bu kümedeki sembollere istek atar —
+        aksi halde her turda ~100+ gereksiz 400 hatası + log spam üretir.
+        """
+        now = time.time()
+        if self._futures_symbols is None or now - self._futures_sync_at >= self._config.futures_universe_ttl_seconds:
+            data = await self._rest.get("/fapi/v1/exchangeInfo", weight=1)
+            symbols = {
+                s["symbol"]
+                for s in data.get("symbols", [])
+                if s.get("status") == "TRADING" and s.get("quoteAsset") == "USDT"
+            }
+            self._futures_symbols = symbols
+            self._futures_sync_at = now
+            logger.info("futures sembol evreni senkronize: %d çift", len(symbols))
+        return self._futures_symbols
 
     async def poll_funding(self) -> int:
         data = await self._rest.get("/fapi/v1/premiumIndex", weight=1)
@@ -63,7 +85,10 @@ class FuturesContextPoller:
 
     async def poll_open_interest(self) -> int:
         total = 0
+        futures_symbols = await self._futures_symbol_set()
         for symbol in self._universe.snapshot():
+            if symbol not in futures_symbols:
+                continue
             try:
                 data = await self._rest.get(
                     "/fapi/v1/openInterest", params={"symbol": symbol}, weight=1
@@ -83,6 +108,12 @@ class FuturesContextPoller:
                 if exc.code == ErrorCode.RATE_LIMITED:
                     self._last_status["open_interest"] = "rate_limited"
                     break  # bütçe dolu — bu turu bırak, sonraki turda dene
+                if exc.code == ErrorCode.INVALID_REQUEST:
+                    # fapi'de olmayan sembol (400): kümeden düşür, her turda tekrarlama
+                    if self._futures_symbols is not None and symbol in self._futures_symbols:
+                        self._futures_symbols.discard(symbol)
+                        logger.info("fapi'de olmayan sembol OI kümesinden düşürüldü: %s", symbol)
+                    continue
                 logger.warning("openInterest başarısız %s: %s", symbol, exc.message)
         self._last_status["open_interest"] = "ok"
         return total

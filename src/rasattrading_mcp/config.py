@@ -52,6 +52,7 @@ class Config:
     universe_refresh_seconds: float = 1800.0
     futures_poll_seconds: float = 300.0
     liquidation_poll_seconds: float = 60.0
+    futures_universe_ttl_seconds: float = 3600.0
     kline_backfill_bars: int = 300
     kline_catchup_bars: int = 5
     kline_workers: int = 8

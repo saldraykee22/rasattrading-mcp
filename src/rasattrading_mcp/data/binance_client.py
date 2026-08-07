@@ -1,6 +1,8 @@
 """Binance REST istemcisi: weight bütçesi + 429/418 exponential backoff.
 
-401/403 → RasatError(UNAUTHORIZED), 429/418 → backoff ile retry, diğer hatalar → RasatError.
+401/403 → RasatError(UNAUTHORIZED), 400/404 → RasatError(INVALID_REQUEST)
+(bilinmeyen sembol gibi — futures'ta olmayan spot çifti), 429/418 → backoff ile
+retry, diğer hatalar → RasatError(INTERNAL_ERROR).
 Test edilebilirlik için `session` enjekte edilebilir (FakeSession ile).
 """
 
@@ -75,6 +77,11 @@ class BinanceREST:
                         raise RasatError(
                             ErrorCode.UNAUTHORIZED,
                             f"Binance {resp.status} — API key gerekiyor olabilir ({path})",
+                        )
+                    if resp.status in (400, 404):
+                        raise RasatError(
+                            ErrorCode.INVALID_REQUEST,
+                            f"Binance {resp.status} — geçersiz istek ({path})",
                         )
                     resp.raise_for_status()
                     ctype = resp.headers.get("Content-Type", "")

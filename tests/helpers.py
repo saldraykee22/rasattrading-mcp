@@ -49,6 +49,17 @@ class FakeRest:
             symbols = [self._symbol_entry(s) for s in self.symbols]
             symbols.extend(self.extra_exchange_entries)
             return {"timezone": "UTC", "symbols": symbols}
+        if path == "/fapi/v1/exchangeInfo":
+            # Varsayılan: spot evreninin tamamı futures'ta da var (test kolaylığı).
+            # Yalnızca belirli sembollerin futures'ta olduğunu simüle etmek için
+            # `fapi_symbols` set edilebilir.
+            fapi_symbols = getattr(self, "fapi_symbols", self.symbols)
+            return {
+                "symbols": [
+                    {"symbol": s, "status": "TRADING", "quoteAsset": "USDT"}
+                    for s in fapi_symbols
+                ]
+            }
         if path == "/api/v3/klines":
             symbol = params.get("symbol")
             if symbol in self.fail_kline_for:
