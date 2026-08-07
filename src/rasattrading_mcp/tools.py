@@ -364,19 +364,21 @@ register_tool(
     ToolSpec(
         name="place_order",
         description=(
-            "Tek hesapta doğrudan emir gönderir (order_type: MARKET|LIMIT, miktar base asset). "
-            "Aynı idempotency_key ile retry çift emir üretmez; ağ zaman aşımında Binance'ten "
-            "gerçek durum reconcile edilir. Temel doğruluk kontrolleri her zaman aktiftir."
+            "Tek hesapta doğrudan emir gönderir (order_type: MARKET|LIMIT|STOP_LOSS_LIMIT, miktar base asset). "
+            "STOP_LOSS_LIMIT spot stop korumasıdır: stop_price'a ulaşınca price seviyesinde LIMIT satış tetiklenir "
+            "(pozisyonu borsada korur, daemon kapalı olsa bile). Aynı idempotency_key ile retry çift emir üretmez; "
+            "ağ zaman aşımında Binance'ten gerçek durum reconcile edilir. Temel doğruluk kontrolleri her zaman aktiftir."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "account_id": {"type": "string", "minLength": 1},
-                "symbol": {"type": "string", "description": "Spot USDT çifti, örn. BTCUSDT"},
+                "symbol": {"type": "string", "description": "Spot USDT çifti, örn. ALICEUSDT"},
                 "side": {"type": "string", "enum": ["BUY", "SELL"]},
-                "order_type": {"type": "string", "enum": ["MARKET", "LIMIT"], "default": "MARKET"},
+                "order_type": {"type": "string", "enum": ["MARKET", "LIMIT", "STOP_LOSS_LIMIT"], "default": "MARKET"},
                 "quantity": {"type": "number", "exclusiveMinimum": 0, "description": "Base asset miktarı"},
-                "price": {"type": "number", "exclusiveMinimum": 0, "description": "LIMIT emir için zorunlu"},
+                "price": {"type": "number", "exclusiveMinimum": 0, "description": "LIMIT/STOP_LOSS_LIMIT için zorunlu (stop tetiklenince satılacak fiyat)"},
+                "stop_price": {"type": "number", "exclusiveMinimum": 0, "description": "STOP_LOSS_LIMIT için zorunlu (stop tetikleme seviyesi)"},
                 "idempotency_key": {"type": "string", "minLength": 1},
                 "request_id": {"type": "string"},
             },

@@ -572,6 +572,7 @@ async def place_order_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
         order_type=params.get("order_type", "MARKET"),
         quantity=params.get("quantity"),
         price=params.get("price"),
+        stop_price=params.get("stop_price"),
         idempotency_key=params.get("idempotency_key"),
         actor=str(ctx.get("actor", "mcp-agent")),
     )

@@ -114,7 +114,7 @@ class FakeOrderBroker:
         self.cancel_errors: dict[str, Exception] = {}
         self._seq = 1000
 
-    async def place_order(self, *, account_id, symbol, side, order_type, quantity, price, client_order_id):
+    async def place_order(self, *, account_id, symbol, side, order_type, quantity, price, client_order_id, stop_price=None):
         self.placed.append(
             {
                 "account_id": account_id,
@@ -123,6 +123,7 @@ class FakeOrderBroker:
                 "order_type": order_type,
                 "quantity": quantity,
                 "price": price,
+                "stop_price": stop_price,
                 "client_order_id": client_order_id,
             }
         )

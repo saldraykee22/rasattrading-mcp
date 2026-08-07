@@ -31,8 +31,8 @@ def _tables(conn):
 
 async def test_migrations_on_empty_db(cfg, db):
     applied = await run_migrations(db)
-    assert applied == [1, 2, 3, 4, 5, 6, 7, 8]
-    assert await current_version(db) == 8
+    assert applied == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    assert await current_version(db) == 9
     tables = await db.read(_tables)
     expected = {
         "candles", "futures_context", "market_structure", "liquidity_zones",

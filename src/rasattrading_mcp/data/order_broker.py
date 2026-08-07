@@ -204,6 +204,7 @@ class BinanceOrderBroker:
         quantity: float,
         price: float | None,
         client_order_id: str,
+        stop_price: float | None = None,
     ) -> OrderResult:
         params: dict[str, Any] = {
             "symbol": symbol,
@@ -214,6 +215,15 @@ class BinanceOrderBroker:
         if order_type.upper() == "LIMIT":
             if price is None:
                 raise RasatError(ErrorCode.INVALID_REQUEST, "limit emirde price zorunlu")
+            params["price"] = str(price)
+            params["timeInForce"] = "GTC"
+        elif order_type.upper() == "STOP_LOSS_LIMIT":
+            # Spot stop koruması: stopPrice'a ulaşınca LIMIT satış tetiklenir.
+            if stop_price is None:
+                raise RasatError(ErrorCode.INVALID_REQUEST, "stop emirde stop_price zorunlu")
+            if price is None:
+                raise RasatError(ErrorCode.INVALID_REQUEST, "stop emirde price zorunlu")
+            params["stopPrice"] = str(stop_price)
             params["price"] = str(price)
             params["timeInForce"] = "GTC"
         if client_order_id:

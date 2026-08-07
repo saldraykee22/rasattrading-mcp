@@ -311,6 +311,15 @@ def _m8_pending_orders(conn: sqlite3.Connection) -> None:
     )
 
 
+def _m9_stop_price(conn: sqlite3.Connection) -> None:
+    """Emir kaydına stop_price sütunu (2.20).
+
+    STOP_LOSS_LIMIT emirleri stopPrice taşır; kayıtta da saklanmalı (audit +
+    pozisyon koruma görünürlüğü). Eski emirler NULL kalır.
+    """
+    conn.execute("ALTER TABLE orders ADD COLUMN stop_price REAL")
+
+
 MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (1, "initial_schema", _m1_initial_schema),
     (2, "indexes", _m2_indexes),
@@ -320,6 +329,7 @@ MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (6, "emergency_reconciled", _m6_emergency_reconciled),
     (7, "orders_equity_snapshot", _m7_orders_equity_snapshot),
     (8, "pending_orders", _m8_pending_orders),
+    (9, "orders_stop_price", _m9_stop_price),
 ]
 
 

@@ -48,6 +48,7 @@ _ORDER_COLUMNS = (
     "order_type",
     "quantity",
     "price",
+    "stop_price",
     "status",
     "exchange_order_id",
     "client_order_id",
@@ -270,15 +271,16 @@ class OrderService:
         equity_snapshot: float,
         status: str,
         client_order_id: str,
+        stop_price: float | None = None,
     ) -> dict:
         now = int(time.time())
         order_id = uuid.uuid4().hex
         conn.execute(
             "INSERT INTO orders "
-            "(order_id, account_id, idempotency_key, symbol, side, order_type, quantity, price, status, "
+            "(order_id, account_id, idempotency_key, symbol, side, order_type, quantity, price, stop_price, status, "
             " client_order_id, executed_qty, avg_price, fee, notional, reference_price, equity_snapshot, "
             " created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,0,0,0,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,0,0,0,?,?,?,?,?)",
             (
                 order_id,
                 account_id,
@@ -288,6 +290,7 @@ class OrderService:
                 order_type,
                 quantity,
                 price,
+                stop_price,
                 status,
                 client_order_id,
                 notional,
@@ -306,6 +309,7 @@ class OrderService:
             "order_type": order_type,
             "quantity": quantity,
             "price": price,
+            "stop_price": stop_price,
             "status": status,
             "exchange_order_id": None,
             "client_order_id": client_order_id,
@@ -363,6 +367,8 @@ class OrderService:
             "side": order["side"],
             "order_type": order["order_type"],
             "quantity": order["quantity"],
+            "price": order.get("price"),
+            "stop_price": order.get("stop_price"),
             "notional": order["notional"],
             "order_id": order.get("order_id"),
             "exchange_order_id": order.get("exchange_order_id"),
@@ -455,6 +461,7 @@ class OrderService:
         order_type: str,
         quantity: float,
         price: float | None = None,
+        stop_price: float | None = None,
         idempotency_key: str,
         actor: str = "mcp-agent",
     ) -> dict[str, Any]:
@@ -469,6 +476,8 @@ class OrderService:
         quantity = self._require_number(quantity, "quantity")
         if price is not None:
             price = self._require_number(price, "price")
+        if stop_price is not None:
+            stop_price = self._require_number(stop_price, "stop_price")
         lock = self._lock(account_id.strip())
         async with lock:
             return await self._execute_one_direct(
@@ -478,6 +487,7 @@ class OrderService:
                 order_type=order_type,
                 quantity=quantity,
                 price=price,
+                stop_price=stop_price,
                 idempotency_key=idempotency_key.strip(),
                 actor=actor or "mcp-agent",
             )
@@ -641,6 +651,7 @@ class OrderService:
         price: float | None,
         idempotency_key: str,
         actor: str,
+        stop_price: float | None = None,
     ) -> dict:
         account = await self.accounts.get_account(account_id)
 
@@ -678,7 +689,7 @@ class OrderService:
         equity = await self._equity_from_balances(balances, "USDT")
         return await self._place_and_record(
             account, is_real, symbol, side, order_type, quantity, price, notional, market_price,
-            idempotency_key, equity, actor,
+            idempotency_key, equity, actor, stop_price=stop_price,
         )
 
     async def _enforce_caps_or_override(
@@ -736,6 +747,7 @@ class OrderService:
         idempotency_key: str,
         equity_snapshot: float,
         actor: str,
+        stop_price: float | None = None,
     ) -> dict:
         account_id = account["account_id"]
         from ..data.order_broker import to_client_order_id
@@ -759,6 +771,7 @@ class OrderService:
                     equity_snapshot=equity_snapshot,
                     status=STATUS_PAPER,
                     client_order_id=client_order_id,
+                    stop_price=stop_price,
                 )
                 if self.audit is not None:
                     self.audit.append_in_connection(
@@ -772,6 +785,7 @@ class OrderService:
                             "side": side,
                             "quantity": quantity,
                             "notional": notional,
+                            "stop_price": stop_price,
                         },
                     )
                 return order
@@ -796,6 +810,7 @@ class OrderService:
                 equity_snapshot=equity_snapshot,
                 status="NEW",
                 client_order_id=client_order_id,
+                stop_price=stop_price,
             )
 
         order = await self.db.write(_insert)
@@ -808,6 +823,7 @@ class OrderService:
                 quantity=quantity,
                 price=price,
                 client_order_id=client_order_id,
+                stop_price=stop_price,
             )
         except RasatError as exc:
             if exc.code == ErrorCode.TIMEOUT:
