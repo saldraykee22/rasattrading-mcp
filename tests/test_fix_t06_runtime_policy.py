@@ -222,6 +222,47 @@ async def test_daemon_stop_closes_broker_before_pipeline_and_db(tmp_path):
     assert runner._shutdown_complete is True
 
 
+async def test_daemon_run_stops_in_finally_on_cancellation(tmp_path):
+    """run() iptal edilse (CancelledError/Windows Ctrl+C) bile stop() finally'de çalışır.
+
+    T3 regresyonu: stop() try/finally dışında olduğunda CancelledError bu satıra
+    ulaşmadan yayılır, DB writer executor ve lock kapanmadan daemon asılı kalırdı.
+    """
+    runner = DaemonRunner(Config(data_dir=tmp_path, pipeline_enabled=False))
+    events: list[str] = []
+    runner.order_broker = _Recorder(events, "broker")
+    runner.db = _Recorder(events, "db")
+
+    task = asyncio.create_task(runner.run())
+    await asyncio.sleep(0.05)  # run() artık _stop.wait()'te bekliyor
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert "broker" in events
+    assert "db" in events
+    assert runner._shutdown_complete is True
+    assert runner._stop.is_set()
+
+
+async def test_daemon_run_returns_zero_on_normal_stop(tmp_path):
+    """Normal bitişte (request_stop) run() 0 döner ve stop() yine çalışır."""
+    runner = DaemonRunner(Config(data_dir=tmp_path, pipeline_enabled=False))
+    events: list[str] = []
+    runner.order_broker = _Recorder(events, "broker")
+    runner.db = _Recorder(events, "db")
+
+    run_task = asyncio.create_task(runner.run())
+    await asyncio.sleep(0.05)
+    runner.request_stop()
+    result = await run_task
+
+    assert result == 0
+    assert "broker" in events
+    assert "db" in events
+    assert runner._shutdown_complete is True
+
+
 async def test_daemon_stop_continues_after_partial_component_failure(tmp_path):
     runner = DaemonRunner(Config(data_dir=tmp_path, pipeline_enabled=False))
     events: list[str] = []

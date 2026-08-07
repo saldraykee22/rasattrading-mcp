@@ -27,6 +27,42 @@ from .server import ToolDispatcher
 _PENDING_DEFINITE_SUCCESS = frozenset({"FILLED", STATUS_PAPER})
 _PENDING_DEFINITE_REJECTED = frozenset({"REJECTED", "CANCELED", "EXPIRED"})
 
+# T3: geçici/retry-edilebilir hatalar → reconcile_required (kullanıcı ya da daemon
+# tekrar deneyebilir). Kalıcı deterministik hatalar (INSUFFICIENT_BALANCE,
+# INVALID_REQUEST, vb.) rejected'da kalır. STALE_DATA/RATE_LIMITED/TIMEOUT
+# eskiden kalıcı rejected üretiyordu — retry imkânı kayboluyordu.
+_PENDING_TRANSIENT_ERRORS = frozenset(
+    {
+        ErrorCode.TIMEOUT,
+        ErrorCode.STALE_DATA,
+        ErrorCode.RATE_LIMITED,
+        ErrorCode.ORDER_UNKNOWN,
+        ErrorCode.ORDER_RECONCILE_REQUIRED,
+    }
+)
+
+
+async def _current_market_price(ctx: dict, symbol: str) -> float | None:
+    """Approve onayında market emir entry'sini dolduracak güncel piyasa fiyatı.
+
+    Daemon bağlamında `pipeline`'ın taze ticker'ı, test bağlamında `market`
+    feed'i kullanılır. Fiyat yoksa veya stale ise None döner (fail-closed).
+    """
+    pipeline = ctx.get("pipeline")
+    if pipeline is not None:
+        ticker = pipeline.get_ticker(symbol)
+        if ticker and ticker.get("freshness") == FRESHNESS_FRESH:
+            try:
+                return float(ticker["last"])
+            except (TypeError, ValueError):
+                return None
+        return None
+    market = ctx.get("market")
+    if market is not None:
+        price = await market.price(symbol)
+        return float(price) if price is not None else None
+    return None
+
 
 async def ping_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
     readiness: Readiness = ctx["readiness"]
@@ -339,13 +375,38 @@ async def approve_pending_order_handler(params: dict, ctx: dict) -> tuple[dict, 
     rec = await alarm._pending_order(order_id)
     if rec["status"] != PENDING_AWAITING_APPROVAL:
         raise RasatError(ErrorCode.INVALID_REQUEST, f"onay bekleyen durumda değil: {rec['status']}")
+
+    # T3: market emirde entry eksikse daemon'ın kendi taze piyasa fiyatıyla doldur
+    # (storage tarafında entry zorunlu — eksik değer kalıcı rejected üretiyordu).
+    # Fiyat alınamıyorsa fail-closed: kayıt awaiting_approval'da kalır, retry edilebilir.
+    order_type = rec.get("order_type") or "market"
+    entry = rec.get("entry")
+    stop_loss = rec.get("stop_loss")
+    if str(order_type).lower() == "market" and entry is None:
+        market_price = await _current_market_price(ctx, rec["symbol"])
+        if market_price is None:
+            raise RasatError(
+                ErrorCode.STALE_DATA,
+                f"market emir için güncel piyasa fiyatı alınamadı: {rec['symbol']}",
+            )
+        entry = market_price
+        await alarm._fill_pending_entry(order_id, entry)
+
     # T02 preflight: risk_pct/required execution alanları broker'dan ÖNCE yeniden doğrulanır.
     alarm._validate_execution_inputs(
         risk_pct=rec.get("risk_pct"),
-        entry=rec.get("entry"),
-        stop_loss=rec.get("stop_loss"),
+        entry=entry,
+        stop_loss=stop_loss,
         order_type=rec.get("order_type"),
     )
+    # T3: stop_loss tüm order tiplerinde zorunludur (storage tarafında zorunlu tutulur).
+    # Eksikse execute_on_accounts'a gitmeden INVALID_REQUEST döner — kayıt kalıcı
+    # rejected'a düşmez, kullanıcı düzeltip yeniden onaylayabilir.
+    if stop_loss is None:
+        raise RasatError(
+            ErrorCode.INVALID_REQUEST,
+            "stop_loss zorunlu (onaylı emir için koruma seviyesi eksik)",
+        )
     order_service = ctx.get("order_service")
     if order_service is None:
         raise RasatError(ErrorCode.NOT_IMPLEMENTED, "order service bu daemon'da başlatılmamış")
@@ -358,18 +419,18 @@ async def approve_pending_order_handler(params: dict, ctx: dict) -> tuple[dict, 
             tags=None,
             symbol=rec["symbol"],
             side=rec["side"],
-            entry=rec["entry"],
-            stop_loss=rec["stop_loss"],
+            entry=entry,
+            stop_loss=stop_loss,
             risk_pct=rec["risk_pct"],
             idempotency_key=f"pending:{order_id}",
             order_type=rec["order_type"] or "MARKET",
             actor=str(ctx.get("actor", "mcp-agent")),
         )
     except RasatError as exc:
-        # Deterministik rejection → rejected; belirsiz/timeout → reconcile_required.
+        # Deterministik rejection → rejected; geçici/retry-edilebilir → reconcile_required.
         terminal = (
             PENDING_RECONCILE_REQUIRED
-            if exc.code in (ErrorCode.TIMEOUT, ErrorCode.ORDER_UNKNOWN, ErrorCode.ORDER_RECONCILE_REQUIRED)
+            if exc.code in _PENDING_TRANSIENT_ERRORS
             else PENDING_REJECTED
         )
         await alarm.fail_pending_execution(
@@ -420,14 +481,19 @@ async def approve_pending_order_handler(params: dict, ctx: dict) -> tuple[dict, 
 
     if status in _PENDING_DEFINITE_REJECTED:
         # Deterministik red: borsa emri kesin reddedildi/iptal/süresi doldu.
+        # T3: structured REJECTED içindeki geçici hata kodları (STALE_DATA,
+        # RATE_LIMITED vb.) kalıcı rejected DEĞİLDİR — retry imkânı kalsın diye
+        # reconcile_required'a çekilir. Yalnızca gerçekten kalıcı kodlar (örn.
+        # borsa ORDER_REJECTED / INSUFFICIENT_BALANCE) rejected'da kalır.
         code = error.get("code") or {
             "REJECTED": ErrorCode.ORDER_REJECTED,
             "EXPIRED": ErrorCode.ORDER_EXPIRED,
             "CANCELED": ErrorCode.ORDER_REJECTED,
         }.get(status, ErrorCode.ORDER_REJECTED)
         message = error.get("message") or f"emir kesin sonlandı (borsa durumu: {status})"
+        terminal = PENDING_RECONCILE_REQUIRED if code in _PENDING_TRANSIENT_ERRORS else PENDING_REJECTED
         await alarm.fail_pending_execution(
-            order_id, status=PENDING_REJECTED, error_code=code, error_message=message
+            order_id, status=terminal, error_code=code, error_message=message
         )
         raise RasatError(code, message)
 

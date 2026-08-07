@@ -32,6 +32,7 @@ from typing import Any
 from ..envelope import FRESHNESS_FRESH
 from ..errors import ErrorCode, RasatError
 from ..storage.db import Database
+from ..storage.orders import STATUS_PAPER
 from ..storage.state import (
     PENDING_APPROVED,
     PENDING_EXECUTING,
@@ -679,6 +680,18 @@ class AlarmService:
             raise RasatError(ErrorCode.NOT_FOUND, f"bekleyen emir bulunamadı: {order_id}")
         return rec
 
+    async def _fill_pending_entry(self, order_id: str, entry: float) -> None:
+        """Market emir onayında eksik entry'yi güncel piyasa fiyatıyla doldurur (T3).
+
+        Storage tarafında entry zorunlu; onaylanan kayıtta eksikse kalıcı rejected
+        üretiliyordu. Fiyat kalıcı kayda işlenir ki yeniden onay/audit tutarlı olsun.
+        """
+
+        def _w(conn):
+            conn.execute("UPDATE pending_orders SET entry=? WHERE order_id=?", (entry, order_id))
+
+        await self.db.write(_w)
+
     async def approve_pending_order(self, order_id: str) -> dict:
         """Onay: `awaiting_approval → approved`. Emir açma handler'da yapılır."""
         now = int(time.time())
@@ -796,6 +809,100 @@ class AlarmService:
             return {"order_id": order_id, "status": status, "execution_error_code": error_code}
 
         return await self.db.write(_w)
+
+    async def reconcile_pending_executions(self, stale_after_seconds: int = 300) -> dict:
+        """Daemon restart sonrası `executing`'de kalan onaylı emirleri kurtarır (T3).
+
+        Crash anında `executing`'e claim edilmiş ama emir sonucu işlenmeden daemon
+        düşmüş olabilir. Her kayıt için `orders` tablosunda
+        `idempotency_key = 'pending:' || order_id` eşleşmesi aranır:
+
+        - eşleşen emir kaydı varsa durumuna göre terminal/reconcile duruma çekilir:
+          FILLED/paper → `complete_pending_execution`, REJECTED/CANCELED/EXPIRED →
+          `fail_pending_execution(rejected)`, diğerleri (NEW/PARTIALLY_FILLED/UNKNOWN)
+          → `fail_pending_execution(reconcile_required)`.
+        - eşleşme yoksa ve `execution_started_at` eşikten eskiyse fail-closed
+          `reconcile_required`'a geçilir (emir borsada olabilir; körlemesine
+          yeniden gönderim yapılmaz). Taze kayıtlar dokunulmadan bırakılır — daemon
+          onları hâlâ işliyor olabilir (sonraki açılışta yeniden değerlendirilir).
+        """
+        now = int(time.time())
+
+        def _executing(conn):
+            rows = conn.execute(
+                "SELECT * FROM pending_orders WHERE status=?",
+                (PENDING_EXECUTING,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+        records = await self.db.read(_executing)
+        matched = 0
+        completed = 0
+        failed = 0
+        untouched = 0
+        details: list[dict] = []
+        for rec in records:
+            order_id = rec["order_id"]
+
+            def _match(conn, oid: str = order_id, acc: str = rec["account_id"]):
+                row = conn.execute(
+                    "SELECT status, exchange_order_id FROM orders "
+                    "WHERE account_id=? AND idempotency_key=?",
+                    (acc, f"pending:{oid}"),
+                ).fetchone()
+                return dict(row) if row is not None else None
+
+            order = await self.db.read(_match)
+            if order is not None:
+                matched += 1
+                exec_status = order["status"]
+                if exec_status in ("FILLED", STATUS_PAPER):
+                    await self.complete_pending_execution(order_id, order["exchange_order_id"])
+                    completed += 1
+                    details.append({"order_id": order_id, "action": "completed", "status": exec_status})
+                elif exec_status in ("REJECTED", "CANCELED", "EXPIRED"):
+                    await self.fail_pending_execution(
+                        order_id,
+                        status=PENDING_REJECTED,
+                        error_code=ErrorCode.ORDER_REJECTED,
+                        error_message=f"restart reconcile: emir kesin sonlandı ({exec_status})",
+                    )
+                    failed += 1
+                    details.append({"order_id": order_id, "action": "rejected", "status": exec_status})
+                else:
+                    # NEW/PARTIALLY_FILLED/UNKNOWN → non-terminal/ambiguous.
+                    await self.fail_pending_execution(
+                        order_id,
+                        status=PENDING_RECONCILE_REQUIRED,
+                        error_code=ErrorCode.ORDER_UNKNOWN,
+                        error_message="restart reconcile: emir durumu kesin değil",
+                    )
+                    failed += 1
+                    details.append({"order_id": order_id, "action": "reconcile_required", "status": exec_status})
+                continue
+
+            started = rec.get("execution_started_at")
+            if started is not None and now - int(started) > stale_after_seconds:
+                await self.fail_pending_execution(
+                    order_id,
+                    status=PENDING_RECONCILE_REQUIRED,
+                    error_code=ErrorCode.ORDER_UNKNOWN,
+                    error_message="restart reconcile: emir kaydı bulunamadı; fail-closed reconcile",
+                )
+                failed += 1
+                details.append({"order_id": order_id, "action": "reconcile_required_no_order"})
+            else:
+                untouched += 1
+                details.append({"order_id": order_id, "action": "untouched"})
+
+        return {
+            "scanned": len(records),
+            "matched": matched,
+            "completed": completed,
+            "failed": failed,
+            "untouched": untouched,
+            "details": details,
+        }
 
     @staticmethod
     def _summary(alert_id: str, definition: dict, state: str, created_at: int, cooldown_until: int | None = None) -> dict:

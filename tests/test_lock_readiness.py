@@ -144,3 +144,75 @@ async def test_wait_ready_timeout():
     assert await r.wait_ready(timeout=0.05) is False
     r.set_state("ready")
     assert await r.wait_ready(timeout=0.5) is True
+
+
+# ---------- daemon signal fallback (Windows) ----------
+
+
+async def test_run_daemon_signal_fallback_on_windows(tmp_path, monkeypatch):
+    """add_signal_handler NotImplementedError (Windows) → signal.signal fallback kurulur."""
+    from rasattrading_mcp.daemon import main as dm
+
+    class _FakeLoop:
+        def add_signal_handler(self, sig, cb):
+            raise NotImplementedError("Windows signal handler desteklenmez")
+
+        def call_soon_threadsafe(self, cb):
+            cb()
+
+    monkeypatch.setattr(dm.asyncio, "get_running_loop", lambda: _FakeLoop())
+
+    installed = []
+    monkeypatch.setattr(dm.signal, "signal", lambda sig, cb: installed.append((sig, cb)))
+
+    async def _noop_start(self):
+        return None
+
+    async def _noop_run(self):
+        return 0
+
+    monkeypatch.setattr(dm.DaemonRunner, "start", _noop_start)
+    monkeypatch.setattr(dm.DaemonRunner, "run", _noop_run)
+
+    result = await dm.run_daemon(Config(data_dir=tmp_path, pipeline_enabled=False))
+    assert result == 0
+    # SIGINT + SIGTERM için signal.signal fallback'i kuruldu (break yerine).
+    assert len(installed) == 2
+    sigs = {s for s, _ in installed}
+    assert dm.signal.SIGINT in sigs
+    assert dm.signal.SIGTERM in sigs
+
+
+async def test_run_daemon_signal_fallback_handler_requests_stop(tmp_path, monkeypatch):
+    """Fallback handler tetiklenince request_stop loop thread'ine iletilir."""
+    from rasattrading_mcp.daemon import main as dm
+
+    class _FakeLoop:
+        def add_signal_handler(self, sig, cb):
+            raise NotImplementedError("win")
+
+        def call_soon_threadsafe(self, cb):
+            cb()
+
+    monkeypatch.setattr(dm.asyncio, "get_running_loop", lambda: _FakeLoop())
+
+    captured = []
+    monkeypatch.setattr(dm.signal, "signal", lambda sig, cb: captured.append((sig, cb)))
+
+    async def _noop_start(self):
+        return None
+
+    async def _noop_run(self):
+        return 0
+
+    stop_calls = []
+    monkeypatch.setattr(dm.DaemonRunner, "start", _noop_start)
+    monkeypatch.setattr(dm.DaemonRunner, "run", _noop_run)
+    monkeypatch.setattr(dm.DaemonRunner, "request_stop", lambda self: stop_calls.append(self))
+
+    assert await dm.run_daemon(Config(data_dir=tmp_path, pipeline_enabled=False)) == 0
+    # Fallback handler'ı elle tetikle → request_stop loop thread'ine iletilmeli.
+    assert captured
+    handler = captured[0][1]
+    handler(dm.signal.SIGINT, None)
+    assert len(stop_calls) == 1
