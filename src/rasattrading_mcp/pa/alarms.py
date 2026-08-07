@@ -396,7 +396,7 @@ class AlarmService:
         if ms is None:
             return None
         as_of = ms["effective_from"]
-        if PAEngine.freshness_for(timeframe, as_of) != FRESHNESS_FRESH:
+        if self.engine.freshness(timeframe, as_of) != FRESHNESS_FRESH:
             return None  # stale → değerlendirme ertelenir (tetiklenmez)
         from .vwap_sessions import compute_vwap
 
@@ -428,7 +428,7 @@ class AlarmService:
         Context kapanmış mumlardan kurulur; oluşmakta olan bar dahil edilmez.
         """
         as_of = analysis.get("as_of")
-        if PAEngine.freshness_for(timeframe, as_of) != FRESHNESS_FRESH:
+        if self.engine.freshness(timeframe, as_of) != FRESHNESS_FRESH:
             return []  # stale analiz → tetikleme yok
         triggers: list[dict] = []
         candles = await self.engine._read_candles(symbol, timeframe, 300)
