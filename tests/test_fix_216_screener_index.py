@@ -265,7 +265,11 @@ async def test_2_16_symbol_valid_unknown_without_pipeline(db):
 
 async def test_2_16_scan_rows_are_auditable(db):
     """Eşleşmeyi tetikleyen filtreler ve ham sinyal özeti satır bazında döner."""
-    await seed(db, "BMTUSDT", breakout_series(193))
+    rows = breakout_series(193)
+    # `above_below_vwap: above` close > vwap ister; düz 104'lük seri sonunda
+    # gün-çapalı VWAP tam 104.0'a eşit kalıp eşleşmiyordu → son barlar VWAP üstüne çekilir.
+    rows[-2:] = [(104, 105.5, 104, 105.2), (104.5, 106.0, 104.5, 105.7)]
+    await seed(db, "BMTUSDT", rows)
     screener = Screener(db)
     res = await screener.scan(
         [
