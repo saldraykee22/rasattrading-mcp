@@ -72,16 +72,6 @@ class FakeRest:
             ]
         if path == "/fapi/v1/openInterest":
             return {"openInterest": "1234.5", "time": int(time.time() * 1000)}
-        if path == "/fapi/v1/forceOrders":
-            return [
-                {
-                    "symbol": "BTCUSDT",
-                    "side": "SELL",
-                    "price": "90000.0",
-                    "origQty": "0.5",
-                    "time": int(time.time() * 1000),
-                }
-            ]
         raise AssertionError(f"FakeRest bilinmeyen path: {path}")
 
 
