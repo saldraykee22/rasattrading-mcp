@@ -735,6 +735,12 @@ async def get_open_orders_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
     return data, Meta(as_of=utc_iso(), source="binance", freshness=FRESHNESS_FRESH)
 
 
+async def get_unprotected_positions_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    service = _require_order_service(ctx)
+    data = await service.find_unprotected_positions()
+    return data, Meta(as_of=utc_iso(), source="binance", freshness=FRESHNESS_FRESH)
+
+
 async def get_audit_log_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
     """Audit log sorgusu — tamamen DB-yerel, pipeline gerektirmez."""
     audit = ctx.get("audit")
@@ -774,6 +780,7 @@ def build_dispatcher(ctx: dict) -> ToolDispatcher:
     dispatcher.register("get_total_exposure", get_total_exposure_handler)
     dispatcher.register("get_account_balance", get_account_balance_handler)
     dispatcher.register("get_open_orders", get_open_orders_handler)
+    dispatcher.register("get_unprotected_positions", get_unprotected_positions_handler)
     dispatcher.register("get_audit_log", get_audit_log_handler)
     dispatcher.register("add_account", add_account_handler)
     dispatcher.register("list_accounts", list_accounts_handler)

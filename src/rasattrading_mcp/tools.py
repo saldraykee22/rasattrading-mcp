@@ -532,6 +532,27 @@ register_tool(
 
 register_tool(
     ToolSpec(
+        name="get_unprotected_positions",
+        description=(
+            "Tüm real hesaplarda, açık SELL emri (stop-loss/take-profit/OCO dahil) "
+            "olmayan dust-üstü base asset bakiyelerini bulur — 'hangi pozisyon "
+            "korumasız kaldı' sorusuna tek çağrıda cevap. Salt-okunur, hiçbir emri "
+            "değiştirmez. Boş sonuç = taranan tüm real hesaplarda her pozisyon "
+            "en az bir açık SELL emriyle eşleşiyor demektir."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "request_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
         name="get_audit_log",
         description=(
             "Hash-chain doğrulamalı audit log sorgusu. verified=true ise zincir sağlam; "

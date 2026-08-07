@@ -873,3 +873,87 @@ async def test_get_open_orders_no_credentials_rejected(ex_ctx):
         await ctx["service"].get_open_orders(account_id=account_id)
 
     assert exc_info.value.code == ErrorCode.ACCOUNT_NO_CREDENTIALS
+
+
+# ---------- get_unprotected_positions: korumasız spot pozisyonlar ----------
+
+
+async def test_find_unprotected_positions_detects_and_dispatches(ex_ctx):
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx, label="unprotected", base_holdings={"BTC": 5.0})
+    ctx["broker"].open_orders = []
+
+    result = await ctx["service"].find_unprotected_positions()
+
+    assert result == {
+        "count": 1,
+        "unprotected": [
+            {
+                "account_id": account_id,
+                "account_label": "unprotected",
+                "symbol": "BTCUSDT",
+                "quantity": 5.0,
+                "value_usd": 500.0,
+            }
+        ],
+    }
+
+    from rasattrading_mcp.daemon.handlers import build_dispatcher
+    from rasattrading_mcp.daemon.readiness import Readiness
+
+    dispatcher_ctx = {
+        "order_service": ctx["service"],
+        "readiness": Readiness(),
+        "started_at": 0,
+        "pipeline": None,
+    }
+    dispatcher = build_dispatcher(dispatcher_ctx)
+    assert "get_unprotected_positions" in set(dispatcher.names())
+    data, meta = await dispatcher.dispatch("get_unprotected_positions", {}, dispatcher_ctx)
+    assert data == result
+    assert meta.source == "binance"
+
+
+async def test_find_unprotected_positions_excludes_sell_protected(ex_ctx):
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx, base_holdings={"BTC": 5.0})
+    ctx["broker"].open_orders = [{"symbol": "BTCUSDT", "side": "SELL"}]
+
+    result = await ctx["service"].find_unprotected_positions()
+
+    assert result == {"unprotected": [], "count": 0}
+    assert account_id not in {row["account_id"] for row in result["unprotected"]}
+
+
+async def test_find_unprotected_positions_filters_dust(ex_ctx):
+    ctx = ex_ctx
+    await _add_real_account(ctx, base_holdings={"BTC": 0.005})  # $0.50 at the fake price
+    ctx["broker"].open_orders = []
+
+    result = await ctx["service"].find_unprotected_positions()
+
+    assert result == {"unprotected": [], "count": 0}
+
+
+async def test_find_unprotected_positions_scans_multiple_real_accounts(ex_ctx):
+    ctx = ex_ctx
+    unprotected_id = await _add_real_account(ctx, label="unprotected", base_holdings={"BTC": 5.0})
+    protected_id = await _add_real_account(ctx, label="cash-only", balance_usdt=1000.0)
+    ctx["broker"].open_orders = []
+
+    result = await ctx["service"].find_unprotected_positions()
+
+    assert [row["account_id"] for row in result["unprotected"]] == [unprotected_id]
+    assert result["unprotected"][0]["account_label"] == "unprotected"
+    assert protected_id not in {row["account_id"] for row in result["unprotected"]}
+
+
+async def test_find_unprotected_positions_excludes_paper_accounts(ex_ctx):
+    ctx = ex_ctx
+    paper_id = await _add_paper_account(ctx, label="paper-with-balance")
+    ctx["broker"].balances[paper_id] = {"USDT": 100.0, "BTC": 5.0}
+    ctx["broker"].open_orders = []
+
+    result = await ctx["service"].find_unprotected_positions()
+
+    assert result == {"unprotected": [], "count": 0}

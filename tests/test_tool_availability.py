@@ -74,7 +74,7 @@ async def test_dispatcher_registers_all_tools_without_pipeline(cfg):
     db, _, _, dispatcher = await _make_no_pipeline_app(cfg)
     try:
         assert set(dispatcher.names()) == set(REGISTRY.names())
-        assert len(dispatcher.names()) == 38
+        assert len(dispatcher.names()) == 39
     finally:
         await db.stop()
 

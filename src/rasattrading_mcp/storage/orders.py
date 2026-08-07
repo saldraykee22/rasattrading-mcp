@@ -99,6 +99,8 @@ class PipelineMarketFeed:
 
 
 class OrderService:
+    MIN_UNPROTECTED_VALUE_USD = 10.0
+
     def __init__(
         self,
         db: Database,
@@ -1943,6 +1945,55 @@ class OrderService:
                 }
             )
         return {"orders": orders, "count": len(orders)}
+
+    async def find_unprotected_positions(self) -> dict[str, Any]:
+        """Real hesaplarda, açık SELL emri olmayan (dust üstü) base asset bakiyelerini bulur.
+
+        ``get_open_orders``'ın aksine tüm real hesapları tarar ve bakiye/açık emir
+        çaprazlamasını otomatik yapar — "hangi pozisyon korumasız" sorusuna
+        tek çağrıda cevap verir.
+        """
+        accounts = [
+            acc
+            for acc in (await self.accounts.list_accounts())["accounts"]
+            if str(acc.get("trading_lock", "paper")) == "real" and acc.get("credentials_configured")
+        ]
+        unprotected: list[dict[str, Any]] = []
+        for acc in accounts:
+            account_id = acc["account_id"]
+            try:
+                balance_detail = await self.broker.get_balance_detail(account_id=account_id)
+                open_orders = await self.broker.get_all_open_orders(account_id=account_id) or []
+            except RasatError:
+                continue
+            sell_symbols = {
+                o.get("symbol") for o in open_orders if str(o.get("side", "")).upper() == "SELL"
+            }
+            for asset, bal in balance_detail.items():
+                if asset == "USDT":
+                    continue
+                qty = float(bal.get("free", 0) or 0) + float(bal.get("locked", 0) or 0)
+                if qty <= 0:
+                    continue
+                symbol = f"{asset}USDT"
+                price = await self.market.price(symbol)
+                if price is None:
+                    continue
+                value = qty * price
+                if value < self.MIN_UNPROTECTED_VALUE_USD:
+                    continue
+                if symbol in sell_symbols:
+                    continue
+                unprotected.append(
+                    {
+                        "account_id": account_id,
+                        "account_label": acc.get("label"),
+                        "symbol": symbol,
+                        "quantity": qty,
+                        "value_usd": value,
+                    }
+                )
+        return {"unprotected": unprotected, "count": len(unprotected)}
 
     async def get_audit_log(self, *, limit: int = 50) -> dict[str, Any]:
         """Hash-chain doğrulamalı audit log sorgusu (3.5)."""
