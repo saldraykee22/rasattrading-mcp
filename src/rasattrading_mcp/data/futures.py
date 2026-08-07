@@ -85,6 +85,7 @@ class FuturesContextPoller:
 
     async def poll_open_interest(self) -> int:
         total = 0
+        clean = True
         futures_symbols = await self._futures_symbol_set()
         for symbol in self._universe.snapshot():
             if symbol not in futures_symbols:
@@ -107,6 +108,7 @@ class FuturesContextPoller:
             except RasatError as exc:
                 if exc.code == ErrorCode.RATE_LIMITED:
                     self._last_status["open_interest"] = "rate_limited"
+                    clean = False
                     break  # bütçe dolu — bu turu bırak, sonraki turda dene
                 if exc.code == ErrorCode.INVALID_REQUEST:
                     # fapi'de olmayan sembol (400): kümeden düşür, her turda tekrarlama
@@ -115,7 +117,12 @@ class FuturesContextPoller:
                         logger.info("fapi'de olmayan sembol OI kümesinden düşürüldü: %s", symbol)
                     continue
                 logger.warning("openInterest başarısız %s: %s", symbol, exc.message)
-        self._last_status["open_interest"] = "ok"
+                self._last_status["open_interest"] = "error"
+                clean = False
+        # "ok" yalnızca döngü hatasız/kesintisiz tamamlandığında yazılır (T2);
+        # aksi halde rate_limited/error gibi gerçek durum korunur.
+        if clean:
+            self._last_status["open_interest"] = "ok"
         return total
 
     async def poll_liquidations(self) -> int:
@@ -125,6 +132,10 @@ class FuturesContextPoller:
         if self._last_liquidation_ts:
             params["startTime"] = self._last_liquidation_ts
         try:
+            # TODO(T3): poll_liquidations imzasız REST client kullanıyor, bu yüzden
+            # /fapi/v1/forceOrders her zaman 401 dönüyor (signed USER_DATA endpoint);
+            # gerçek düzeltme daemon/main.py'da signed broker wiring gerektirir —
+            # burada yalnızca belgelenir, davranış değişmez.
             data = await self._rest.get("/fapi/v1/forceOrders", params=params, weight=10)
         except RasatError as exc:
             if exc.code == ErrorCode.UNAUTHORIZED:

@@ -124,7 +124,9 @@ def test_validate_nested_and_or():
 async def test_scan_price_change(db):
     await seed_all(db)
     screener = Screener(db)
-    res = await screener.scan([{"type": "price_change", "window_bars": 10, "min": 2}])
+    res = await screener.scan(
+        [{"type": "price_change", "window_bars": 10, "min": 2}], require_fresh=False
+    )
     syms = [s["symbol"] for s in res["symbols"]]
     assert "BTCUSDT" in syms  # %2.5 artış
     assert "SOLUSDT" not in syms  # düşüyor
@@ -135,7 +137,7 @@ async def test_scan_price_change(db):
 async def test_scan_liquidity_sweep(db):
     await seed_all(db)
     screener = Screener(db)
-    res = await screener.scan([{"type": "liquidity_sweep_occurred"}])
+    res = await screener.scan([{"type": "liquidity_sweep_occurred"}], require_fresh=False)
     syms = [s["symbol"] for s in res["symbols"]]
     assert "ETHUSDT" in syms  # eşit high sweep edildi
     assert "BTCUSDT" not in syms
@@ -144,7 +146,7 @@ async def test_scan_liquidity_sweep(db):
 async def test_scan_structure_event(db):
     await seed_all(db)
     screener = Screener(db)
-    res = await screener.scan([{"type": "structure_event", "event": "bos_bullish"}])
+    res = await screener.scan([{"type": "structure_event", "event": "bos_bullish"}], require_fresh=False)
     syms = [s["symbol"] for s in res["symbols"]]
     assert "BTCUSDT" in syms
 
@@ -155,7 +157,7 @@ async def test_scan_near_order_block(db):
     await seed(db, "BTCUSDT", ACTIVE_OB)
     await seed(db, "ETHUSDT", EQ_SWEEP)
     screener = Screener(db)
-    res = await screener.scan([{"type": "near_order_block", "max_distance_pct": 2.0}])
+    res = await screener.scan([{"type": "near_order_block", "max_distance_pct": 2.0}], require_fresh=False)
     syms = [s["symbol"] for s in res["symbols"]]
     assert "BTCUSDT" in syms  # aktif OB'ye yakın
     assert "ETHUSDT" not in syms  # OB yok
@@ -164,8 +166,8 @@ async def test_scan_near_order_block(db):
 async def test_scan_above_below_vwap(db):
     await seed_all(db)
     screener = Screener(db)
-    above = await screener.scan([{"type": "above_below_vwap", "position": "above"}])
-    below = await screener.scan([{"type": "above_below_vwap", "position": "below"}])
+    above = await screener.scan([{"type": "above_below_vwap", "position": "above"}], require_fresh=False)
+    below = await screener.scan([{"type": "above_below_vwap", "position": "below"}], require_fresh=False)
     above_syms = {s["symbol"] for s in above["symbols"]}
     below_syms = {s["symbol"] for s in below["symbols"]}
     assert "BTCUSDT" in above_syms
@@ -187,7 +189,7 @@ async def test_scan_funding_rate_fresh_only(db):
 
     await db.write(_w)
     screener = Screener(db)
-    res = await screener.scan([{"type": "funding_rate", "min": 0.0001, "max": 0.001}])
+    res = await screener.scan([{"type": "funding_rate", "min": 0.0001, "max": 0.001}], require_fresh=False)
     syms = [s["symbol"] for s in res["symbols"]]
     assert "BTCUSDT" in syms  # fresh
     assert "ETHUSDT" not in syms  # stale skora katılmaz
@@ -199,6 +201,7 @@ async def test_scan_combine_or(db):
     res = await screener.scan(
         [{"type": "structure_event", "event": "bos_bullish"}, {"type": "above_below_vwap", "position": "below"}],
         combine="OR",
+        require_fresh=False,
     )
     syms = [s["symbol"] for s in res["symbols"]]
     assert "BTCUSDT" in syms  # bos_bullish
@@ -216,7 +219,7 @@ async def test_scan_pagination(db):
     cursor = None
     pages = 0
     while True:
-        res = await screener.scan(filters, combine="OR", limit=1, cursor=cursor)
+        res = await screener.scan(filters, combine="OR", limit=1, cursor=cursor, require_fresh=False)
         seen.append(res["symbols"][0]["symbol"])
         pages += 1
         if res["next_cursor"] is None:
@@ -229,7 +232,9 @@ async def test_scan_pagination(db):
 async def test_scan_stale_marking(db):
     await seed_all(db)
     screener = Screener(db)
-    res = await screener.scan([{"type": "price_change", "window_bars": 10, "min": 2}])
+    res = await screener.scan(
+        [{"type": "price_change", "window_bars": 10, "min": 2}], require_fresh=False
+    )
     btc = next(s for s in res["symbols"] if s["symbol"] == "BTCUSDT")
     assert btc["data_stale"] is True  # eski damgalı mumlar → açıkça işaretli
 
@@ -238,7 +243,8 @@ async def test_scan_and_or_nested(db):
     await seed_all(db)
     screener = Screener(db)
     res = await screener.scan(
-        [{"type": "or", "filters": [{"type": "structure_event", "event": "bos_bullish"}, {"type": "liquidity_sweep_occurred"}]}]
+        [{"type": "or", "filters": [{"type": "structure_event", "event": "bos_bullish"}, {"type": "liquidity_sweep_occurred"}]}],
+        require_fresh=False,
     )
     syms = [s["symbol"] for s in res["symbols"]]
     assert "BTCUSDT" in syms

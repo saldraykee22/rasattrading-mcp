@@ -25,12 +25,16 @@ from typing import Any
 from .params import SWING_ALGO_VERSION, SWING_LOOKBACK
 
 
-def filter_closed_candles(candles: list[dict], timeframe: str) -> list[dict]:
+def filter_closed_candles(candles: list[dict], timeframe: str, now: float | None = None) -> list[dict]:
     """Hâlâ oluşmakta olan (kapanmamış) son barı atar.
 
     Kapalı mum kuralı: PA hesaplamaları yalnızca kapanmış mumlar üzerinden
     yapılır. Binance'te bar `open_time + period` anında kapanır; bu andan
     önceki hiçbir bar canlı sayılmaz.
+
+    `now` verilmezse yerel saate düşülür; veri katmanıyla (klines server clock)
+    tutarlılık için çağıranlar `PAEngine._now()` ile server clock'u geçirmeli
+    (T2) — host saati kayarsa bu karar kayar.
     """
     from ..config import TIMEFRAME_SECONDS
 
@@ -40,8 +44,12 @@ def filter_closed_candles(candles: list[dict], timeframe: str) -> list[dict]:
         return candles
     import time as _time
 
+    if now is None:
+        now = _time.time()
     period = TIMEFRAME_SECONDS[timeframe]
-    latest_closed = int(_time.time() // period) * period - period
+    latest_closed = int(now // period) * period - period
+    # TODO(T2, düşük öncelik): 1w/1M için epoch-floor kapanış hizalaması
+    # Binance'in Pazartesi/ay-başı hizalamasıyla uyuşmaz — gerekiyorsa ayrıca ele alın.
     return [c for c in candles if c["open_time"] <= latest_closed]
 
 

@@ -37,9 +37,16 @@ class PAWorker:
         self._sem = asyncio.Semaphore(config.pa_worker_concurrency)
 
     @staticmethod
-    def latest_closed(tf: str) -> int:
+    def latest_closed(tf: str, now: float | None = None) -> int:
+        """Timeframe'in son kapanmış mumunun `open_time`'ı (server clock ile, T2).
+
+        `now` verilmezse yerel saate düşülür; `PAWorker` turları server clock ile
+        tutarlı kalması için `engine._now()` geçirir.
+        """
         period = TIMEFRAME_SECONDS[tf]
-        return int(time.time() // period) * period - period
+        if now is None:
+            now = time.time()
+        return int(now // period) * period - period
 
     async def run(self) -> None:
         while True:
@@ -63,8 +70,9 @@ class PAWorker:
         geldiğinde yeniden denenir.
         """
         processed = 0
+        now = self.engine._now()
         for tf in self.config.kline_intervals:
-            latest_closed = self.latest_closed(tf)
+            latest_closed = self.latest_closed(tf, now=now)
             if self._last_processed.get(tf) == latest_closed:
                 continue
             symbols = sorted(self.universe.snapshot())
@@ -92,7 +100,7 @@ class PAWorker:
                 return False
             if not candles:
                 return False
-            if PAEngine.freshness_for(tf, candles[-1]["open_time"]) != FRESHNESS_FRESH:
+            if self.engine.freshness(tf, candles[-1]["open_time"]) != FRESHNESS_FRESH:
                 # Mum verisi hedef kapalı bara yetişmedi → kline scheduler tamamlayınca işlenir.
                 return False
             try:

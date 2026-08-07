@@ -351,14 +351,30 @@ class KlineService:
                 logger.exception("kline scheduler hatası")
 
     async def _needs_catchup(self, tf: str, last_closed: int, source: str) -> bool:
-        def _q(conn):
-            row = conn.execute(
-                "SELECT MAX(open_time) AS m FROM candles WHERE timeframe=? AND source=?", (tf, source)
-            ).fetchone()
-            return int(row["m"]) if row["m"] is not None else None
+        """Sembol bazlı catchup ihtiyacı (T2).
 
-        max_open = await self._db.read(_q)
-        return max_open is None or max_open < last_closed
+        Eski davranış timeframe genelinde tek `MAX(open_time)` kontrolü yapıyordu;
+        bir sembol son kapalı bara ulaşınca tüm timeframe için catchup atlanıyor,
+        geride kalan semboller kaçabiliyordu. Artık evrendeki her sembolün kendi
+        `MAX(open_time)`'ı hedef kapalı bara bakılır: en az biri geride kalınca
+        True döner (in-flight dedup çift çekimi zaten önler).
+        """
+        if source == "futures":
+            symbols = await self._futures_symbol_set()
+        else:
+            symbols = self._universe.snapshot()
+        if not symbols:
+            return False
+
+        def _q(conn):
+            rows = conn.execute(
+                "SELECT symbol, MAX(open_time) AS m FROM candles WHERE timeframe=? AND source=? GROUP BY symbol",
+                (tf, source),
+            ).fetchall()
+            return {r["symbol"]: int(r["m"]) for r in rows}
+
+        warm_map = await self._db.read(_q)
+        return any(warm_map.get(s, 0) < last_closed for s in symbols)
 
     async def _enqueue_closed_bar_pass(self, tf: str, last_closed: int, source: str = "spot") -> None:
         for symbol in self._universe.snapshot():
