@@ -64,6 +64,7 @@ class Config:
     http_timeout_seconds: float = 20.0
     alarm_eval_seconds: float = 30.0
     alarm_compute_budget: int = 8
+    alarm_notify_command: str | None = None
     pa_check_seconds: float = 20.0
     pa_worker_concurrency: int = 4
     futures_stale_after_seconds: float = 1800.0
@@ -96,6 +97,7 @@ class Config:
             "port": int(env.get("RASATTRADING_PORT", str(DEFAULT_PORT))),
             "pipeline_enabled": env.get("RASATTRADING_PIPELINE_ENABLED", "1").lower() not in ("0", "false", "no"),
             "rate_limit_max_weight": int(env.get("RASATTRADING_RATE_LIMIT_WEIGHT", "6000")),
+            "alarm_notify_command": env.get("RASATTRADING_ALARM_NOTIFY_COMMAND"),
         }
         if overrides:
             kwargs.update(overrides)

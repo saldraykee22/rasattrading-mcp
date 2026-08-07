@@ -286,7 +286,73 @@ async def create_alert_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
         params["condition"],
         cooldown_seconds=params.get("cooldown_seconds", 300),
         note=params.get("note"),
+        order_spec=params.get("order_spec"),
     )
+    return data, Meta(as_of=utc_iso(), source="alarm-engine", freshness=FRESHNESS_FRESH)
+
+
+async def get_pending_orders_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    alarm = _require_alarm_service(ctx)
+    data = await alarm.get_pending_orders(
+        status=params.get("status"),
+        limit=params.get("limit", 50),
+    )
+    return data, Meta(as_of=utc_iso(), source="alarm-engine", freshness=FRESHNESS_FRESH)
+
+
+async def approve_pending_order_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    """Onaylı bekleyen emri GERÇEK emir olarak açıp `executed` işaretler.
+
+    Emir boyutlandırma daemon tarafında yapılır: `execute_on_accounts`
+    risk_pct + hesap equity'si + sembol filtreleriyle; spec'teki miktar
+    kullanılmaz (agent'a güvenilmez — plan 5.2). Idempotency key:
+    `pending:<order_id>` — retry çift emir üretmez.
+    """
+    alarm = _require_alarm_service(ctx)
+    rec = await alarm._pending_order(params["order_id"])
+    if rec["status"] != "awaiting_approval":
+        raise RasatError(ErrorCode.INVALID_REQUEST, f"onay bekleyen durumda değil: {rec['status']}")
+    order_service = ctx.get("order_service")
+    if order_service is None:
+        raise RasatError(ErrorCode.NOT_IMPLEMENTED, "order service bu daemon'da başlatılmamış")
+
+    await alarm.approve_pending_order(rec["order_id"])
+
+    executed = None
+    try:
+        executed = await order_service.execute_on_accounts(
+            account_ids=[rec["account_id"]],
+            tags=None,
+            symbol=rec["symbol"],
+            side=rec["side"],
+            entry=rec["entry"],
+            stop_loss=rec["stop_loss"],
+            risk_pct=rec["risk_pct"],
+            idempotency_key=f"pending:{rec['order_id']}",
+            order_type=rec["order_type"] or "MARKET",
+            actor=str(ctx.get("actor", "mcp-agent")),
+        )
+    except Exception:
+        # Emir açılamadı → onayı geri al (kullanıcı tekrar onaylayabilir)
+        await alarm.reject_pending_order(rec["order_id"], reason="emir açılamadı (servis hatası)")
+        raise
+
+    executed_order_id = None
+    if isinstance(executed, dict) and isinstance(executed.get("results"), list) and executed["results"]:
+        first = executed["results"][0]
+        executed_order_id = first.get("order_id") if isinstance(first, dict) else None
+
+    await alarm.mark_pending_executed(rec["order_id"], executed_order_id)
+    return {
+        "order_id": rec["order_id"],
+        "status": "executed",
+        "executed": executed,
+    }, Meta(as_of=utc_iso(), source="order-service", freshness=FRESHNESS_FRESH)
+
+
+async def reject_pending_order_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
+    alarm = _require_alarm_service(ctx)
+    data = await alarm.reject_pending_order(params["order_id"], reason=params.get("reason"))
     return data, Meta(as_of=utc_iso(), source="alarm-engine", freshness=FRESHNESS_FRESH)
 
 
@@ -601,6 +667,9 @@ def build_dispatcher(ctx: dict) -> ToolDispatcher:
     dispatcher.register("list_alerts", list_alerts_handler)
     dispatcher.register("delete_alert", delete_alert_handler)
     dispatcher.register("get_triggered_alerts", get_triggered_alerts_handler)
+    dispatcher.register("get_pending_orders", get_pending_orders_handler)
+    dispatcher.register("approve_pending_order", approve_pending_order_handler)
+    dispatcher.register("reject_pending_order", reject_pending_order_handler)
 
 
     dispatcher.register("enable_real_trading", enable_real_trading_handler)

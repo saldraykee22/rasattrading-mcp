@@ -696,6 +696,25 @@ register_tool(
                 },
                 "cooldown_seconds": {"type": "integer", "minimum": 0, "default": 300},
                 "note": {"type": "string"},
+                "order_spec": {
+                    "type": "object",
+                    "description": (
+                        "Opsiyonel: alarm tetiklenince onay bekleyen emir kaydı oluşturur "
+                        "(awaiting_approval). Emir OTOMATİK açılmaz — approve_pending_order gerekir. "
+                        "Alanlar: account_id (zorunlu), symbol, side (BUY|SELL), order_type (market|limit), "
+                        "entry (limit için zorunlu), stop_loss, risk_pct (0,1]"
+                    ),
+                    "properties": {
+                        "account_id": {"type": "string"},
+                        "symbol": {"type": "string"},
+                        "side": {"type": "string", "enum": ["BUY", "SELL"]},
+                        "order_type": {"type": "string", "enum": ["market", "limit"], "default": "market"},
+                        "entry": {"type": "number"},
+                        "stop_loss": {"type": "number"},
+                        "risk_pct": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+                    },
+                    "required": ["account_id", "symbol", "side"],
+                },
             }
         ),
     )
@@ -760,6 +779,49 @@ register_tool(
                 "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50},
                 "cursor": {"type": "integer"},
             }
+        ),
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="get_pending_orders",
+        description=(
+            "Onay bekleyen emir kayıtlarını listeler (alarm order_spec'i tetiklenince "
+            "awaiting_approval kaydı düşer). status filtresi: awaiting_approval|approved|"
+            "rejected|executed. Emirler otomatik açılmaz — approve_pending_order gerekir."
+        ),
+        input_schema=_alarm_schema(
+            {
+                "status": {
+                    "type": "string",
+                    "enum": ["awaiting_approval", "approved", "rejected", "executed"],
+                },
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50},
+            }
+        ),
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="approve_pending_order",
+        description=(
+            "Onay bekleyen emri onaylar ve GERÇEK emir olarak açar. Boyutlandırma daemon "
+            "tarafında yapılır (risk_pct x hesap equity'si + sembol filtreleri). "
+            "Idempotency: pending:<order_id> key'iyle retry çift emir üretmez. "
+            "Bu işlem gerçek para kullanır — yalnızca kullanıcının açık onayıyla çağrılmalı."
+        ),
+        input_schema=_alarm_schema({"order_id": {"type": "string", "minLength": 1}}),
+    )
+)
+
+register_tool(
+    ToolSpec(
+        name="reject_pending_order",
+        description="Onay bekleyen emri reddeder (emir açılmaz).",
+        input_schema=_alarm_schema(
+            {"order_id": {"type": "string", "minLength": 1}, "reason": {"type": "string"}}
         ),
     )
 )

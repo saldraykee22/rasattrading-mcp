@@ -11,14 +11,18 @@ State machine: `armed → triggered → cooldown → armed`.
   sembol için değerlendirme ertelenir, sessizce eski veriyle tetiklenmez).
 
 Koşullar, screener'daki allowlisted filtre AST'sini kullanır (aynı güvenli
-değerlendirme). v1'de dış bildirim (Telegram/webhook) YOK — bu bir pasif
-kalıcı kayıt defteridir.
+değerlendirme). 2.19: tetiklenmede harici bildirim komutu çalıştırılabilir
+(`notify_command`, örn. `traycer agent send` ile ajana uyandırma); alarm
+tanımı `order_spec` taşıyorsa tetiklenmede `pending_orders`'a onay bekleyen
+emir kaydı düşer — emir OTOMATİK açılmaz, onaylanınca açılır.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import shlex
+import subprocess
 import time
 import uuid
 from typing import Any
@@ -37,11 +41,27 @@ STATE_ARMED = "armed"
 STATE_TRIGGERED = "triggered"
 STATE_COOLDOWN = "cooldown"
 
+PENDING_AWAITING = "awaiting_approval"
+PENDING_APPROVED = "approved"
+PENDING_REJECTED = "rejected"
+PENDING_EXECUTED = "executed"
+PENDING_EXPIRED = "expired"
+
+# order_spec içinde izin verilen anahtarlar (allowlist — serbest parametre yok)
+ORDER_SPEC_KEYS = {"account_id", "symbol", "side", "entry", "stop_loss", "risk_pct", "order_type"}
+
 
 class AlarmService:
-    def __init__(self, db: Database, engine: PAEngine | None = None, compute_budget: int | None = None) -> None:
+    def __init__(
+        self,
+        db: Database,
+        engine: PAEngine | None = None,
+        compute_budget: int | None = None,
+        notify_command: str | None = None,
+    ) -> None:
         self.db = db
         self.engine = engine
+        self._notify_command = notify_command
         # K3: depolanmış analiz yokken talep üzerine `analyze` (ve dolayısıyla
         # warm-up/backfill yükü) başıboş artmasın — her değerlendirme turunda
         # sınırlı sayıda on-demand hesaplamaya izin verilir, aşanlar ertelenir.
@@ -64,6 +84,7 @@ class AlarmService:
         condition: list | dict,
         cooldown_seconds: int = 300,
         note: str | None = None,
+        order_spec: dict | None = None,
     ) -> dict:
         if not isinstance(symbol, str) or not symbol:
             raise RasatError(ErrorCode.INVALID_REQUEST, "symbol zorunlu (string)")
@@ -80,7 +101,31 @@ class AlarmService:
             "cooldown_seconds": cooldown_seconds,
             "note": note,
         }
+        if order_spec is not None:
+            definition["order_spec"] = self._validate_order_spec(order_spec)
         return await self._insert_alert(definition)
+
+    @staticmethod
+    def _validate_order_spec(spec: dict) -> dict:
+        """order_spec allowlist doğrulaması (2.19): yalnızca bilinen anahtarlar."""
+        if not isinstance(spec, dict):
+            raise RasatError(ErrorCode.INVALID_REQUEST, "order_spec nesne olmalı")
+        for key in spec:
+            if key not in ORDER_SPEC_KEYS:
+                raise RasatError(ErrorCode.INVALID_REQUEST, f"order_spec bilinmeyen anahtar: {key}")
+        for required in ("account_id", "symbol", "side"):
+            if not spec.get(required):
+                raise RasatError(ErrorCode.INVALID_REQUEST, f"order_spec.{required} zorunlu")
+        if spec["side"] not in ("BUY", "SELL"):
+            raise RasatError(ErrorCode.INVALID_REQUEST, "order_spec.side BUY|SELL olmalı")
+        if spec.get("order_type", "market") not in ("market", "limit"):
+            raise RasatError(ErrorCode.INVALID_REQUEST, "order_spec.order_type market|limit olmalı")
+        if spec.get("order_type") == "limit" and spec.get("entry") is None:
+            raise RasatError(ErrorCode.INVALID_REQUEST, "limit emir için order_spec.entry zorunlu")
+        risk_pct = spec.get("risk_pct")
+        if risk_pct is not None and not (isinstance(risk_pct, (int, float)) and 0 < risk_pct <= 1):
+            raise RasatError(ErrorCode.INVALID_REQUEST, "order_spec.risk_pct (0,1] aralığında olmalı")
+        return dict(spec)
 
     async def create_composite_alert(
         self,
@@ -177,13 +222,22 @@ class AlarmService:
         return state
 
     async def _maybe_trigger(self, alert_id: str, trigger_key: str, payload: dict, cooldown_seconds: int) -> dict | None:
-        """Koşul eşleşti; dedup + state kontrolü yapıp kalıcı kayda geçer."""
+        """Koşul eşleşti; dedup + state kontrolü yapıp kalıcı kayda geçer.
+
+        2.19: tetiklenmede (a) `notify_command` harici komutu çalıştırılır
+        (ajan uyandırma / bildirim), (b) alarm tanımında `order_spec` varsa
+        `pending_orders`'a `awaiting_approval` kaydı düşer — emir otomatik
+        AÇILMAZ, `approve_pending_order` onayı bekler.
+        """
         now = int(time.time())
+        definition: dict = {}
 
         def _w(conn):
-            row = conn.execute("SELECT state, cooldown_until FROM alerts WHERE alert_id=?", (alert_id,)).fetchone()
+            nonlocal definition
+            row = conn.execute("SELECT state, cooldown_until, definition FROM alerts WHERE alert_id=?", (alert_id,)).fetchone()
             if row is None:
                 raise RasatError(ErrorCode.NOT_FOUND, f"alarm bulunamadı: {alert_id}")
+            definition = json.loads(row["definition"])
             state = self._lazy_state(row["state"], row["cooldown_until"], now)
             if state != STATE_ARMED:
                 return None  # cooldown'da → tetiklenmez
@@ -196,6 +250,18 @@ class AlarmService:
                 "INSERT INTO triggered_alerts (alert_id, trigger_key, payload, triggered_at) VALUES (?,?,?,?)",
                 (alert_id, trigger_key, json.dumps(payload, ensure_ascii=False), now),
             )
+            order_spec = definition.get("order_spec")
+            if order_spec is not None:
+                conn.execute(
+                    "INSERT INTO pending_orders (order_id, alert_id, account_id, symbol, side, order_type, "
+                    "entry, stop_loss, risk_pct, status, created_at, note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        uuid.uuid4().hex, alert_id, order_spec["account_id"], order_spec["symbol"],
+                        order_spec["side"], order_spec.get("order_type", "market"),
+                        order_spec.get("entry"), order_spec.get("stop_loss"), order_spec.get("risk_pct"),
+                        PENDING_AWAITING, now, definition.get("note"),
+                    ),
+                )
             if cooldown_seconds > 0:
                 conn.execute(
                     "UPDATE alerts SET state=?, cooldown_until=?, updated_at=? WHERE alert_id=?",
@@ -208,7 +274,45 @@ class AlarmService:
                 )
             return {"alert_id": alert_id, "trigger_key": trigger_key, "triggered_at": now}
 
-        return await self.db.write(_w)
+        res = await self.db.write(_w)
+        if res is not None:
+            self._notify(definition, payload, res.get("alert_id"))
+        return res
+
+    def _notify(self, definition: dict, payload: dict, alert_id: str | None = None) -> None:
+        """Harici bildirim komutu (2.19): fire-and-forget, daemon'u bloklamaz.
+
+        Komut şablonunda {alert_id}, {symbol}, {timeframe}, {note}, {price}
+        yer tutucuları tetiklenme verisiyle doldurulur.
+        """
+        command = self._notify_command
+        if not command:
+            return
+        fmt = {
+            "alert_id": str(alert_id or payload.get("alert_id", "")),
+            "symbol": str(payload.get("symbol", "")),
+            "timeframe": str(payload.get("timeframe", "")),
+            "note": str(definition.get("note", "") or ""),
+            "price": str(payload.get("close", "") or ""),
+        }
+        rendered = command
+        for key, value in fmt.items():
+            rendered = rendered.replace("{" + key + "}", value)
+        try:
+            if hasattr(subprocess, "CREATE_NO_WINDOW"):
+                flags = subprocess.CREATE_NO_WINDOW
+            else:
+                flags = 0
+            subprocess.Popen(
+                rendered if not rendered.split() else rendered,
+                shell=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=flags,
+            )
+            logger.info("alarm bildirimi gönderildi: %s", payload.get("alert_id"))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("alarm bildirimi başarısız: %s", exc)
 
     # ---------- değerlendirme ----------
 
@@ -453,6 +557,112 @@ class AlarmService:
             ],
             "next_cursor": (cursor or 0) + len(rows) if has_more else None,
         }
+
+    # ---------- onay bekleyen emirler (2.19) ----------
+
+    async def get_pending_orders(self, status: str | None = None, limit: int = 50) -> dict:
+        """Onay bekleyen / geçmiş bekleyen emir kayıtlarını listeler."""
+        if not 1 <= limit <= 500:
+            raise RasatError(ErrorCode.INVALID_REQUEST, f"limit 1-500 arası olmalı (verildi: {limit})")
+        if status is not None and status not in (PENDING_AWAITING, PENDING_APPROVED, PENDING_REJECTED, PENDING_EXECUTED, PENDING_EXPIRED):
+            raise RasatError(ErrorCode.INVALID_REQUEST, f"bilinmeyen status: {status}")
+
+        def _q(conn):
+            sql = "SELECT * FROM pending_orders"
+            params: tuple = ()
+            if status:
+                sql += " WHERE status=?"
+                params = (status,)
+            sql += " ORDER BY created_at DESC LIMIT ?"
+            rows = conn.execute(sql, params + (limit,)).fetchall()
+            return [dict(r) for r in rows]
+
+        rows = await self.db.read(_q)
+        return {
+            "pending": [
+                {
+                    "order_id": r["order_id"],
+                    "alert_id": r["alert_id"],
+                    "account_id": r["account_id"],
+                    "symbol": r["symbol"],
+                    "side": r["side"],
+                    "order_type": r["order_type"],
+                    "entry": r["entry"],
+                    "stop_loss": r["stop_loss"],
+                    "risk_pct": r["risk_pct"],
+                    "status": r["status"],
+                    "note": r["note"],
+                    "created_at": r["created_at"],
+                    "executed_order_id": r["executed_order_id"],
+                }
+                for r in rows
+            ],
+            "count": len(rows),
+        }
+
+    async def _pending_order(self, order_id: str) -> dict:
+        def _q(conn):
+            row = conn.execute("SELECT * FROM pending_orders WHERE order_id=?", (order_id,)).fetchone()
+            return dict(row) if row else None
+
+        rec = await self.db.read(_q)
+        if rec is None:
+            raise RasatError(ErrorCode.NOT_FOUND, f"bekleyen emir bulunamadı: {order_id}")
+        return rec
+
+    async def approve_pending_order(self, order_id: str) -> dict:
+        """Onay: `awaiting_approval → approved`. Emir açma handler'da yapılır."""
+        now = int(time.time())
+
+        def _w(conn):
+            cur = conn.execute(
+                "UPDATE pending_orders SET status=?, approved_at=? WHERE order_id=? AND status=?",
+                (PENDING_APPROVED, now, order_id, PENDING_AWAITING),
+            )
+            if cur.rowcount == 0:
+                row = conn.execute("SELECT status FROM pending_orders WHERE order_id=?", (order_id,)).fetchone()
+                if row is None:
+                    raise RasatError(ErrorCode.NOT_FOUND, f"bekleyen emir bulunamadı: {order_id}")
+                raise RasatError(ErrorCode.INVALID_REQUEST, f"onaylanabilir durumda değil: {row['status']}")
+            return {"order_id": order_id, "status": PENDING_APPROVED}
+
+        return await self.db.write(_w)
+
+    async def reject_pending_order(self, order_id: str, reason: str | None = None) -> dict:
+        """Red: `awaiting_approval → rejected` (emir açılmaz)."""
+        now = int(time.time())
+
+        def _w(conn):
+            cur = conn.execute(
+                "UPDATE pending_orders SET status=?, rejected_at=?, reject_reason=? WHERE order_id=? AND status=?",
+                (PENDING_REJECTED, now, reason, order_id, PENDING_AWAITING),
+            )
+            if cur.rowcount == 0:
+                row = conn.execute("SELECT status FROM pending_orders WHERE order_id=?", (order_id,)).fetchone()
+                if row is None:
+                    raise RasatError(ErrorCode.NOT_FOUND, f"bekleyen emir bulunamadı: {order_id}")
+                raise RasatError(ErrorCode.INVALID_REQUEST, f"reddedilebilir durumda değil: {row['status']}")
+            return {"order_id": order_id, "status": PENDING_REJECTED}
+
+        return await self.db.write(_w)
+
+    async def mark_pending_executed(self, order_id: str, executed_order_id: str | None) -> dict:
+        """Emir açıldıktan sonra `approved → executed` (audit izi)."""
+        now = int(time.time())
+
+        def _w(conn):
+            cur = conn.execute(
+                "UPDATE pending_orders SET status=?, executed_order_id=? WHERE order_id=? AND status=?",
+                (PENDING_EXECUTED, executed_order_id, order_id, PENDING_APPROVED),
+            )
+            if cur.rowcount == 0:
+                row = conn.execute("SELECT status FROM pending_orders WHERE order_id=?", (order_id,)).fetchone()
+                if row is None:
+                    raise RasatError(ErrorCode.NOT_FOUND, f"bekleyen emir bulunamadı: {order_id}")
+                raise RasatError(ErrorCode.INVALID_REQUEST, f"executed'a geçilebilir durumda değil: {row['status']}")
+            return {"order_id": order_id, "status": PENDING_EXECUTED}
+
+        return await self.db.write(_w)
 
     @staticmethod
     def _summary(alert_id: str, definition: dict, state: str, created_at: int, cooldown_until: int | None = None) -> dict:

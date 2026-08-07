@@ -131,7 +131,9 @@ class DaemonRunner:
         from ..pa.alarms import AlarmService
 
         pa_engine = PAEngine(self.db, pipeline=self.pipeline, config=self.config)
-        alarm_service = AlarmService(self.db, engine=pa_engine)
+        alarm_service = AlarmService(
+            self.db, engine=pa_engine, notify_command=self.config.alarm_notify_command
+        )
         pa_engine.alarm_service = alarm_service
         self.pa_engine = pa_engine
         self.alarm_service = alarm_service

@@ -276,6 +276,41 @@ def _m7_orders_equity_snapshot(conn: sqlite3.Connection) -> None:
     conn.execute("ALTER TABLE orders ADD COLUMN equity_snapshot REAL")
 
 
+def _m8_pending_orders(conn: sqlite3.Connection) -> None:
+    """Alarm → onay bekleyen emir kayıtları (2.19).
+
+    Alarm tetiklenip `order_spec` taşıdığında `awaiting_approval` kaydı düşer.
+    Emir OTOMATİK açılmaz: `approve_pending_order` onayında gerçek emir
+    açılır (`executed_order_id` doldurulur), `reject_pending_order` iptal eder.
+    `approved_at`/`executed_order_id` onay akışının audit izidir.
+    """
+    conn.executescript(
+        """
+        CREATE TABLE pending_orders (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          order_id TEXT NOT NULL UNIQUE,
+          alert_id TEXT NOT NULL,
+          account_id TEXT NOT NULL,
+          symbol TEXT NOT NULL,
+          side TEXT NOT NULL,
+          order_type TEXT NOT NULL DEFAULT 'market',
+          entry REAL,
+          stop_loss REAL,
+          risk_pct REAL,
+          status TEXT NOT NULL DEFAULT 'awaiting_approval',
+          note TEXT,
+          created_at INTEGER NOT NULL,
+          approved_at INTEGER,
+          rejected_at INTEGER,
+          executed_order_id TEXT,
+          reject_reason TEXT
+        );
+        CREATE INDEX idx_pending_orders_status ON pending_orders (status, created_at);
+        CREATE INDEX idx_pending_orders_alert ON pending_orders (alert_id);
+        """
+    )
+
+
 MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (1, "initial_schema", _m1_initial_schema),
     (2, "indexes", _m2_indexes),
@@ -284,6 +319,7 @@ MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (5, "orders", _m5_orders),
     (6, "emergency_reconciled", _m6_emergency_reconciled),
     (7, "orders_equity_snapshot", _m7_orders_equity_snapshot),
+    (8, "pending_orders", _m8_pending_orders),
 ]
 
 
