@@ -174,6 +174,7 @@ class DaemonRunner:
                 self.config.rest_spot_base,
                 credentials=lambda account_id: self.account_service.get_credentials(account_id),
                 budget=self.pipeline.budget,
+                clock=self.pipeline.clock,
             )
             order_service = OrderService(
                 self.db,

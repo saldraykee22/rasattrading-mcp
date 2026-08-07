@@ -27,6 +27,7 @@ import aiohttp
 import yarl
 
 from ..errors import ErrorCode, RasatError
+from .clock import BinanceClock
 from .rate_limit import RateLimitBudget
 
 logger = logging.getLogger("rasattrading.data.orders")
@@ -132,6 +133,7 @@ class BinanceOrderBroker:
         session: aiohttp.ClientSession | None = None,
         recv_window_ms: int = 10_000,
         timeout_seconds: float = 20.0,
+        clock: BinanceClock | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._credentials = credentials
@@ -140,11 +142,29 @@ class BinanceOrderBroker:
         self._own_session = session is None
         self._recv_window_ms = recv_window_ms
         self._timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+        #: T1-koord: imzalı istek timestamp'i için BinanceClock (server-time
+        #: offset'li). Verilirse `_signed_request_url` `clock.server_now()` kullanır;
+        #: verilmezse (veya clock fail-closed → None) eski `time.time()` fallback'i
+        #: korunur — geriye uyumluluk.
+        self._clock = clock
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(timeout=self._timeout)
         return self._session
+
+    def _now_ms(self) -> int:
+        """İmzalı istek timestamp'i (ms).
+
+        `clock` verilmişse ve `server_now()` güvenilir sunucu zamanı döndürüyorsa
+        onu kullan (host saat kaymasına karşı -1021/1022 koruması); clock yoksa
+        veya fail-closed (None) ise eski yerel `time.time()` fallback'i.
+        """
+        if self._clock is not None:
+            server_now = self._clock.server_now()
+            if server_now is not None:
+                return int(server_now * 1000)
+        return int(time.time() * 1000)
 
     async def _signed_request_url(self, account_id: str, path: str, params: dict) -> tuple[str, str]:
         """İmzalı isteğin (api_key, tam URL) çiftini üretir.
@@ -156,7 +176,8 @@ class BinanceOrderBroker:
         """
         api_key, api_secret = await self._credentials(account_id)
         base = dict(params)
-        base["timestamp"] = int(time.time() * 1000)
+        now = self._now_ms()
+        base["timestamp"] = now
         base["recvWindow"] = self._recv_window_ms
         url = yarl.URL(f"{self._base_url}{path}").with_query(base)
         signature = hmac.new(api_secret.encode("utf-8"), url.query_string.encode("utf-8"), hashlib.sha256).hexdigest()

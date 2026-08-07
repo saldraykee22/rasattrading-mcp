@@ -570,3 +570,111 @@ async def test_find_unprotected_positions_reports_account_errors(cfg, db):
     assert any(e["account_id"] == bad_id for e in result["errors"])
     assert any(e["error"]["code"] == ErrorCode.TIMEOUT for e in result["errors"])
     assert result["account_count"] == 2
+
+
+# ---------- T1-koord: BinanceClock broker'a enjeksiyonu (signed timestamp) ----------
+
+
+async def test_broker_signed_timestamp_uses_clock_server_now():
+    """clock verilirse imzalı istek timestamp'i `clock.server_now()`'dan gelir (host saatine değil)."""
+    import hashlib
+    import hmac
+    import time
+
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+
+    from rasattrading_mcp.data.rate_limit import RateLimitBudget
+    from tests.helpers import FakeClock
+
+    api_key = "TESTKEY0000000000000000000000000000"
+    api_secret = "TESTSECRET00000000000000000000000000"
+    received: dict = {}
+
+    def _verify(request):
+        qs = request.query_string
+        params = dict(request.query)
+        signature = params.pop("signature", None)
+        if not signature:
+            return False
+        signed_part = qs[: qs.index("&signature=")]
+        expected = hmac.new(api_secret.encode(), signed_part.encode(), hashlib.sha256).hexdigest()
+        return expected == signature
+
+    async def order_handler(request):
+        if not _verify(request):
+            return web.json_response({"code": -1022}, status=400)
+        received["params"] = dict(request.query)
+        return web.json_response(
+            {"symbol": "ALICEUSDT", "orderId": 1, "status": "NEW", "executedQty": "0", "cummulativeQuoteQty": "0"}
+        )
+
+    app = web.Application()
+    app.router.add_get("/api/v3/order", order_handler)
+    async with TestServer(app) as server:
+        async def creds(_aid):
+            return (api_key, api_secret)
+
+        # offset = +300s → server_now() = local + 300
+        clock = FakeClock(offset=300.0)
+        broker = BinanceOrderBroker(
+            server.make_url("/").human_repr(),
+            credentials=creds,
+            budget=RateLimitBudget(6000),
+            clock=clock,
+        )
+        try:
+            expected_ms = int((time.time() + 300.0) * 1000)
+            await broker.query_order(account_id="a1", symbol="ALICEUSDT", client_order_id="oco-1")
+            got = int(received["params"]["timestamp"])
+            assert abs(got - expected_ms) < 5000  # clock.server_now() (offset uygulanmış)
+            # host saatinden (offset'siz) net ayrılmalı — 300s fark test edilebilir
+            assert got > int(time.time() * 1000) + 250_000
+        finally:
+            await broker.close()
+
+
+async def test_broker_signed_timestamp_falls_back_to_local_when_clock_unavailable():
+    """clock fail-closed (server_now → None) ise eski `time.time()` fallback'i korunur."""
+    import hashlib
+    import hmac
+    import time
+
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+
+    from rasattrading_mcp.data.rate_limit import RateLimitBudget
+    from tests.helpers import FakeClock
+
+    api_key = "TESTKEY0000000000000000000000000000"
+    api_secret = "TESTSECRET00000000000000000000000000"
+    received: dict = {}
+
+    async def order_handler(request):
+        received["params"] = dict(request.query)
+        return web.json_response(
+            {"symbol": "ALICEUSDT", "orderId": 1, "status": "NEW", "executedQty": "0", "cummulativeQuoteQty": "0"}
+        )
+
+    app = web.Application()
+    app.router.add_get("/api/v3/order", order_handler)
+    async with TestServer(app) as server:
+        async def creds(_aid):
+            return (api_key, api_secret)
+
+        clock = FakeClock(offset=300.0)
+        clock.set_available(False)  # server_now → None
+        broker = BinanceOrderBroker(
+            server.make_url("/").human_repr(),
+            credentials=creds,
+            budget=RateLimitBudget(6000),
+            clock=clock,
+        )
+        try:
+            before = int(time.time() * 1000)
+            await broker.query_order(account_id="a1", symbol="ALICEUSDT", client_order_id="oco-1")
+            got = int(received["params"]["timestamp"])
+            after = int(time.time() * 1000)
+            assert before <= got <= after  # yerel saat fallback'i (offset uygulanmadı)
+        finally:
+            await broker.close()
