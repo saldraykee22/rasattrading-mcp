@@ -113,6 +113,33 @@ async def seed(db, symbol, rows, n_extra_flat=100):
     await db.write(_w)
 
 
+async def _seed_with_volumes(db, symbol, ohlc, volumes):
+    latest_closed = int(time.time() // PERIOD) * PERIOD - PERIOD
+    n = len(ohlc)
+
+    def _w(conn):
+        for i, (o, h, l, c) in enumerate(ohlc):
+            conn.execute(
+                "INSERT INTO candles (symbol, timeframe, open_time, open, high, low, close, volume, source, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (symbol, TF, latest_closed - (n - 1 - i) * PERIOD, o, h, l, c, volumes[i], "spot", int(time.time())),
+            )
+
+    await db.write(_w)
+
+
+async def _seed_futures(db, symbol, ftype, times_values):
+    now = int(time.time())
+
+    def _w(conn):
+        conn.executemany(
+            "INSERT INTO futures_context (symbol, type, event_time, value, fetched_at, freshness) VALUES (?,?,?,?,?,?)",
+            [(symbol, ftype, t, v, now, "fresh") for t, v in times_values],
+        )
+
+    await db.write(_w)
+
+
 # ---------------------------------------------------------------------------
 # S1 — structure_event: gerçek son BOS artık makul since_bars ile eşleşiyor
 # ---------------------------------------------------------------------------
@@ -301,3 +328,33 @@ async def test_2_16_matched_filters_or_semantics(db):
     bmt = next(s for s in res["symbols"] if s["symbol"] == "BMTUSDT")
     assert "structure_event" in bmt["matched_filters"]
     assert "price_change" not in bmt["matched_filters"]  # %500 değişim yok → eşleşmedi
+
+
+async def test_2_16_signal_summary_price_change_has_pct(db):
+    """price_change eşleşmesi gerçek % değerini signal_summary'de taşır (denetlenebilirlik)."""
+    await seed(db, "BMTUSDT", breakout_series(193))
+    screener = Screener(db)
+    res = await screener.scan([{"type": "price_change", "window_bars": 10, "min": 1.0}])
+    bmt = next(s for s in res["symbols"] if s["symbol"] == "BMTUSDT")
+    assert "price 10bar +1.96%" in bmt["signal_summary"]
+
+
+async def test_2_16_signal_summary_volume_change_has_pct(db):
+    """volume_change eşleşmesi gerçek % değerini signal_summary'de taşır (denetlenebilirlik)."""
+    rows = [(100, 100.5, 99.5, 100)] * 48
+    vols = [10.0] * 24 + [15.0] * 24  # son 24 bar önceki 24 bara göre +%50
+    await _seed_with_volumes(db, "BMTUSDT", rows, vols)
+    screener = Screener(db)
+    res = await screener.scan([{"type": "volume_change", "recent_bars": 24, "baseline_bars": 24}])
+    bmt = next(s for s in res["symbols"] if s["symbol"] == "BMTUSDT")
+    assert "volume 24/24bar +50.00%" in bmt["signal_summary"]
+
+
+async def test_2_16_signal_summary_oi_change_has_pct(db):
+    """oi_change eşleşmesi gerçek % değerini signal_summary'de taşır (denetlenebilirlik)."""
+    await _seed_with_volumes(db, "BTCUSDT", [(100, 100.5, 99.5, 100)] * 48, [10.0] * 48)
+    await _seed_futures(db, "BTCUSDT", "open_interest", [(100, 10.0), (200, 30.0)])  # +%200
+    screener = Screener(db)
+    res = await screener.scan([{"type": "oi_change", "window": 1}])
+    btc = next(s for s in res["symbols"] if s["symbol"] == "BTCUSDT")
+    assert "oi 1bar +200.00%" in btc["signal_summary"]

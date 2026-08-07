@@ -148,26 +148,50 @@ def _between(value: float | None, lo: float | None, hi: float | None) -> bool:
     return True
 
 
-def _eval_volume_change(f: dict, ctx: dict) -> bool:
+def _price_change_pct(ctx: dict, window_bars: int) -> float | None:
+    closes = [c["close"] for c in ctx["candles"]]
+    w = window_bars
+    if len(closes) < w + 1:
+        return None
+    base = closes[-w - 1]
+    if not base:
+        return None
+    return (closes[-1] / base - 1.0) * 100.0
+
+
+def _volume_change_pct(ctx: dict, recent_bars: int, baseline_bars: int) -> float | None:
     vols = [c["volume"] or 0.0 for c in ctx["candles"]]
-    recent = f["recent_bars"]
-    baseline = f["baseline_bars"]
+    recent = recent_bars
+    baseline = baseline_bars
     if len(vols) < recent + baseline:
-        return False
+        return None
     recent_sum = sum(vols[-recent:])
     base_sum = sum(vols[-recent - baseline : -recent])
     if base_sum <= 0:
-        return False
-    pct = (recent_sum / base_sum - 1.0) * 100.0
+        return None
+    return (recent_sum / base_sum - 1.0) * 100.0
+
+
+def _oi_change_pct(ctx: dict, window: int) -> float | None:
+    series = ctx.get("oi_series") or []
+    fresh = [s for s in series if s.get("freshness") == "fresh"]
+    w = window
+    if len(fresh) < w + 1:
+        return None
+    latest = fresh[-1]["value"]
+    base = fresh[-1 - w]["value"]
+    if not latest or not base:
+        return None
+    return (latest / base - 1.0) * 100.0
+
+
+def _eval_volume_change(f: dict, ctx: dict) -> bool:
+    pct = _volume_change_pct(ctx, f["recent_bars"], f["baseline_bars"])
     return _between(pct, f.get("min"), f.get("max"))
 
 
 def _eval_price_change(f: dict, ctx: dict) -> bool:
-    closes = [c["close"] for c in ctx["candles"]]
-    w = f["window_bars"]
-    if len(closes) < w + 1:
-        return False
-    pct = (closes[-1] / closes[-w - 1] - 1.0) * 100.0
+    pct = _price_change_pct(ctx, f["window_bars"])
     return _between(pct, f.get("min"), f.get("max"))
 
 
@@ -233,16 +257,7 @@ def _eval_funding_rate(f: dict, ctx: dict) -> bool:
 
 
 def _eval_oi_change(f: dict, ctx: dict) -> bool:
-    series = ctx.get("oi_series") or []
-    fresh = [s for s in series if s.get("freshness") == "fresh"]
-    w = f["window"]
-    if len(fresh) < w + 1:
-        return False
-    latest = fresh[-1]["value"]
-    base = fresh[-1 - w]["value"]
-    if not latest or not base:
-        return False
-    pct = (latest / base - 1.0) * 100.0
+    pct = _oi_change_pct(ctx, f["window"])
     return _between(pct, f.get("min"), f.get("max"))
 
 
@@ -334,11 +349,17 @@ def _signal_summary(f: dict, ctx: dict) -> str:
         dd = f"{diff:+.2f}%" if diff is not None else "?"
         return f"vwap {f['position']} ({dd})"
     if ftype == "price_change":
-        return f"price {f['window_bars']}bar"
+        pct = _price_change_pct(ctx, f["window_bars"])
+        d = f"{pct:+.2f}%" if pct is not None else "?"
+        return f"price {f['window_bars']}bar {d}"
     if ftype == "volume_change":
-        return f"volume {f['recent_bars']}/{f['baseline_bars']}bar"
+        pct = _volume_change_pct(ctx, f["recent_bars"], f["baseline_bars"])
+        d = f"{pct:+.2f}%" if pct is not None else "?"
+        return f"volume {f['recent_bars']}/{f['baseline_bars']}bar {d}"
     if ftype == "oi_change":
-        return f"oi {f['window']}bar"
+        pct = _oi_change_pct(ctx, f["window"])
+        d = f"{pct:+.2f}%" if pct is not None else "?"
+        return f"oi {f['window']}bar {d}"
     return ftype
 
 
