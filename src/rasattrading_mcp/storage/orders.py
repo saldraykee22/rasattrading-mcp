@@ -49,6 +49,7 @@ _ORDER_COLUMNS = (
     "quantity",
     "price",
     "stop_price",
+    "stop_limit_price",
     "status",
     "exchange_order_id",
     "client_order_id",
@@ -272,15 +273,17 @@ class OrderService:
         status: str,
         client_order_id: str,
         stop_price: float | None = None,
+        stop_limit_price: float | None = None,
     ) -> dict:
         now = int(time.time())
         order_id = uuid.uuid4().hex
         conn.execute(
             "INSERT INTO orders "
-            "(order_id, account_id, idempotency_key, symbol, side, order_type, quantity, price, stop_price, status, "
+            "(order_id, account_id, idempotency_key, symbol, side, order_type, quantity, price, stop_price, "
+            " stop_limit_price, status, "
             " client_order_id, executed_qty, avg_price, fee, notional, reference_price, equity_snapshot, "
             " created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,0,0,0,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,0,0,?,?,?,?,?)",
             (
                 order_id,
                 account_id,
@@ -291,6 +294,7 @@ class OrderService:
                 quantity,
                 price,
                 stop_price,
+                stop_limit_price,
                 status,
                 client_order_id,
                 notional,
@@ -310,6 +314,7 @@ class OrderService:
             "quantity": quantity,
             "price": price,
             "stop_price": stop_price,
+            "stop_limit_price": stop_limit_price,
             "status": status,
             "exchange_order_id": None,
             "client_order_id": client_order_id,
@@ -369,6 +374,7 @@ class OrderService:
             "quantity": order["quantity"],
             "price": order.get("price"),
             "stop_price": order.get("stop_price"),
+            "stop_limit_price": order.get("stop_limit_price"),
             "notional": order["notional"],
             "order_id": order.get("order_id"),
             "exchange_order_id": order.get("exchange_order_id"),
@@ -491,6 +497,249 @@ class OrderService:
                 idempotency_key=idempotency_key.strip(),
                 actor=actor or "mcp-agent",
             )
+
+    # ---------- OCO emirleri (2.21) ----------
+
+    async def place_oco_order(
+        self,
+        *,
+        account_id: str,
+        symbol: str,
+        side: str,
+        quantity: float,
+        price: float,
+        stop_price: float,
+        stop_limit_price: float,
+        idempotency_key: str,
+        actor: str = "mcp-agent",
+    ) -> dict[str, Any]:
+        """Spot OCO: kâr hedefi (LIMIT) + stop (STOP_LOSS_LIMIT) tek emir listesinde.
+
+        Biri dolunca diğeri borsada otomatik iptal olur. Aynı pozisyon için ayrı
+        ayrı SL+TP emri bakiyeyi birbirinden çaldığı için imkânsızdı; bu çağrı
+        ikisini tek `orderList` olarak taşır.
+        """
+        if not isinstance(account_id, str) or not account_id.strip():
+            raise RasatError(ErrorCode.INVALID_REQUEST, "account_id zorunlu (string)")
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise RasatError(ErrorCode.INVALID_REQUEST, "idempotency_key zorunlu (string)")
+        symbol = self._require_string(symbol, "symbol")
+        side = self._require_string(side, "side")
+        quantity = self._require_number(quantity, "quantity")
+        price = self._require_number(price, "price")
+        stop_price = self._require_number(stop_price, "stop_price")
+        stop_limit_price = self._require_number(stop_limit_price, "stop_limit_price")
+        if side.upper() == "SELL" and stop_limit_price >= stop_price:
+            raise RasatError(
+                ErrorCode.INVALID_REQUEST,
+                "stop_limit_price stop_price'dan düşük olmalı (stop tetiklenince satış limiti)",
+            )
+        lock = self._lock(account_id.strip())
+        async with lock:
+            return await self._execute_oco_direct(
+                account_id.strip(),
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                price=price,
+                stop_price=stop_price,
+                stop_limit_price=stop_limit_price,
+                idempotency_key=idempotency_key.strip(),
+                actor=actor or "mcp-agent",
+            )
+
+    async def _execute_oco_direct(
+        self,
+        account_id: str,
+        *,
+        symbol: str,
+        side: str,
+        quantity: float,
+        price: float,
+        stop_price: float,
+        stop_limit_price: float,
+        idempotency_key: str,
+        actor: str,
+    ) -> dict:
+        account = await self.accounts.get_account(account_id)
+        existing = await self.db.read(lambda conn: self._load_order(conn, account_id, idempotency_key))
+        if existing is not None:
+            return await self._handle_existing(account, existing)
+
+        is_real = await self._is_real(account)
+        if not await self.market.symbol_valid(symbol):
+            raise RasatError(ErrorCode.INVALID_SYMBOL, f"evrende bilinmeyen sembol: {symbol}")
+        market_price = await self.market.price(symbol)
+        check_price_fresh(FRESHNESS_FRESH if market_price is not None else None, symbol)
+        # Stop yönü (spot OCO): SELL = eldeki long'u kapatmak → stop girişin ALTINDA.
+        # `check_stop_direction` SELL'i short-açma sayar (stop üstte ister); spot
+        # kapatma için ayrıca doğrulanır.
+        if side.upper() == "SELL" and stop_price >= market_price:
+            raise RasatError(
+                ErrorCode.INVALID_REQUEST,
+                "SELL OCO'da stop_price giriş fiyatının altında olmalı (long kapatma)",
+            )
+        if side.upper() == "BUY" and stop_price <= market_price:
+            raise RasatError(
+                ErrorCode.INVALID_REQUEST,
+                "BUY OCO'da stop_price giriş fiyatının üstünde olmalı",
+            )
+        notional = quantity * price
+
+        # 3.8: serbest bakiye gate'i — OCO iki emri de borsada kilitler, free yeterli olmalı.
+        filters = await self.market.filters(symbol)
+        base_asset = filters.base_asset if filters else (
+            symbol[: -len("USDT")] if symbol.endswith("USDT") else symbol
+        )
+        balances = await self.broker.get_balance(account_id=account_id)
+        self._check_available_balance(
+            balances=balances, side=(side or "BUY").upper(), symbol=symbol,
+            base_asset=base_asset, quote_asset="USDT",
+            quantity=quantity, notional=notional, fee=notional * self.default_fee_rate,
+        )
+
+        policy = await self.risk.get_policy(account_id)
+        exposure_after = await self._current_exposure(account_id, "USDT") + notional
+        await self._enforce_caps_or_override(account, policy, symbol, notional, exposure_after, idempotency_key)
+
+        equity = await self._equity_from_balances(balances, "USDT")
+
+        from ..data.order_broker import to_client_order_id
+
+        client_order_id = to_client_order_id(idempotency_key)
+
+        if not is_real:
+            def _insert(conn: sqlite3.Connection) -> dict:
+                order = self._insert_order(
+                    conn,
+                    account_id=account_id,
+                    idempotency_key=idempotency_key,
+                    symbol=symbol,
+                    side=side,
+                    order_type="OCO",
+                    quantity=quantity,
+                    price=price,
+                    notional=notional,
+                    reference_price=market_price,
+                    equity_snapshot=equity,
+                    status=STATUS_PAPER,
+                    client_order_id=client_order_id,
+                    stop_price=stop_price,
+                    stop_limit_price=stop_limit_price,
+                )
+                if self.audit is not None:
+                    self.audit.append_in_connection(
+                        conn,
+                        actor=actor,
+                        action="place_oco_paper",
+                        details={
+                            "account_id": account_id,
+                            "order_id": order["order_id"],
+                            "symbol": symbol,
+                            "side": side,
+                            "quantity": quantity,
+                            "price": price,
+                            "stop_price": stop_price,
+                            "stop_limit_price": stop_limit_price,
+                        },
+                    )
+                return order
+
+            order = await self.db.write(_insert)
+            return self._order_to_result(order, position_size=quantity)
+
+        def _insert(conn: sqlite3.Connection) -> dict:
+            return self._insert_order(
+                conn,
+                account_id=account_id,
+                idempotency_key=idempotency_key,
+                symbol=symbol,
+                side=side,
+                order_type="OCO",
+                quantity=quantity,
+                price=price,
+                notional=notional,
+                reference_price=market_price,
+                equity_snapshot=equity,
+                status="NEW",
+                client_order_id=client_order_id,
+                stop_price=stop_price,
+                stop_limit_price=stop_limit_price,
+            )
+
+        order = await self.db.write(_insert)
+        try:
+            result = await self.broker.place_oco(
+                account_id=account_id,
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                price=price,
+                stop_price=stop_price,
+                stop_limit_price=stop_limit_price,
+                client_order_id=client_order_id,
+            )
+        except RasatError as exc:
+            if exc.code == ErrorCode.TIMEOUT:
+                return await self._reconcile_after_timeout(
+                    account, order, symbol, client_order_id, actor
+                )
+            status = "REJECTED" if exc.code == ErrorCode.ORDER_REJECTED else "UNKNOWN"
+
+            def _fail(conn: sqlite3.Connection) -> None:
+                self._update_order(
+                    conn,
+                    order["order_id"],
+                    status=status,
+                    error_code=exc.code,
+                    error_message=exc.message,
+                )
+                if self.audit is not None:
+                    self.audit.append_in_connection(
+                        conn,
+                        actor=actor,
+                        action="place_oco_failed",
+                        details={
+                            "account_id": account_id,
+                            "order_id": order["order_id"],
+                            "symbol": symbol,
+                            "error_code": exc.code,
+                        },
+                    )
+
+            await self.db.write(_fail)
+            order = {**order, "status": status, "error_code": exc.code, "error_message": exc.message}
+            return self._order_to_result(order, position_size=quantity)
+
+        def _fill(conn: sqlite3.Connection) -> dict:
+            self._update_order(
+                conn,
+                order["order_id"],
+                status=result.status,
+                exchange_order_id=result.exchange_order_id,
+                executed_qty=result.executed_qty,
+                avg_price=result.avg_price,
+            )
+            if self.audit is not None:
+                self.audit.append_in_connection(
+                    conn,
+                    actor=actor,
+                    action="place_oco",
+                    details={
+                        "account_id": account_id,
+                        "order_id": order["order_id"],
+                        "symbol": symbol,
+                        "side": side,
+                        "quantity": quantity,
+                        "price": price,
+                        "stop_price": stop_price,
+                        "stop_limit_price": stop_limit_price,
+                    },
+                )
+            return order
+
+        order = await self.db.write(_fill)
+        return self._order_to_result(order, position_size=quantity)
 
     # ---------- tekil emirler ----------
 

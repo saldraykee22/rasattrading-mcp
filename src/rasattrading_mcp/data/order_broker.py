@@ -231,6 +231,47 @@ class BinanceOrderBroker:
         data = await self._request("POST", "/api/v3/order", account_id, params)
         return self._order_result(data)
 
+    async def place_oco(
+        self,
+        *,
+        account_id: str,
+        symbol: str,
+        side: str,
+        quantity: float,
+        price: float,
+        stop_price: float,
+        stop_limit_price: float,
+        client_order_id: str,
+    ) -> OrderResult:
+        """Spot OCO emri (`/api/v3/orderList/oco`): LIMIT + STOP_LOSS_LIMIT tek istekte.
+
+        Biri dolunca diğeri borsada otomatik iptal olur (true OCO garantisi).
+        `price` = kâr hedefi (limit), `stop_price` = stop tetikleme,
+        `stop_limit_price` = stop tetiklenince satılacak limit fiyatı.
+        Aynı pozisyon için ayrı ayrı SL+TP emri bakiyeyi birbirinden çaldığı için
+        mümkün değildi; bu çağrı ikisini tek emir listesinde taşır.
+        """
+        params: dict[str, Any] = {
+            "symbol": symbol,
+            "side": side,
+            "quantity": str(quantity),
+            "price": str(price),
+            "stopPrice": str(stop_price),
+            "stopLimitPrice": str(stop_limit_price),
+            "stopLimitTimeInForce": "GTC",
+        }
+        if client_order_id:
+            params["listClientOrderId"] = client_order_id
+        data = await self._request("POST", "/api/v3/orderList/oco", account_id, params)
+        # OCO yanıtı orderListId taşır (orderId değil) — listeyi iz olarak sakla.
+        return OrderResult(
+            status="NEW",
+            exchange_order_id=str(data.get("orderListId")) if data.get("orderListId") is not None else None,
+            executed_qty=0.0,
+            avg_price=0.0,
+            raw=data,
+        )
+
     async def query_order(self, *, account_id: str, symbol: str, client_order_id: str) -> OrderResult | None:
         try:
             data = await self._request(

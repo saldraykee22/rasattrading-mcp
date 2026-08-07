@@ -392,6 +392,35 @@ register_tool(
 
 register_tool(
     ToolSpec(
+        name="place_oco_order",
+        description=(
+            "Spot OCO emri: kâr hedefi (LIMIT) + stop (STOP_LOSS_LIMIT) TEK emir listesinde. "
+            "Biri dolunca diğeri borsada otomatik iptal olur (true OCO). Aynı pozisyon için "
+            "ayrı ayrı SL+TP emri bakiyeyi birbirinden çaldığı için imkânsızdır; bu tool ikisini "
+            "tek `orderList/oco` çağrısında taşır. price=TP, stop_price=stop tetikleme, "
+            "stop_limit_price=stop tetiklenince satılacak limit (stop_price'dan düşük olmalı)."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "account_id": {"type": "string", "minLength": 1},
+                "symbol": {"type": "string", "description": "Spot USDT çifti, örn. ALICEUSDT"},
+                "side": {"type": "string", "enum": ["BUY", "SELL"]},
+                "quantity": {"type": "number", "exclusiveMinimum": 0, "description": "Base asset miktarı"},
+                "price": {"type": "number", "exclusiveMinimum": 0, "description": "Kâr hedefi (limit) fiyatı"},
+                "stop_price": {"type": "number", "exclusiveMinimum": 0, "description": "Stop tetikleme seviyesi"},
+                "stop_limit_price": {"type": "number", "exclusiveMinimum": 0, "description": "Stop tetiklenince satılacak limit fiyatı (< stop_price)"},
+                "idempotency_key": {"type": "string", "minLength": 1},
+                "request_id": {"type": "string"},
+            },
+            "required": ["account_id", "symbol", "side", "quantity", "price", "stop_price", "stop_limit_price", "idempotency_key"],
+            "additionalProperties": False,
+        },
+    )
+)
+
+register_tool(
+    ToolSpec(
         name="close_all_positions",
         description=(
             "Hesabın (veya account_id='all' ise tüm hesapların) açık emirlerini iptal edip "
