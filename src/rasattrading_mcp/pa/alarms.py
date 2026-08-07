@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import re
 import shlex
 import subprocess
 import time
@@ -30,6 +32,14 @@ from typing import Any
 from ..envelope import FRESHNESS_FRESH
 from ..errors import ErrorCode, RasatError
 from ..storage.db import Database
+from ..storage.state import (
+    PENDING_APPROVED,
+    PENDING_EXECUTING,
+    PENDING_EXECUTED,
+    PENDING_EXPIRED,
+    PENDING_RECONCILE_REQUIRED,
+    PENDING_REJECTED,
+)
 from .analysis import PAEngine, _read_current
 from .liquidity import load_futures_series
 from .screener import _eval_node, validate_filters
@@ -41,14 +51,15 @@ STATE_ARMED = "armed"
 STATE_TRIGGERED = "triggered"
 STATE_COOLDOWN = "cooldown"
 
+# Canonical pending state isimleri (T00 sözleşmesi — storage.state tek kaynak).
 PENDING_AWAITING = "awaiting_approval"
-PENDING_APPROVED = "approved"
-PENDING_REJECTED = "rejected"
-PENDING_EXECUTED = "executed"
-PENDING_EXPIRED = "expired"
 
 # order_spec içinde izin verilen anahtarlar (allowlist — serbest parametre yok)
 ORDER_SPEC_KEYS = {"account_id", "symbol", "side", "entry", "stop_loss", "risk_pct", "order_type"}
+
+# notify şablonundaki {placeholder} belirteci — tek geçişte değiştirilir, böylece
+# değer içindeki başka placeholder benzeri metin ikinci kez ikame edilmez.
+_PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
 
 
 class AlarmService:
@@ -107,7 +118,12 @@ class AlarmService:
 
     @staticmethod
     def _validate_order_spec(spec: dict) -> dict:
-        """order_spec allowlist doğrulaması (2.19): yalnızca bilinen anahtarlar."""
+        """order_spec allowlist doğrulaması (2.19 + T02): yalnızca bilinen anahtarlar.
+
+        T02: risk_pct onay bekleyen emir için zorunludur (approve aşamasında
+        boyutlandırma bunu kullanır) ve finite olmalıdır; limit emir için entry
+        pozitif finite sayı olmalıdır — broker'a gitmeden önce INVALID_REQUEST.
+        """
         if not isinstance(spec, dict):
             raise RasatError(ErrorCode.INVALID_REQUEST, "order_spec nesne olmalı")
         for key in spec:
@@ -120,12 +136,42 @@ class AlarmService:
             raise RasatError(ErrorCode.INVALID_REQUEST, "order_spec.side BUY|SELL olmalı")
         if spec.get("order_type", "market") not in ("market", "limit"):
             raise RasatError(ErrorCode.INVALID_REQUEST, "order_spec.order_type market|limit olmalı")
-        if spec.get("order_type") == "limit" and spec.get("entry") is None:
-            raise RasatError(ErrorCode.INVALID_REQUEST, "limit emir için order_spec.entry zorunlu")
-        risk_pct = spec.get("risk_pct")
-        if risk_pct is not None and not (isinstance(risk_pct, (int, float)) and 0 < risk_pct <= 1):
-            raise RasatError(ErrorCode.INVALID_REQUEST, "order_spec.risk_pct (0,1] aralığında olmalı")
+        AlarmService._validate_execution_inputs(
+            risk_pct=spec.get("risk_pct"),
+            entry=spec.get("entry"),
+            stop_loss=spec.get("stop_loss"),
+            order_type=spec.get("order_type"),
+        )
         return dict(spec)
+
+    @staticmethod
+    def _validate_execution_inputs(risk_pct: Any, entry: Any, stop_loss: Any = None, order_type: Any = None) -> None:
+        """Approve öncesi execution preflight (T02): risk_pct zorunlu + finite.
+
+        Alarm oluşturma (`_validate_order_spec`) ve onay handler'ı bu tek
+        doğrulamayı kullanır. NaN/Infinity fail-open geçemez; eksik risk_pct
+        broker'a gitmeden INVALID_REQUEST döner.
+        """
+        if risk_pct is None or isinstance(risk_pct, bool):
+            raise RasatError(ErrorCode.INVALID_REQUEST, "order_spec.risk_pct zorunlu (onay sonrası boyutlandırma için)")
+        if not isinstance(risk_pct, (int, float)):
+            raise RasatError(ErrorCode.INVALID_REQUEST, "order_spec.risk_pct sayı olmalı")
+        risk = float(risk_pct)
+        if not math.isfinite(risk) or not (0 < risk <= 1):
+            raise RasatError(ErrorCode.INVALID_REQUEST, "order_spec.risk_pct (0,1] aralığında ve finite olmalı")
+        for name, value in (("entry", entry), ("stop_loss", stop_loss)):
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                raise RasatError(ErrorCode.INVALID_REQUEST, f"order_spec.{name} sayı olmalı")
+            if not isinstance(value, (int, float)):
+                raise RasatError(ErrorCode.INVALID_REQUEST, f"order_spec.{name} sayı olmalı")
+            value_f = float(value)
+            if not math.isfinite(value_f) or value_f <= 0:
+                raise RasatError(ErrorCode.INVALID_REQUEST, f"order_spec.{name} pozitif finite olmalı")
+        if (order_type or "market").lower() == "limit":
+            if entry is None:
+                raise RasatError(ErrorCode.INVALID_REQUEST, "limit emir için order_spec.entry zorunlu")
 
     async def create_composite_alert(
         self,
@@ -280,10 +326,18 @@ class AlarmService:
         return res
 
     def _notify(self, definition: dict, payload: dict, alert_id: str | None = None) -> None:
-        """Harici bildirim komutu (2.19): fire-and-forget, daemon'u bloklamaz.
+        """Harici bildirim komutu (2.19; T02 güvenli argv): fire-and-forget.
 
-        Komut şablonunda {alert_id}, {symbol}, {timeframe}, {note}, {price}
-        yer tutucuları tetiklenme verisiyle doldurulur.
+        Komut şablonu `shlex.split` ile güvenli argv listesine parse edilir ve
+        `shell=False` ile çalıştırılır — pipe, redirection ve shell expansion
+        desteklenmez (yorumlanmaz, literal argv elemanı olur). {alert_id},
+        {symbol}, {timeframe}, {note}, {price} yer tutucuları token bazında
+        tek geçişte doldurulur; değerler shell kodu değil sıradan argv
+        elemanıdır (`note` içindeki `; whoami` process başlatmaz).
+
+        Parse hatasında notify fail-closed kalır: hiçbir process başlamaz,
+        alarm state'i bozulmaz, yalnızca log üretilir. Komutun tamamı
+        loglanmaz (note/hassas içerik sızmaz).
         """
         command = self._notify_command
         if not command:
@@ -295,17 +349,20 @@ class AlarmService:
             "note": str(definition.get("note", "") or ""),
             "price": str(payload.get("close", "") or ""),
         }
-        rendered = command
-        for key, value in fmt.items():
-            rendered = rendered.replace("{" + key + "}", value)
+        try:
+            template = shlex.split(command)
+        except ValueError as exc:
+            logger.warning("alarm bildirimi şablonu parse edilemedi (notify atlandı): %s", exc)
+            return
+        argv = [_PLACEHOLDER_RE.sub(lambda m: fmt.get(m.group(1), m.group(0)), arg) for arg in template]
         try:
             if hasattr(subprocess, "CREATE_NO_WINDOW"):
                 flags = subprocess.CREATE_NO_WINDOW
             else:
                 flags = 0
             subprocess.Popen(
-                rendered if not rendered.split() else rendered,
-                shell=True,
+                argv,
+                shell=False,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 creationflags=flags,
@@ -564,7 +621,16 @@ class AlarmService:
         """Onay bekleyen / geçmiş bekleyen emir kayıtlarını listeler."""
         if not 1 <= limit <= 500:
             raise RasatError(ErrorCode.INVALID_REQUEST, f"limit 1-500 arası olmalı (verildi: {limit})")
-        if status is not None and status not in (PENDING_AWAITING, PENDING_APPROVED, PENDING_REJECTED, PENDING_EXECUTED, PENDING_EXPIRED):
+        valid_statuses = (
+            PENDING_AWAITING,
+            PENDING_APPROVED,
+            PENDING_EXECUTING,
+            PENDING_EXECUTED,
+            PENDING_REJECTED,
+            PENDING_RECONCILE_REQUIRED,
+            PENDING_EXPIRED,
+        )
+        if status is not None and status not in valid_statuses:
             raise RasatError(ErrorCode.INVALID_REQUEST, f"bilinmeyen status: {status}")
 
         def _q(conn):
@@ -594,6 +660,9 @@ class AlarmService:
                     "note": r["note"],
                     "created_at": r["created_at"],
                     "executed_order_id": r["executed_order_id"],
+                    "execution_error_code": r["execution_error_code"],
+                    "execution_error_message": r["execution_error_message"],
+                    "last_attempt_at": r["last_attempt_at"],
                 }
                 for r in rows
             ],
@@ -646,21 +715,85 @@ class AlarmService:
 
         return await self.db.write(_w)
 
-    async def mark_pending_executed(self, order_id: str, executed_order_id: str | None) -> dict:
-        """Emir açıldıktan sonra `approved → executed` (audit izi)."""
+    async def approve_and_claim_pending_execution(self, order_id: str) -> dict:
+        """Onay + execution claim (T00 CAS): `awaiting_approval → approved → executing`.
+
+        İki CAS geçişi tek transaction'da yapılır; iki eşzamanlı `approve`
+        çağrısından yalnızca biri execution claim alabilir (ikincisi
+        INVALID_REQUEST). Transaction yarım kalmadan commit edilir — onay sonrası
+        `approved`'da kilitlenme penceresi yoktur.
+        """
         now = int(time.time())
 
         def _w(conn):
             cur = conn.execute(
-                "UPDATE pending_orders SET status=?, executed_order_id=? WHERE order_id=? AND status=?",
-                (PENDING_EXECUTED, executed_order_id, order_id, PENDING_APPROVED),
+                "UPDATE pending_orders SET status=?, approved_at=? WHERE order_id=? AND status=?",
+                (PENDING_APPROVED, now, order_id, PENDING_AWAITING),
+            )
+            if cur.rowcount == 0:
+                row = conn.execute("SELECT status FROM pending_orders WHERE order_id=?", (order_id,)).fetchone()
+                if row is None:
+                    raise RasatError(ErrorCode.NOT_FOUND, f"bekleyen emir bulunamadı: {order_id}")
+                raise RasatError(ErrorCode.INVALID_REQUEST, f"onaylanabilir durumda değil: {row['status']}")
+            cur2 = conn.execute(
+                "UPDATE pending_orders SET status=?, execution_started_at=?, last_attempt_at=?, "
+                "execution_error_code=NULL, execution_error_message=NULL "
+                "WHERE order_id=? AND status=?",
+                (PENDING_EXECUTING, now, now, order_id, PENDING_APPROVED),
+            )
+            if cur2.rowcount == 0:
+                raise RasatError(ErrorCode.INTERNAL_ERROR, "execution claim alınamadı")
+            return {"order_id": order_id, "status": PENDING_EXECUTING}
+
+        return await self.db.write(_w)
+
+    async def complete_pending_execution(self, order_id: str, executed_order_id: str | None) -> dict:
+        """Terminal başarı (CAS): `executing → executed`.
+
+        `executed_order_id` yalnızca kesin gerçek emir kimliği için doldurulur
+        (real → exchange_order_id, paper → yerel emir kaydı).
+        """
+        now = int(time.time())
+
+        def _w(conn):
+            cur = conn.execute(
+                "UPDATE pending_orders SET status=?, executed_order_id=?, execution_finished_at=?, "
+                "last_attempt_at=? WHERE order_id=? AND status=?",
+                (PENDING_EXECUTED, executed_order_id, now, now, order_id, PENDING_EXECUTING),
             )
             if cur.rowcount == 0:
                 row = conn.execute("SELECT status FROM pending_orders WHERE order_id=?", (order_id,)).fetchone()
                 if row is None:
                     raise RasatError(ErrorCode.NOT_FOUND, f"bekleyen emir bulunamadı: {order_id}")
                 raise RasatError(ErrorCode.INVALID_REQUEST, f"executed'a geçilebilir durumda değil: {row['status']}")
-            return {"order_id": order_id, "status": PENDING_EXECUTED}
+            return {"order_id": order_id, "status": PENDING_EXECUTED, "executed_order_id": executed_order_id}
+
+        return await self.db.write(_w)
+
+    async def fail_pending_execution(
+        self, order_id: str, *, status: str, error_code: str, error_message: str
+    ) -> dict:
+        """Terminal/hata (CAS): `executing → rejected | reconcile_required`.
+
+        Exception/timeout sonrası kayıt `approved` kilidinde kalmaz; doğru
+        terminal veya reconcile durumu + execution hata kodu/mesajı yazılır.
+        """
+        if status not in (PENDING_REJECTED, PENDING_RECONCILE_REQUIRED):
+            raise RasatError(ErrorCode.INVALID_REQUEST, f"geçersiz failure status: {status}")
+        now = int(time.time())
+
+        def _w(conn):
+            cur = conn.execute(
+                "UPDATE pending_orders SET status=?, execution_error_code=?, execution_error_message=?, "
+                "execution_finished_at=?, last_attempt_at=? WHERE order_id=? AND status=?",
+                (status, error_code, error_message, now, now, order_id, PENDING_EXECUTING),
+            )
+            if cur.rowcount == 0:
+                row = conn.execute("SELECT status FROM pending_orders WHERE order_id=?", (order_id,)).fetchone()
+                if row is None:
+                    raise RasatError(ErrorCode.NOT_FOUND, f"bekleyen emir bulunamadı: {order_id}")
+                raise RasatError(ErrorCode.INVALID_REQUEST, f"{status} durumuna geçilemez (durum: {row['status']})")
+            return {"order_id": order_id, "status": status, "execution_error_code": error_code}
 
         return await self.db.write(_w)
 
