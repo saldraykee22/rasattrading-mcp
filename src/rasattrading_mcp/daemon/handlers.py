@@ -10,7 +10,22 @@ from .. import __version__
 from ..daemon.readiness import Readiness
 from ..envelope import FRESHNESS_FRESH, FRESHNESS_STALE, Meta, SOURCE_DAEMON, utc_iso
 from ..errors import RasatError, ErrorCode
+from ..storage.orders import STATUS_PAPER
+from ..storage.state import (
+    PENDING_AWAITING_APPROVAL,
+    PENDING_RECONCILE_REQUIRED,
+    PENDING_REJECTED,
+)
 from .server import ToolDispatcher
+
+
+# T02: execution sonucu status'u → pending terminal eşlemesi.
+# Yalnızca kesin borsa dolumu (FILLED) veya yerel paper simülasyonu kesin başarıdır;
+# NEW/PARTIALLY_FILLED gibi non-terminal ve bilinmeyen durumlar reconcile_required
+# taşır; REJECTED/CANCELED/EXPIRED deterministik rejected'dir. executed_order_id
+# yalnızca kesin başarıda doldurulur.
+_PENDING_DEFINITE_SUCCESS = frozenset({"FILLED", STATUS_PAPER})
+_PENDING_DEFINITE_REJECTED = frozenset({"REJECTED", "CANCELED", "EXPIRED"})
 
 
 async def ping_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
@@ -301,24 +316,42 @@ async def get_pending_orders_handler(params: dict, ctx: dict) -> tuple[dict, Met
 
 
 async def approve_pending_order_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
-    """Onaylı bekleyen emri GERÇEK emir olarak açıp `executed` işaretler.
+    """Onaylı bekleyen emri GERÇEK emir olarak açıp T00 state machine'iyle kapatır.
 
     Emir boyutlandırma daemon tarafında yapılır: `execute_on_accounts`
     risk_pct + hesap equity'si + sembol filtreleriyle; spec'teki miktar
     kullanılmaz (agent'a güvenilmez — plan 5.2). Idempotency key:
     `pending:<order_id>` — retry çift emir üretmez.
+
+    T02 state akışı (CAS, T00 sözleşmesi):
+    - `awaiting_approval → approved → executing` tek transaction'da claim edilir
+      (iki eşzamanlı approve yalnızca bir execution claim üretir).
+    - `execute_on_accounts` structured REJECTED/UNKNOWN sonucu başarı sayılmaz;
+      exception sonrası kayıt `approved` kilidinde kalmaz.
+    - Kesin başarı yalnızca `status == FILLED` (borsa dolumu) veya paper
+      simülasyonudur → `executed` (`executed_order_id` kesin emir kimliğiyle
+      doldurulur). REJECTED/CANCELED/EXPIRED → deterministic `rejected`;
+      NEW/PARTIALLY_FILLED/UNKNOWN ve bilinmeyen status → `reconcile_required`
+      (non-terminal/ambiguous; executed_order_id boş kalır).
     """
     alarm = _require_alarm_service(ctx)
-    rec = await alarm._pending_order(params["order_id"])
-    if rec["status"] != "awaiting_approval":
+    order_id = params["order_id"]
+    rec = await alarm._pending_order(order_id)
+    if rec["status"] != PENDING_AWAITING_APPROVAL:
         raise RasatError(ErrorCode.INVALID_REQUEST, f"onay bekleyen durumda değil: {rec['status']}")
+    # T02 preflight: risk_pct/required execution alanları broker'dan ÖNCE yeniden doğrulanır.
+    alarm._validate_execution_inputs(
+        risk_pct=rec.get("risk_pct"),
+        entry=rec.get("entry"),
+        stop_loss=rec.get("stop_loss"),
+        order_type=rec.get("order_type"),
+    )
     order_service = ctx.get("order_service")
     if order_service is None:
         raise RasatError(ErrorCode.NOT_IMPLEMENTED, "order service bu daemon'da başlatılmamış")
 
-    await alarm.approve_pending_order(rec["order_id"])
+    await alarm.approve_and_claim_pending_execution(order_id)
 
-    executed = None
     try:
         executed = await order_service.execute_on_accounts(
             account_ids=[rec["account_id"]],
@@ -328,26 +361,84 @@ async def approve_pending_order_handler(params: dict, ctx: dict) -> tuple[dict, 
             entry=rec["entry"],
             stop_loss=rec["stop_loss"],
             risk_pct=rec["risk_pct"],
-            idempotency_key=f"pending:{rec['order_id']}",
+            idempotency_key=f"pending:{order_id}",
             order_type=rec["order_type"] or "MARKET",
             actor=str(ctx.get("actor", "mcp-agent")),
         )
-    except Exception:
-        # Emir açılamadı → onayı geri al (kullanıcı tekrar onaylayabilir)
-        await alarm.reject_pending_order(rec["order_id"], reason="emir açılamadı (servis hatası)")
+    except RasatError as exc:
+        # Deterministik rejection → rejected; belirsiz/timeout → reconcile_required.
+        terminal = (
+            PENDING_RECONCILE_REQUIRED
+            if exc.code in (ErrorCode.TIMEOUT, ErrorCode.ORDER_UNKNOWN, ErrorCode.ORDER_RECONCILE_REQUIRED)
+            else PENDING_REJECTED
+        )
+        await alarm.fail_pending_execution(
+            order_id, status=terminal, error_code=exc.code, error_message=exc.message
+        )
+        raise
+    except Exception as exc:  # noqa: BLE001
+        await alarm.fail_pending_execution(
+            order_id,
+            status=PENDING_RECONCILE_REQUIRED,
+            error_code=ErrorCode.INTERNAL_ERROR,
+            error_message="beklenmeyen hata; emir durumu doğrulanamadı",
+        )
         raise
 
-    executed_order_id = None
-    if isinstance(executed, dict) and isinstance(executed.get("results"), list) and executed["results"]:
-        first = executed["results"][0]
-        executed_order_id = first.get("order_id") if isinstance(first, dict) else None
+    results = executed.get("results") if isinstance(executed, dict) else None
+    result = results[0] if isinstance(results, list) and results else None
+    if not isinstance(result, dict):
+        # Boş/ambiguous sonuç — executed_order_id'yi doldurmadan reconcile bırak.
+        await alarm.fail_pending_execution(
+            order_id,
+            status=PENDING_RECONCILE_REQUIRED,
+            error_code=ErrorCode.ORDER_UNKNOWN,
+            error_message="emir sonucu alınamadı; reconcile gerekli",
+        )
+        raise RasatError(ErrorCode.ORDER_RECONCILE_REQUIRED, "emir sonucu belirsiz; reconcile gerekli")
 
-    await alarm.mark_pending_executed(rec["order_id"], executed_order_id)
-    return {
-        "order_id": rec["order_id"],
-        "status": "executed",
-        "executed": executed,
-    }, Meta(as_of=utc_iso(), source="order-service", freshness=FRESHNESS_FRESH)
+    status = result.get("status")
+    error = result.get("error") or {}
+    if status in _PENDING_DEFINITE_SUCCESS:
+        # Kesin başarı: yalnızca FILLED (borsa dolumu) veya paper simülasyonu.
+        executed_order_id = result.get("exchange_order_id") or result.get("order_id")
+        if not executed_order_id:
+            await alarm.fail_pending_execution(
+                order_id,
+                status=PENDING_RECONCILE_REQUIRED,
+                error_code=ErrorCode.ORDER_UNKNOWN,
+                error_message="kesin emir kimliği alınamadı; reconcile gerekli",
+            )
+            raise RasatError(ErrorCode.ORDER_RECONCILE_REQUIRED, "kesin emir kimliği alınamadı")
+        await alarm.complete_pending_execution(order_id, executed_order_id)
+        return {
+            "order_id": order_id,
+            "status": "executed",
+            "executed_order_id": executed_order_id,
+            "executed": executed,
+        }, Meta(as_of=utc_iso(), source="order-service", freshness=FRESHNESS_FRESH)
+
+    if status in _PENDING_DEFINITE_REJECTED:
+        # Deterministik red: borsa emri kesin reddedildi/iptal/süresi doldu.
+        code = error.get("code") or {
+            "REJECTED": ErrorCode.ORDER_REJECTED,
+            "EXPIRED": ErrorCode.ORDER_EXPIRED,
+            "CANCELED": ErrorCode.ORDER_REJECTED,
+        }.get(status, ErrorCode.ORDER_REJECTED)
+        message = error.get("message") or f"emir kesin sonlandı (borsa durumu: {status})"
+        await alarm.fail_pending_execution(
+            order_id, status=PENDING_REJECTED, error_code=code, error_message=message
+        )
+        raise RasatError(code, message)
+
+    # Diğer tüm durumlar (UNKNOWN, NEW, PARTIALLY_FILLED ve bilinmeyen status):
+    # non-terminal/ambiguous → reconcile_required; executed_order_id doldurulmaz.
+    code = error.get("code") or ErrorCode.ORDER_UNKNOWN
+    message = error.get("message") or f"emir durumu kesin değil (borsa durumu: {status}); reconcile gerekli"
+    await alarm.fail_pending_execution(
+        order_id, status=PENDING_RECONCILE_REQUIRED, error_code=code, error_message=message
+    )
+    raise RasatError(ErrorCode.ORDER_RECONCILE_REQUIRED, "emir kesin dolmadı; reconcile gerekli")
 
 
 async def reject_pending_order_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:

@@ -6,7 +6,6 @@ taşıyorsa `pending_orders`'a `awaiting_approval` kaydı düşer. Emir OTOMATİ
 AÇILMAZ: `approve_pending_order` → handler emri açar → `executed`.
 """
 
-import asyncio
 import json
 import time
 
@@ -145,28 +144,100 @@ async def test_order_spec_validation(db):
     assert e3.value.code == ErrorCode.INVALID_REQUEST
 
 
-async def test_notify_command_executed_on_trigger(db, tmp_path):
-    """notify_command tetiklenmede çalıştırılır (fire-and-forget)."""
+async def test_notify_uses_safe_argv_shell_false(db, monkeypatch):
+    """T02: notify güvenli argv + shell=False; placeholder'lar tek argv elemanı."""
     await seed(db, "BTCUSDT", UPTREND)
-    marker = tmp_path / "notify.txt"
-    # Windows'ta cmd echo ile dosyaya yaz; yer tutucular dolu gelmeli.
-    notify = f'cmd /c echo {{symbol}} {{alert_id}} > "{marker}"'
-    engine, alarms = _make_service(db, notify_command=notify)
+    calls = []
 
+    def _fake_popen(argv, **kwargs):
+        calls.append({"argv": list(argv), "kwargs": kwargs})
+        return None
+
+    monkeypatch.setattr("rasattrading_mcp.pa.alarms.subprocess.Popen", _fake_popen)
+    engine, alarms = _make_service(
+        db,
+        notify_command="traycer agent send --message {note} --symbol {symbol} --tf {timeframe} --id {alert_id}",
+    )
     created = await alarms.create_alert(
         "BTCUSDT", TF, [{"type": "structure_event", "event": "bos_bullish", "since_bars": 24}],
-        cooldown_seconds=0, note="n",
+        cooldown_seconds=0, note="; whoami",
     )
     await engine.analyze("BTCUSDT", TF)
 
-    for _ in range(200):
-        if marker.exists():
-            break
-        await asyncio.sleep(0.05)
-    assert marker.exists(), "notify komutu çalışmadı"
-    content = marker.read_text(encoding="utf-8", errors="replace").strip()
-    assert content.startswith("BTCUSDT")
-    assert created["alert_id"] in content
+    assert len(calls) == 1
+    argv = calls[0]["argv"]
+    kwargs = calls[0]["kwargs"]
+    assert kwargs["shell"] is False
+    assert argv[0:3] == ["traycer", "agent", "send"]
+    assert argv[argv.index("--message") + 1] == "; whoami"
+    assert argv[argv.index("--symbol") + 1] == "BTCUSDT"
+    assert argv[argv.index("--tf") + 1] == TF
+    assert argv[argv.index("--id") + 1] == created["alert_id"]
+
+
+async def test_notify_note_shell_metachars_stays_single_arg(db, monkeypatch):
+    """T02: note içindeki shell metacharacter'ları process komutu olarak yorumlanmaz."""
+    await seed(db, "BTCUSDT", UPTREND)
+    calls = []
+
+    def _fake_popen(argv, **kwargs):
+        calls.append(list(argv))
+        return None
+
+    monkeypatch.setattr("rasattrading_mcp.pa.alarms.subprocess.Popen", _fake_popen)
+    malicious = "$(calc.exe); rm -rf /; echo pwned > /tmp/x && ls | grep x `id`"
+    engine, alarms = _make_service(db, notify_command="notifier --message {note}")
+    await alarms.create_alert(
+        "BTCUSDT", TF, [{"type": "structure_event", "event": "bos_bullish", "since_bars": 24}],
+        cooldown_seconds=0, note=malicious,
+    )
+    await engine.analyze("BTCUSDT", TF)
+
+    assert len(calls) == 1
+    assert calls[0] == ["notifier", "--message", malicious]
+
+
+async def test_notify_parse_error_fails_closed(db, monkeypatch):
+    """T02: şablon parse hatasında notify fail-closed — process başlamaz, alarm state bozulmaz."""
+    await seed(db, "BTCUSDT", UPTREND)
+    called = []
+
+    def _fake_popen(*args, **kwargs):
+        called.append(args)
+        return None
+
+    monkeypatch.setattr("rasattrading_mcp.pa.alarms.subprocess.Popen", _fake_popen)
+    engine, alarms = _make_service(db, notify_command="notifier --message '{note}")  # dengesiz tırnak
+    await alarms.create_alert(
+        "BTCUSDT", TF, [{"type": "structure_event", "event": "bos_bullish", "since_bars": 24}],
+        cooldown_seconds=0,
+    )
+    await engine.analyze("BTCUSDT", TF)
+
+    assert called == []
+    triggered = await alarms.get_triggered_alerts()
+    assert len(triggered["triggered"]) == 1  # tetiklenme kaydı bozulmadı
+
+
+async def test_notify_does_not_log_command_or_note(db, monkeypatch, caplog):
+    """T02: komutun tamamı loglanmaz (note/hassas içerik sızmaz)."""
+    import logging
+
+    await seed(db, "BTCUSDT", UPTREND)
+
+    def _fake_popen(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr("rasattrading_mcp.pa.alarms.subprocess.Popen", _fake_popen)
+    secret_note = "gizli-icerik-S3CRET"
+    engine, alarms = _make_service(db, notify_command="notifier --message {note}")
+    with caplog.at_level(logging.INFO, logger="rasattrading.pa.alarms"):
+        await alarms.create_alert(
+            "BTCUSDT", TF, [{"type": "structure_event", "event": "bos_bullish", "since_bars": 24}],
+            cooldown_seconds=0, note=secret_note,
+        )
+        await engine.analyze("BTCUSDT", TF)
+    assert secret_note not in caplog.text
 
 
 async def test_approve_reject_pending_lifecycle(db):
