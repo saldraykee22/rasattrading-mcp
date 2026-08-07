@@ -896,6 +896,9 @@ async def test_find_unprotected_positions_detects_and_dispatches(ex_ctx):
                 "value_usd": 500.0,
             }
         ],
+        "account_count": 1,
+        "complete": True,
+        "errors": [],
     }
 
     from rasattrading_mcp.daemon.handlers import build_dispatcher
@@ -921,7 +924,7 @@ async def test_find_unprotected_positions_excludes_sell_protected(ex_ctx):
 
     result = await ctx["service"].find_unprotected_positions()
 
-    assert result == {"unprotected": [], "count": 0}
+    assert result == {"unprotected": [], "count": 0, "account_count": 1, "complete": True, "errors": []}
     assert account_id not in {row["account_id"] for row in result["unprotected"]}
 
 
@@ -932,7 +935,7 @@ async def test_find_unprotected_positions_filters_dust(ex_ctx):
 
     result = await ctx["service"].find_unprotected_positions()
 
-    assert result == {"unprotected": [], "count": 0}
+    assert result == {"unprotected": [], "count": 0, "account_count": 1, "complete": True, "errors": []}
 
 
 async def test_find_unprotected_positions_scans_multiple_real_accounts(ex_ctx):
@@ -956,4 +959,4 @@ async def test_find_unprotected_positions_excludes_paper_accounts(ex_ctx):
 
     result = await ctx["service"].find_unprotected_positions()
 
-    assert result == {"unprotected": [], "count": 0}
+    assert result == {"unprotected": [], "count": 0, "account_count": 0, "complete": True, "errors": []}

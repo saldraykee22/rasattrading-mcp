@@ -6,6 +6,7 @@
 - `place_order` → emir gönderir (clientOrderId ile), gerçek Binance state'i döner.
 - `query_order` → reconcile-before-retry için tekil emri `clientOrderId` ile sorgular.
 - `query_oco` → OCO listesini `listClientOrderId` ile sorgular.
+- `cancel_oco` → OCO listesini `listClientOrderId` ile iptal eder (kill switch).
 - `get_balance` → daemon'ın kendi taze bakiye snapshot'ı (agent rakamlarına güvenilmez).
 
 Status değerleri Binance'in gerçek state machine'ini yansıtır:
@@ -86,6 +87,14 @@ class OrderBroker(Protocol):
         account_id: str,
         symbol: str,
         client_order_id: str,
+    ) -> OrderResult | None: ...
+
+    async def cancel_oco(
+        self,
+        *,
+        account_id: str,
+        symbol: str,
+        list_client_order_id: str,
     ) -> OrderResult | None: ...
 
     async def get_all_open_orders(self, *, account_id: str) -> list[dict]: ...
@@ -361,6 +370,42 @@ class BinanceOrderBroker:
                 return None
             raise
         return self._order_result(data)
+
+    async def cancel_oco(
+        self, *, account_id: str, symbol: str, list_client_order_id: str
+    ) -> OrderResult | None:
+        """OCO listesini `listClientOrderId` ile iptal eder (`DELETE /api/v3/orderList`).
+
+        OCO bacakları Binance'in kendi ürettiği clientOrderId'leri taşıdığı için
+        tekil `cancel_order` ile iptal edilemez — kill switch OCO satırlarında
+        `query_oco` ile eşleşen `listClientOrderId` üzerinden iptal etmelidir.
+        Yanıt `listOrderStatus` taşır: ALL_DONE → CANCELED, EXECUTING → NEW,
+        bilinmeyen → UNKNOWN (körlemesine "iptal edildi" varsayılmaz).
+        """
+        try:
+            data = await self._request(
+                "DELETE",
+                "/api/v3/orderList",
+                account_id,
+                {"symbol": symbol, "listClientOrderId": list_client_order_id},
+            )
+        except RasatError as exc:
+            # -2011 liste zaten iptal/dolmuş → None
+            if exc.code == ErrorCode.ORDER_REJECTED and exc.details and exc.details.get("binance_code") == -2011:
+                return None
+            raise
+        list_status = str(data.get("listOrderStatus") or "").upper()
+        if list_status == "ALL_DONE":
+            status = "CANCELED"
+        elif list_status == "EXECUTING":
+            status = "NEW"
+        else:
+            status = "UNKNOWN"
+        return OrderResult(
+            status=status,
+            exchange_order_id=str(data.get("orderListId")) if data.get("orderListId") is not None else None,
+            raw=data,
+        )
 
     async def get_all_open_orders(self, *, account_id: str) -> list[dict]:
         """Spot'taki tüm açık emirleri döner (sembol bazlı değil, global)."""

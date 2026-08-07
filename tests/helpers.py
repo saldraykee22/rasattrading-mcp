@@ -279,6 +279,25 @@ class FakeOrderBroker:
 
         return OrderResult(status="CANCELED", exchange_order_id=f"CX{len(self.cancelled)}")
 
+    async def cancel_oco(self, *, account_id, symbol, list_client_order_id):
+        """OCO listesi iptali: `cancelled_oco` listesine kaydeder.
+
+        `cancel_oco_results[list_client_order_id]` varsa o OrderResult|None döner
+        (None = borsada bulunamadı, -2011 simülasyonu); yoksa CANCELED varsayılır.
+        """
+        if list_client_order_id in self.cancel_errors:
+            raise self.cancel_errors[list_client_order_id]
+        self.cancelled_oco = getattr(self, "cancelled_oco", [])
+        self.cancelled_oco.append(
+            {"account_id": account_id, "symbol": symbol, "list_client_order_id": list_client_order_id}
+        )
+        from rasattrading_mcp.data.order_broker import OrderResult
+
+        results = getattr(self, "cancel_oco_results", {})
+        if list_client_order_id in results:
+            return results[list_client_order_id]
+        return OrderResult(status="CANCELED", exchange_order_id=f"OLX{len(self.cancelled_oco)}")
+
     async def get_all_open_orders(self, *, account_id):
         return list(self.open_orders)
 

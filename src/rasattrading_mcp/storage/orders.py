@@ -1291,11 +1291,20 @@ class OrderService:
             return self._order_to_result(existing)
 
         try:
-            found = await self.broker.query_order(
-                account_id=account["account_id"],
-                symbol=existing["symbol"],
-                client_order_id=existing["client_order_id"],
-            )
+            # OCO bacakları Binance'in kendi clientOrderId'lerini taşır; tekil
+            # `query_order` hep -2013 döner. OCO kaydı listClientOrderId ile
+            # `query_oco` üzerinden reconcile edilir (bkz. `_reconcile_after_timeout`).
+            if existing["order_type"] == "OCO":
+                found = await self.broker.query_oco(
+                    account_id=account["account_id"],
+                    list_client_order_id=existing["client_order_id"],
+                )
+            else:
+                found = await self.broker.query_order(
+                    account_id=account["account_id"],
+                    symbol=existing["symbol"],
+                    client_order_id=existing["client_order_id"],
+                )
         except RasatError:
             found = None
         if found is None:
@@ -1331,7 +1340,7 @@ class OrderService:
     # ---------- startup reconcile (3.13) ----------
 
     async def reconcile_open_orders(self) -> dict[str, Any]:
-        """Daemon açılışında NEW/PARTIALLY_FILLED'da takılı emirleri doğrular.
+        """Daemon açılışında NEW/PARTIALLY_FILLED/UNKNOWN'da takılı emirleri doğrular.
 
         DB'ye NEW yazma ile broker çağrısı arasında crash olursa orphan NEW kaydı
         kalır ve exposure'ı (`_current_exposure`/`_open_order_notional`) sonsuza dek
@@ -1339,6 +1348,9 @@ class OrderService:
         borsada doğrulanamayan `UNKNOWN` olur (körlemesine tekrar gönderim yok —
         reconcile-before-retry sözleşmesi). OCO listeleri `query_oco` ile,
         tekil emirler `query_order` ile sorgulanır.
+
+        UNKNOWN kayıtları da taranır: zaman aşımı sonrası gerçekten FILLED olmuş
+        olabilirler; açılışta yeniden sorgulanıp terminal duruma çekilirler.
         """
         account_ids = [
             acc["account_id"]
@@ -1352,7 +1364,7 @@ class OrderService:
             marks = ",".join("?" for _ in account_ids)
             rows = conn.execute(
                 "SELECT " + ", ".join(_ORDER_COLUMNS)
-                + f" FROM orders WHERE account_id IN ({marks}) AND status IN ('NEW', 'PARTIALLY_FILLED')",
+                + f" FROM orders WHERE account_id IN ({marks}) AND status IN ('NEW', 'PARTIALLY_FILLED', 'UNKNOWN')",
                 tuple(account_ids),
             ).fetchall()
             return [dict(r) for r in rows]
@@ -1518,8 +1530,12 @@ class OrderService:
                 str(o["client_order_id"]): o for o in exchange_open if o.get("client_order_id")
             }
 
-        async def _query_safe(symbol: str, cid: str):
+        async def _query_safe(symbol: str, cid: str, is_oco: bool = False):
             try:
+                if is_oco:
+                    return await self.broker.query_oco(
+                        account_id=account_id, list_client_order_id=cid
+                    )
                 return await self.broker.query_order(
                     account_id=account_id, symbol=symbol, client_order_id=cid
                 )
@@ -1583,11 +1599,22 @@ class OrderService:
             return _apply
 
         async def _cancel_one(cid: str, symbol: str, order: dict | None) -> None:
-            """Tek client_order_id iptalini dener; local satır varsa senkronize eder."""
+            """Tek client_order_id iptalini dener; local satır varsa senkronize eder.
+
+            OCO satırlarında `listClientOrderId` taşıyan `cancel_oco` kullanılır
+            (tekil `cancel_order` bacakları Binance'in kendi cid'leriyle bulamaz);
+            iptal sonrası doğrulama da `query_oco` ile yapılır.
+            """
+            is_oco = order is not None and order.get("order_type") == "OCO"
             try:
-                res = await self.broker.cancel_order(
-                    account_id=account_id, symbol=symbol, client_order_id=cid
-                )
+                if is_oco:
+                    res = await self.broker.cancel_oco(
+                        account_id=account_id, symbol=symbol, list_client_order_id=cid
+                    )
+                else:
+                    res = await self.broker.cancel_order(
+                        account_id=account_id, symbol=symbol, client_order_id=cid
+                    )
             except (RasatError, asyncio.TimeoutError) as exc:
                 # 3.9: iptal başarısız → sessizce CANCELED yapma. Gerçek durum
                 # bilinmiyor; UNKNOWN'a çek ve sonuçta açıkça raporla.
@@ -1606,7 +1633,7 @@ class OrderService:
                 return
             if res is None:
                 # -2011: borsada yok (iptal edilmiş/dolmuş olabilir) → gerçek durumu sor.
-                found = await _query_safe(symbol, cid)
+                found = await _query_safe(symbol, cid, is_oco=is_oco)
                 if isinstance(found, RasatError):
                     if order is not None:
                         await self.db.write(_write_unknown(order, found))
@@ -1952,6 +1979,11 @@ class OrderService:
         ``get_open_orders``'ın aksine tüm real hesapları tarar ve bakiye/açık emir
         çaprazlamasını otomatik yapar — "hangi pozisyon korumasız" sorusuna
         tek çağrıda cevap verir.
+
+        Hesap erişim hataları sessizce yutulmaz: bir hesabın bakiye/açık-emir
+        sorgusu başarısız olursa `errors` içinde `{account_id, error}` taşınır ve
+        `complete=false` döner — hatalı hesap sonuçtan düşerken "korumasız pozisyon
+        yok" gibi yanıltıcı tam bir tablo sunulmaz (bkz. `get_total_exposure`).
         """
         accounts = [
             acc
@@ -1959,12 +1991,28 @@ class OrderService:
             if str(acc.get("trading_lock", "paper")) == "real" and acc.get("credentials_configured")
         ]
         unprotected: list[dict[str, Any]] = []
+        errors: list[dict] = []
         for acc in accounts:
             account_id = acc["account_id"]
             try:
                 balance_detail = await self.broker.get_balance_detail(account_id=account_id)
                 open_orders = await self.broker.get_all_open_orders(account_id=account_id) or []
-            except RasatError:
+            except RasatError as exc:
+                errors.append(
+                    {
+                        "account_id": account_id,
+                        "error": {"code": exc.code, "message": exc.message},
+                    }
+                )
+                continue
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("korumasız pozisyon taraması başarısız: %s", account_id, exc_info=True)
+                errors.append(
+                    {
+                        "account_id": account_id,
+                        "error": {"code": ErrorCode.INTERNAL_ERROR, "message": "hesap taranamadı"},
+                    }
+                )
                 continue
             sell_symbols = {
                 o.get("symbol") for o in open_orders if str(o.get("side", "")).upper() == "SELL"
@@ -1993,7 +2041,13 @@ class OrderService:
                         "value_usd": value,
                     }
                 )
-        return {"unprotected": unprotected, "count": len(unprotected)}
+        return {
+            "unprotected": unprotected,
+            "count": len(unprotected),
+            "account_count": len(accounts),
+            "complete": not errors,
+            "errors": errors,
+        }
 
     async def get_audit_log(self, *, limit: int = 50) -> dict[str, Any]:
         """Hash-chain doğrulamalı audit log sorgusu (3.5)."""
