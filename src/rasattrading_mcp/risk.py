@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 
 from .errors import ErrorCode, RasatError
+from .numeric import require_finite
 
 logger = logging.getLogger("rasattrading.risk")
 
@@ -35,6 +36,9 @@ def within_tolerance(value: float, target: float, tolerance_pct: float = DEFAULT
     """
     if tolerance_pct is None or tolerance_pct < 0:
         raise RasatError(ErrorCode.INVALID_REQUEST, "tolerance_pct negatif olamaz")
+    value = require_finite(value, "value")
+    target = require_finite(target, "target")
+    tolerance_pct = require_finite(tolerance_pct, "tolerance_pct")
     if target == 0:
         return value == 0
     band = abs(target) * tolerance_pct
@@ -60,7 +64,8 @@ def enforce_policy_caps(
     """
     if not isinstance(symbol, str) or not symbol:
         raise RasatError(ErrorCode.INVALID_REQUEST, "symbol zorunlu (string)")
-    if not isinstance(notional, (int, float)) or notional <= 0:
+    notional = require_finite(notional, "notional")
+    if notional <= 0:
         raise RasatError(ErrorCode.INVALID_REQUEST, "notional pozitif bir sayı olmalı")
 
     allowed = policy.get("allowed_symbols")
@@ -70,6 +75,7 @@ def enforce_policy_caps(
 
     cap = policy.get("max_notional_per_order")
     if cap is not None:
+        cap = require_finite(cap, "max_notional_per_order")
         if notional > cap:
             raise RasatError(
                 ErrorCode.RISK_LIMIT_EXCEEDED,
@@ -77,9 +83,12 @@ def enforce_policy_caps(
             )
 
     if aggregate_exposure is not None:
+        aggregate_exposure = require_finite(aggregate_exposure, "aggregate_exposure")
         agg_cap = policy.get("max_aggregate_exposure")
-        if agg_cap is not None and aggregate_exposure > agg_cap:
-            raise RasatError(
-                ErrorCode.RISK_LIMIT_EXCEEDED,
-                f"toplam exposure cap'i aşıyor: {aggregate_exposure} > {agg_cap} (max_aggregate_exposure, tolerans uygulanmaz)",
-            )
+        if agg_cap is not None:
+            agg_cap = require_finite(agg_cap, "max_aggregate_exposure")
+            if aggregate_exposure > agg_cap:
+                raise RasatError(
+                    ErrorCode.RISK_LIMIT_EXCEEDED,
+                    f"toplam exposure cap'i aşıyor: {aggregate_exposure} > {agg_cap} (max_aggregate_exposure, tolerans uygulanmaz)",
+                )

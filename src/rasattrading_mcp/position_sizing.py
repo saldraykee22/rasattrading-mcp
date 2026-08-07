@@ -17,6 +17,7 @@ from typing import Any
 
 from .accuracy import check_stop_direction, check_sufficient_balance
 from .errors import ErrorCode, RasatError
+from .numeric import require_finite
 
 DEFAULT_FEE_RATE = 0.001  # %0.1 (Binance spot default)
 
@@ -118,6 +119,12 @@ def calculate_position_size(
     if not isinstance(symbol, str) or not symbol:
         raise RasatError(ErrorCode.INVALID_REQUEST, "symbol zorunlu (string)")
     check_stop_direction(side, entry, stop_loss)
+    # T01: NaN/Infinity karşılaştırmaları bypass etmesin — önce finite kes.
+    account_balance = require_finite(account_balance, "account_balance")
+    risk_pct = require_finite(risk_pct, "risk_pct")
+    entry = require_finite(entry, "entry")
+    stop_loss = require_finite(stop_loss, "stop_loss")
+    fee_rate = require_finite(fee_rate, "fee_rate")
     if risk_pct <= 0 or risk_pct > 1:
         raise RasatError(ErrorCode.INVALID_REQUEST, "risk_pct (0,1] aralığında olmalı")
     if account_balance <= 0:

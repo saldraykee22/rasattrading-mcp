@@ -112,6 +112,14 @@ class FakeOrderBroker:
         self.query_results: dict[str, object | None] = {}
         self.query_results_by_account: dict[str, object | None] = {}
         self.cancel_errors: dict[str, Exception] = {}
+        #: Borsada duran (local DB'de kaydı olmayabilir) açık emirler.
+        #: Varsayılan, legacy `get_all_open_orders` davranışını korur (bir BTCUSDT
+        #: yetim emri); isteyen test `open_orders = []` ile temizler.
+        self.open_orders: list[dict] = [
+            {"symbol": "BTCUSDT", "order_id": "O1", "client_order_id": "open-1", "side": "BUY", "quantity": 0.5}
+        ]
+        #: get_balance çağrısında hesap bazlı hata (exposure fail-closed testleri).
+        self.get_balance_errors: dict[str, Exception] = {}
         self._seq = 1000
 
     async def place_order(self, *, account_id, symbol, side, order_type, quantity, price, client_order_id, stop_price=None):
@@ -220,9 +228,7 @@ class FakeOrderBroker:
         return OrderResult(status="CANCELED", exchange_order_id=f"CX{len(self.cancelled)}")
 
     async def get_all_open_orders(self, *, account_id):
-        return [
-            {"symbol": "BTCUSDT", "order_id": "O1", "client_order_id": "open-1", "side": "BUY", "quantity": 0.5}
-        ]
+        return list(self.open_orders)
 
     async def cancel_all_open_orders(self, *, account_id, symbol):
         self.cancelled_all = getattr(self, "cancelled_all", [])
@@ -230,6 +236,8 @@ class FakeOrderBroker:
         return 1
 
     async def get_balance(self, *, account_id):
+        if account_id in self.get_balance_errors:
+            raise self.get_balance_errors[account_id]
         return dict(self.balances.get(account_id, {"USDT": 10000.0}))
 
     async def get_balance_detail(self, *, account_id):
