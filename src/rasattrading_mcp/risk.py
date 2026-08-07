@@ -34,11 +34,13 @@ def within_tolerance(value: float, target: float, tolerance_pct: float = DEFAULT
     görecelidir (target'ın yüzdesi). Örnek: RR hedef 2.0, tolerans %2
     -> 1.96 ve üzeri kabul.
     """
-    if tolerance_pct is None or tolerance_pct < 0:
-        raise RasatError(ErrorCode.INVALID_REQUEST, "tolerance_pct negatif olamaz")
+    # T01: non-numeric/None tolerance karşılaştırmaya girmeden önce finite'lanır —
+    # aksi halde "abc" gibi değerler TypeError ile dışarı kaçabilirdi.
     value = require_finite(value, "value")
     target = require_finite(target, "target")
     tolerance_pct = require_finite(tolerance_pct, "tolerance_pct")
+    if tolerance_pct < 0:
+        raise RasatError(ErrorCode.INVALID_REQUEST, "tolerance_pct negatif olamaz")
     if target == 0:
         return value == 0
     band = abs(target) * tolerance_pct

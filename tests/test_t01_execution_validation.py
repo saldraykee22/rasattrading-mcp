@@ -226,6 +226,43 @@ def test_validator_filter_min_notional():
     assert exc.value.code == ErrorCode.FILTER_VIOLATION
 
 
+def test_validator_stop_price_price_filter():
+    # stop_price da PRICE_FILTER min/max/tick'e tabidir (yalnızca price değil).
+    # SELL stop < market geçerli iken tick katı olmayan stop reddedilmeli.
+    with pytest.raises(RasatError) as exc:
+        validate_execution_order(
+            side="SELL", order_type="STOP_LOSS_LIMIT", quantity=1.0,
+            price=90.0, stop_price=95.005, market_price=100.0, filters=FILTERS,
+        )
+    assert exc.value.code == ErrorCode.FILTER_VIOLATION
+    # stop_price min_price altında → FILTER_VIOLATION
+    with pytest.raises(RasatError) as exc:
+        validate_execution_order(
+            side="SELL", order_type="STOP_LOSS_LIMIT", quantity=1.0,
+            price=90.0, stop_price=0.005, market_price=100.0, filters=FILTERS,
+        )
+    assert exc.value.code == ErrorCode.FILTER_VIOLATION
+    # stop_price max_price üstünde → FILTER_VIOLATION (direction geçerli kalır)
+    over = SymbolFilters(**{**FILTERS.__dict__, "max_price": 50.0})
+    with pytest.raises(RasatError) as exc:
+        validate_execution_order(
+            side="SELL", order_type="STOP_LOSS_LIMIT", quantity=1.0,
+            price=40.0, stop_price=60.0, market_price=100.0, filters=over,
+        )
+    assert exc.value.code == ErrorCode.FILTER_VIOLATION
+
+
+def test_validator_stop_limit_price_price_filter():
+    # OCO stop_limit_price da PRICE_FILTER tick'e tabidir.
+    with pytest.raises(RasatError) as exc:
+        validate_execution_order(
+            side="SELL", order_type="OCO", quantity=1.0,
+            price=110.0, stop_price=95.0, stop_limit_price=94.005,
+            market_price=100.0, filters=FILTERS,
+        )
+    assert exc.value.code == ErrorCode.FILTER_VIOLATION
+
+
 # =====================================================================
 # Service — broker asla çağrılmaz (fail-closed)
 # =====================================================================
@@ -354,6 +391,41 @@ async def test_execute_on_accounts_limit_tick_violation(ex_ctx):
     assert result["results"][0]["status"] == "REJECTED"
     assert result["results"][0]["error"]["code"] == ErrorCode.FILTER_VIOLATION
     assert ex_ctx["broker"].placed == []
+
+
+async def test_execute_on_accounts_stop_loss_limit_passes_price_and_stop(ex_ctx):
+    # T01 regresyon: _execute_one_sized STOP_LOSS_LIMIT'i "price zorunlu" diye
+    # reddetmemeli — entry/stop_loss validator'a price/stop_price olarak geçer,
+    # validator geçer ve akış bakiye gate'ine ulaşır (SELL: base yok).
+    account_id = await _add_real_account(ex_ctx)
+    service = ex_ctx["service"]
+    result = await service.execute_on_accounts(
+        account_ids=[account_id], symbol="BTCUSDT", side="SELL", entry=95,
+        stop_loss=98, risk_pct=0.01, order_type="STOP_LOSS_LIMIT",
+        idempotency_key="sized-sll",
+    )
+    detail = result["results"][0]
+    assert detail["status"] == "REJECTED"
+    assert detail["error"]["code"] == ErrorCode.INSUFFICIENT_BALANCE
+    assert ex_ctx["broker"].placed == []
+
+
+async def test_execute_on_accounts_stop_loss_limit_reaches_broker_with_stop(ex_ctx):
+    # T01 regresyon: bakiye gate'i geçince STOP_LOSS_LIMIT, stop_price ile birlikte
+    # _place_and_record chokepoint'inden broker'a ulaşır ("stop_price zorunlu" değil).
+    account_id = await _add_real_account(ex_ctx, base_holdings={"BTC": 100.0})
+    service = ex_ctx["service"]
+    result = await service.execute_on_accounts(
+        account_ids=[account_id], symbol="BTCUSDT", side="SELL", entry=95,
+        stop_loss=98, risk_pct=0.01, order_type="STOP_LOSS_LIMIT",
+        idempotency_key="sized-sll-real",
+    )
+    detail = result["results"][0]
+    assert detail["status"] == "FILLED"
+    placed = ex_ctx["broker"].placed[0]
+    assert placed["order_type"] == "STOP_LOSS_LIMIT"
+    assert placed["price"] == pytest.approx(95.0)
+    assert placed["stop_price"] == pytest.approx(98.0)
 
 
 # =====================================================================
@@ -575,6 +647,20 @@ def test_within_tolerance_nan_fail_closed():
     assert exc.value.code == ErrorCode.INVALID_REQUEST
 
 
+def test_within_tolerance_non_numeric_fail_closed():
+    # T01: non-numeric tolerance TypeError ile dışarı kaçmamalı — require_finite önce.
+    with pytest.raises(RasatError) as exc:
+        within_tolerance(value=1.9, target=2.0, tolerance_pct="abc")
+    assert exc.value.code == ErrorCode.INVALID_REQUEST
+    with pytest.raises(RasatError) as exc:
+        within_tolerance(value="abc", target=2.0)
+    assert exc.value.code == ErrorCode.INVALID_REQUEST
+    # negatif tolerans hâlâ INVALID_REQUEST
+    with pytest.raises(RasatError) as exc:
+        within_tolerance(value=1.9, target=2.0, tolerance_pct=-0.1)
+    assert exc.value.code == ErrorCode.INVALID_REQUEST
+
+
 def test_calculate_position_size_nan_fail_closed():
     with pytest.raises(RasatError) as exc:
         calculate_position_size(
@@ -582,6 +668,50 @@ def test_calculate_position_size_nan_fail_closed():
             entry=100, stop_loss=95, filters=FILTERS,
         )
     assert exc.value.code == ErrorCode.INVALID_REQUEST
+
+
+def test_calculate_position_size_non_numeric_fail_closed():
+    # T01: non-numeric entry, check_stop_direction öncesi require_finite ile
+    # kesilmeli — TypeError yerine INVALID_REQUEST.
+    with pytest.raises(RasatError) as exc:
+        calculate_position_size(
+            symbol="BTCUSDT", account_balance=10000, risk_pct=0.01,
+            entry="abc", stop_loss=95, filters=FILTERS,
+        )
+    assert exc.value.code == ErrorCode.INVALID_REQUEST
+    with pytest.raises(RasatError) as exc:
+        calculate_position_size(
+            symbol="BTCUSDT", account_balance=10000, risk_pct=0.01,
+            entry=100, stop_loss=None, filters=FILTERS,
+        )
+    assert exc.value.code == ErrorCode.INVALID_REQUEST
+
+
+# =====================================================================
+# tools.py schema senkronizasyonu (T02 sözleşmesi)
+# =====================================================================
+
+
+def test_tools_schema_get_pending_orders_status_enum():
+    from rasattrading_mcp.tools import REGISTRY
+
+    spec = REGISTRY.get("get_pending_orders")
+    enum = spec.input_schema["properties"]["status"]["enum"]
+    for s in ("awaiting_approval", "approved", "executing", "rejected",
+              "executed", "reconcile_required", "expired"):
+        assert s in enum
+
+
+def test_tools_schema_order_spec_requires_risk_pct():
+    from rasattrading_mcp.tools import REGISTRY
+
+    spec = REGISTRY.get("create_alert")
+    order_spec = spec.input_schema["properties"]["order_spec"]
+    assert "risk_pct" in order_spec["required"]
+    assert "account_id" in order_spec["required"]
+    assert order_spec["properties"]["entry"]["exclusiveMinimum"] == 0
+    assert order_spec["properties"]["stop_loss"]["exclusiveMinimum"] == 0
+    assert order_spec["properties"]["risk_pct"]["maximum"] == 1
 
 
 # =====================================================================

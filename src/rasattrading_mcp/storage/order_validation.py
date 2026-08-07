@@ -183,18 +183,24 @@ def validate_execution_order(
                     ErrorCode.FILTER_VIOLATION,
                     f"miktar LOT_SIZE stepSize katı değil: {qty} (step {filters.step_size}, {filters.symbol})",
                 )
-        if price is not None:
-            if price < filters.min_price or price > filters.max_price:
+        for pname, pval in (
+            ("price", price),
+            ("stop_price", stop_price),
+            ("stop_limit_price", stop_limit_price),
+        ):
+            if pval is None:
+                continue
+            if pval < filters.min_price or pval > filters.max_price:
                 raise RasatError(
                     ErrorCode.FILTER_VIOLATION,
-                    f"fiyat PRICE_FILTER dışında: {price} ([{filters.min_price}, {filters.max_price}])",
+                    f"{pname} PRICE_FILTER dışında: {pval} ([{filters.min_price}, {filters.max_price}])",
                 )
             if filters.tick_size and filters.tick_size > 0:
-                ticks = (price - filters.min_price) / filters.tick_size
+                ticks = (pval - filters.min_price) / filters.tick_size
                 if abs(ticks - round(ticks)) > _ALIGN_EPS:
                     raise RasatError(
                         ErrorCode.FILTER_VIOLATION,
-                        f"fiyat PRICE_FILTER tickSize katı değil: {price} (tick {filters.tick_size})",
+                        f"{pname} PRICE_FILTER tickSize katı değil: {pval} (tick {filters.tick_size})",
                     )
         if notional is None:
             raise RasatError(ErrorCode.INVALID_REQUEST, f"{ot} emir için fiyat/referans fiyatı gerekli")

@@ -891,12 +891,15 @@ class OrderService:
         quantity = sized["quantity"]
         notional = quantity * price
 
-        # T01: ortak validator — enum/finite + SymbolFilters (LIMIT fiyatı = entry).
+        # T01: ortak validator — enum/finite + SymbolFilters. LIMIT/STOP_LOSS_LIMIT
+        # fiyatı = entry, STOP_LOSS_LIMIT stop tetikleyicisi = stop_loss olarak geçer;
+        # aksi halde STOP_LOSS_LIMIT her zaman "price zorunlu" ile reddedilirdi.
         validated = validate_execution_order(
             side=side,
             order_type=order_type,
             quantity=quantity,
-            price=(entry if order_type == "LIMIT" else None),
+            price=(entry if order_type in ("LIMIT", "STOP_LOSS_LIMIT") else None),
+            stop_price=(stop_loss if order_type == "STOP_LOSS_LIMIT" else None),
             filters=filters,
             market_price=price,
         )
@@ -919,10 +922,12 @@ class OrderService:
             account, policy, symbol, notional, exposure_after, idempotency_key
         )
 
-        # 5) Emri gönder
+        # 5) Emri gönder — STOP_LOSS_LIMIT için stop_price chokepoint validator'ına
+        #    da geçer (aksi halde _place_and_record yine "stop_price zorunlu" der).
         return await self._place_and_record(
             account, is_real, symbol, side, order_type, quantity, entry, notional, price,
             idempotency_key, equity, actor,
+            stop_price=(stop_loss if order_type == "STOP_LOSS_LIMIT" else None),
         )
 
     async def _execute_one_direct(

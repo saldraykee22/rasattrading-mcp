@@ -118,13 +118,14 @@ def calculate_position_size(
     """
     if not isinstance(symbol, str) or not symbol:
         raise RasatError(ErrorCode.INVALID_REQUEST, "symbol zorunlu (string)")
-    check_stop_direction(side, entry, stop_loss)
-    # T01: NaN/Infinity karşılaştırmaları bypass etmesin — önce finite kes.
+    # T01: NaN/Infinity/non-numeric girişler karşılaştırmalara (check_stop_direction
+    # dahil) girmeden önce finite'lanır — string entry TypeError üretmemeli.
     account_balance = require_finite(account_balance, "account_balance")
     risk_pct = require_finite(risk_pct, "risk_pct")
     entry = require_finite(entry, "entry")
     stop_loss = require_finite(stop_loss, "stop_loss")
     fee_rate = require_finite(fee_rate, "fee_rate")
+    check_stop_direction(side, entry, stop_loss)
     if risk_pct <= 0 or risk_pct > 1:
         raise RasatError(ErrorCode.INVALID_REQUEST, "risk_pct (0,1] aralığında olmalı")
     if account_balance <= 0:
