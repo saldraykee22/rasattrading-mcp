@@ -1,11 +1,12 @@
 import asyncio
+import time
 
 import pytest
 
 from rasattrading_mcp.config import Config
 from rasattrading_mcp.storage.audit import AuditLog
 from rasattrading_mcp.storage.db import Database
-from rasattrading_mcp.storage.migrations import current_version, run_migrations
+from rasattrading_mcp.storage.migrations import _migration_lock, current_version, run_migrations
 from rasattrading_mcp.storage.retention import prune_candles
 
 
@@ -31,8 +32,8 @@ def _tables(conn):
 
 async def test_migrations_on_empty_db(cfg, db):
     applied = await run_migrations(db)
-    assert applied == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-    assert await current_version(db) == 10
+    assert applied == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    assert await current_version(db) == 11
     tables = await db.read(_tables)
     expected = {
         "candles", "futures_context", "market_structure", "liquidity_zones",
@@ -55,6 +56,18 @@ async def test_migrations_on_empty_db(cfg, db):
     order_cols = await db.read(_order_cols)
     assert "equity_snapshot" in order_cols  # 3.20 M1: migration 7 sütunu ekler
 
+    def _pending_cols(conn):
+        return {r["name"] for r in conn.execute("PRAGMA table_info(pending_orders)").fetchall()}
+
+    pending_cols = await db.read(_pending_cols)
+    assert {
+        "execution_started_at",
+        "execution_finished_at",
+        "execution_error_code",
+        "execution_error_message",
+        "last_attempt_at",
+    } <= pending_cols
+
 
 async def test_migrations_idempotent_on_filled_db(cfg, db):
     await run_migrations(db)
@@ -73,6 +86,25 @@ async def test_migrations_idempotent_on_filled_db(cfg, db):
         return conn.execute("SELECT COUNT(*) AS c FROM candles").fetchone()["c"]
 
     assert await db.read(_count) == 1  # veri korundu
+
+
+async def test_migration_lock_serializes_threads(cfg):
+    events: list[tuple[str, str]] = []
+
+    def critical(name: str):
+        with _migration_lock(cfg.db_path):
+            events.append((name, "acquired"))
+            time.sleep(0.05)
+            events.append((name, "released"))
+
+    await asyncio.gather(
+        asyncio.to_thread(critical, "a"),
+        asyncio.to_thread(critical, "b"),
+    )
+    assert events.count(("a", "acquired")) == 1
+    assert events.count(("b", "acquired")) == 1
+    assert events.index(("a", "released")) < events.index(("b", "acquired")) or \
+        events.index(("b", "released")) < events.index(("a", "acquired"))
 
 
 async def test_write_queue_returns_value(cfg, db):

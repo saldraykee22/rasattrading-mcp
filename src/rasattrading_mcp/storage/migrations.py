@@ -7,9 +7,12 @@ migration'lar sırayla, her biri kendi transaction'ında çalışır. Uygulanan 
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import logging
+import os
 import sqlite3
 import time
+from pathlib import Path
 from typing import Callable
 
 from .db import Database
@@ -31,7 +34,7 @@ def _m1_initial_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
         -- Ham mum verisi (spot/futures kaynaklı)
-        CREATE TABLE candles (
+        CREATE TABLE IF NOT EXISTS candles (
           symbol TEXT NOT NULL,
           timeframe TEXT NOT NULL,
           open_time INTEGER NOT NULL,
@@ -43,7 +46,7 @@ def _m1_initial_schema(conn: sqlite3.Connection) -> None:
         );
 
         -- Futures bağlam sinyali (salt-okunur): funding_rate | open_interest | liquidation
-        CREATE TABLE futures_context (
+        CREATE TABLE IF NOT EXISTS futures_context (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           symbol TEXT NOT NULL,
           type TEXT NOT NULL,
@@ -56,7 +59,7 @@ def _m1_initial_schema(conn: sqlite3.Connection) -> None:
         );
 
         -- Immutable PA hesap kayıtları: üzerine yazılmaz, algo_version + effective penceresi korunur
-        CREATE TABLE market_structure (
+        CREATE TABLE IF NOT EXISTS market_structure (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           symbol TEXT NOT NULL,
           timeframe TEXT NOT NULL,
@@ -67,7 +70,7 @@ def _m1_initial_schema(conn: sqlite3.Connection) -> None:
           created_at INTEGER NOT NULL
         );
 
-        CREATE TABLE liquidity_zones (
+        CREATE TABLE IF NOT EXISTS liquidity_zones (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           symbol TEXT NOT NULL,
           timeframe TEXT NOT NULL,
@@ -78,7 +81,7 @@ def _m1_initial_schema(conn: sqlite3.Connection) -> None:
           created_at INTEGER NOT NULL
         );
 
-        CREATE TABLE order_blocks (
+        CREATE TABLE IF NOT EXISTS order_blocks (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           symbol TEXT NOT NULL,
           timeframe TEXT NOT NULL,
@@ -90,7 +93,7 @@ def _m1_initial_schema(conn: sqlite3.Connection) -> None:
         );
 
         -- Agent işaretlemeleri
-        CREATE TABLE annotations (
+        CREATE TABLE IF NOT EXISTS annotations (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           symbol TEXT NOT NULL,
           timeframe TEXT NOT NULL,
@@ -100,7 +103,7 @@ def _m1_initial_schema(conn: sqlite3.Connection) -> None:
         );
 
         -- Alarm tanımları (state machine: armed/triggered/cooldown)
-        CREATE TABLE alerts (
+        CREATE TABLE IF NOT EXISTS alerts (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           alert_id TEXT NOT NULL UNIQUE,
           definition TEXT NOT NULL,
@@ -110,7 +113,7 @@ def _m1_initial_schema(conn: sqlite3.Connection) -> None:
         );
 
         -- Tetiklenen alarm kayıtları (dedup key: alert_id + trigger_key)
-        CREATE TABLE triggered_alerts (
+        CREATE TABLE IF NOT EXISTS triggered_alerts (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           alert_id TEXT NOT NULL,
           trigger_key TEXT NOT NULL,
@@ -120,7 +123,7 @@ def _m1_initial_schema(conn: sqlite3.Connection) -> None:
         );
 
         -- Çoklu hesap (key'ler DPAPI/Modül 3 ile şifrelenir)
-        CREATE TABLE accounts (
+        CREATE TABLE IF NOT EXISTS accounts (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           account_id TEXT NOT NULL UNIQUE,
           label TEXT,
@@ -134,7 +137,7 @@ def _m1_initial_schema(conn: sqlite3.Connection) -> None:
         );
 
         -- Append-only, hash-chain'li audit log (sır asla yazılmaz)
-        CREATE TABLE audit_log (
+        CREATE TABLE IF NOT EXISTS audit_log (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           seq INTEGER NOT NULL UNIQUE,
           actor TEXT NOT NULL,
@@ -175,7 +178,7 @@ def _m4_risk_policy(conn: sqlite3.Connection) -> None:
         -- max_notional_per_order / max_aggregate_exposure cap'leri:
         --   REAL NULL = sınırsız; varsa KATI üst sınırdır (tolerans uygulanmaz).
         -- allowed_symbols: JSON string listesi; boş [] = tüm semboller serbest.
-        CREATE TABLE risk_policy (
+        CREATE TABLE IF NOT EXISTS risk_policy (
           account_id TEXT PRIMARY KEY,
           max_notional_per_order REAL,
           max_aggregate_exposure REAL,
@@ -188,7 +191,7 @@ def _m4_risk_policy(conn: sqlite3.Connection) -> None:
         -- Tek kullanımlık override state machine: reserved -> applied|reconciled
         -- (account_id, policy_version, idempotency_key, actor, expires_at) taşır.
         -- consumed_by_idem = override'ı tüketen emir isteğinin idempotency key'i.
-        CREATE TABLE risk_override (
+        CREATE TABLE IF NOT EXISTS risk_override (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           override_id TEXT NOT NULL UNIQUE,
           account_id TEXT NOT NULL,
@@ -207,7 +210,7 @@ def _m4_risk_policy(conn: sqlite3.Connection) -> None:
           UNIQUE (account_id, idempotency_key)
         );
 
-        CREATE INDEX idx_risk_override_account ON risk_override (account_id, state, expires_at);
+        CREATE INDEX IF NOT EXISTS idx_risk_override_account ON risk_override (account_id, state, expires_at);
         """
     )
 
@@ -219,7 +222,7 @@ def _m5_orders(conn: sqlite3.Connection) -> None:
         -- status: NEW | PARTIALLY_FILLED | FILLED | CANCELED | REJECTED | EXPIRED | UNKNOWN | PAPER
         -- (account_id, idempotency_key) UNIQUE -> aynı anahtarla retry çift emir üretmez,
         --   stored emir döner / durum reconcile edilir.
-        CREATE TABLE orders (
+        CREATE TABLE IF NOT EXISTS orders (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           order_id TEXT NOT NULL UNIQUE,
           account_id TEXT NOT NULL,
@@ -244,8 +247,8 @@ def _m5_orders(conn: sqlite3.Connection) -> None:
           UNIQUE (account_id, idempotency_key)
         );
 
-        CREATE INDEX idx_orders_account ON orders (account_id, status);
-        CREATE INDEX idx_orders_open ON orders (account_id, status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_orders_account ON orders (account_id, status);
+        CREATE INDEX IF NOT EXISTS idx_orders_open ON orders (account_id, status, created_at);
         """
     )
 
@@ -256,7 +259,7 @@ def _m6_emergency_reconciled(conn: sqlite3.Connection) -> None:
         -- emergency_stop log dosyasından audit_log'a reconcile edilen entry'ler.
         -- entry_hash UNIQUE -> daemon açılışında aynı emergency entry ikinci kez
         -- audit_log'a yazılmaz (idempotent reconcile).
-        CREATE TABLE emergency_reconciled (
+        CREATE TABLE IF NOT EXISTS emergency_reconciled (
           entry_hash TEXT PRIMARY KEY,
           seq INTEGER NOT NULL,
           reconciled_at INTEGER NOT NULL
@@ -286,7 +289,7 @@ def _m8_pending_orders(conn: sqlite3.Connection) -> None:
     """
     conn.executescript(
         """
-        CREATE TABLE pending_orders (
+        CREATE TABLE IF NOT EXISTS pending_orders (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           order_id TEXT NOT NULL UNIQUE,
           alert_id TEXT NOT NULL,
@@ -329,6 +332,27 @@ def _m10_stop_limit_price(conn: sqlite3.Connection) -> None:
     conn.execute("ALTER TABLE orders ADD COLUMN stop_limit_price REAL")
 
 
+def _m11_pending_execution_state(conn: sqlite3.Connection) -> None:
+    """Pending execution attempt/reconcile state (T00 contract)."""
+
+    columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(pending_orders)").fetchall()
+    }
+    additions = (
+        ("execution_started_at", "INTEGER"),
+        ("execution_finished_at", "INTEGER"),
+        ("execution_error_code", "TEXT"),
+        ("execution_error_message", "TEXT"),
+        ("last_attempt_at", "INTEGER"),
+    )
+    for name, definition in additions:
+        if name not in columns:
+            conn.execute(
+                f"ALTER TABLE pending_orders ADD COLUMN {name} {definition}"
+            )
+
+
 MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (1, "initial_schema", _m1_initial_schema),
     (2, "indexes", _m2_indexes),
@@ -340,7 +364,65 @@ MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (8, "pending_orders", _m8_pending_orders),
     (9, "orders_stop_price", _m9_stop_price),
     (10, "orders_stop_limit_price", _m10_stop_limit_price),
+    (11, "pending_execution_state", _m11_pending_execution_state),
 ]
+
+
+@contextmanager
+def _migration_lock(db_path: Path):
+    """Cross-process migration lock for daemon and standalone kill-switch."""
+
+    lock_path = db_path.with_name(db_path.name + ".migrations.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0)
+    fd = os.open(str(lock_path), flags)
+    acquired = False
+    deadline = time.monotonic() + 30.0
+    try:
+        if os.fstat(fd).st_size == 0:
+            os.write(fd, b"0")
+        if os.name == "nt":
+            import msvcrt
+
+            while True:
+                try:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    acquired = True
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("migration lock alınamadı")
+                    time.sleep(0.05)
+        else:
+            import fcntl
+
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("migration lock alınamadı")
+                    time.sleep(0.05)
+        yield
+    finally:
+        if acquired:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+        else:
+            os.close(fd)
 
 
 def applied_versions(conn: sqlite3.Connection) -> set[int]:
@@ -364,22 +446,23 @@ async def run_migrations(db: Database) -> list[int]:
     """
 
     def _run(conn: sqlite3.Connection) -> list[int]:
-        conn.execute(SCHEMA_BOOTSTRAP)
-        existing_versions = applied_versions(conn)
-        existing_names = applied_names(conn)
-        applied: list[int] = []
-        for version, name, fn in MIGRATIONS:
-            if version in existing_versions or name in existing_names:
-                continue
-            with conn:  # her migration tek transaction
-                fn(conn)
-                conn.execute(
-                    "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
-                    (version, name, int(time.time())),
-                )
-            applied.append(version)
-            logger.info("migration %d (%s) uygulandı", version, name)
-        return applied
+        with _migration_lock(db.path):
+            conn.execute(SCHEMA_BOOTSTRAP)
+            existing_versions = applied_versions(conn)
+            existing_names = applied_names(conn)
+            applied: list[int] = []
+            for version, name, fn in MIGRATIONS:
+                if version in existing_versions or name in existing_names:
+                    continue
+                with conn:  # her migration tek transaction
+                    fn(conn)
+                    conn.execute(
+                        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+                        (version, name, int(time.time())),
+                    )
+                applied.append(version)
+                logger.info("migration %d (%s) uygulandı", version, name)
+            return applied
 
     return await db.write(_run)
 
