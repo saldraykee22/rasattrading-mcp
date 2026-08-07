@@ -1215,9 +1215,14 @@ class OrderService:
     ) -> dict:
         account_id = account["account_id"]
         try:
-            found = await self.broker.query_order(
-                account_id=account_id, symbol=symbol, client_order_id=client_order_id
-            )
+            if order["order_type"] == "OCO":
+                found = await self.broker.query_oco(
+                    account_id=account_id, list_client_order_id=client_order_id
+                )
+            else:
+                found = await self.broker.query_order(
+                    account_id=account_id, symbol=symbol, client_order_id=client_order_id
+                )
         except RasatError:
             found = None
         if found is not None:
@@ -1330,7 +1335,8 @@ class OrderService:
         kalır ve exposure'ı (`_current_exposure`/`_open_order_notional`) sonsuza dek
         şişirir. Her kayıt Binance `query_order` ile gerçek duruma çekilir;
         borsada doğrulanamayan `UNKNOWN` olur (körlemesine tekrar gönderim yok —
-        reconcile-before-retry sözleşmesi).
+        reconcile-before-retry sözleşmesi). OCO listeleri `query_oco` ile,
+        tekil emirler `query_order` ile sorgulanır.
         """
         account_ids = [
             acc["account_id"]
@@ -1355,11 +1361,17 @@ class OrderService:
         errors: list[dict] = []
         for order in stuck:
             try:
-                found = await self.broker.query_order(
-                    account_id=order["account_id"],
-                    symbol=order["symbol"],
-                    client_order_id=order["client_order_id"],
-                )
+                if order["order_type"] == "OCO":
+                    found = await self.broker.query_oco(
+                        account_id=order["account_id"],
+                        list_client_order_id=order["client_order_id"],
+                    )
+                else:
+                    found = await self.broker.query_order(
+                        account_id=order["account_id"],
+                        symbol=order["symbol"],
+                        client_order_id=order["client_order_id"],
+                    )
             except RasatError as exc:
                 errors.append(
                     {"order_id": order["order_id"], "symbol": order["symbol"],

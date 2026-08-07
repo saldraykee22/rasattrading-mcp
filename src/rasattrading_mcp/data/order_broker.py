@@ -4,7 +4,8 @@
 `BinanceOrderBroker` ile çalışır.
 
 - `place_order` → emir gönderir (clientOrderId ile), gerçek Binance state'i döner.
-- `query_order` → reconcile-before-retry için emri `clientOrderId` ile sorgular.
+- `query_order` → reconcile-before-retry için tekil emri `clientOrderId` ile sorgular.
+- `query_oco` → OCO listesini `listClientOrderId` ile sorgular.
 - `get_balance` → daemon'ın kendi taze bakiye snapshot'ı (agent rakamlarına güvenilmez).
 
 Status değerleri Binance'in gerçek state machine'ini yansıtır:
@@ -70,6 +71,13 @@ class OrderBroker(Protocol):
         account_id: str,
         symbol: str,
         client_order_id: str,
+    ) -> OrderResult | None: ...
+
+    async def query_oco(
+        self,
+        *,
+        account_id: str,
+        list_client_order_id: str,
     ) -> OrderResult | None: ...
 
     async def cancel_order(
@@ -303,6 +311,41 @@ class BinanceOrderBroker:
                 return None
             raise
         return self._order_result(data)
+
+    async def query_oco(self, *, account_id: str, list_client_order_id: str) -> OrderResult | None:
+        """OCO'yu `listClientOrderId` ile sorgular (`GET /api/v3/orderList`).
+
+        `query_order`'dan farklı: OCO'nun bacakları Binance'in kendi ürettiği
+        clientOrderId'leri taşır, bizim `listClientOrderId`'imiz yalnızca
+        orderList seviyesinde sorgulanabilir — tekil `/api/v3/order` ile
+        bulunamaz (bu yüzden eskiden hep UNKNOWN'a düşüyordu).
+        """
+        try:
+            data = await self._request(
+                "GET",
+                "/api/v3/orderList",
+                account_id,
+                {"origClientOrderId": list_client_order_id},
+            )
+        except RasatError as exc:
+            if exc.code == ErrorCode.ORDER_REJECTED and exc.details and exc.details.get("binance_code") == -2013:
+                return None
+            raise
+        list_status = str(data.get("listOrderStatus") or "").upper()
+        # EXECUTING = OCO hâlâ borsada aktif/canlı (koruma yerinde) → NEW.
+        # ALL_DONE = bacaklardan biri doldu/iptal oldu, liste tamamlandı → terminal.
+        # Diğer/bilinmeyen değerler UNKNOWN'a düşer (körlemesine "canlı" varsayılmaz).
+        if list_status == "EXECUTING":
+            status = "NEW"
+        elif list_status == "ALL_DONE":
+            status = "FILLED"
+        else:
+            status = "UNKNOWN"
+        return OrderResult(
+            status=status,
+            exchange_order_id=str(data.get("orderListId")) if data.get("orderListId") is not None else None,
+            raw=data,
+        )
 
     async def cancel_order(self, *, account_id: str, symbol: str, client_order_id: str) -> OrderResult | None:
         try:

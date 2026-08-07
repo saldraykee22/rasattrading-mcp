@@ -126,6 +126,8 @@ class FakeOrderBroker:
     - `query_order` `queries` listesine eklenir; `query_results` dict'i
       {client_order_id: OrderResult|None} verilirse onu döner, yoksa son
       `placed` kaydını döner (bulunamadı → None).
+    - `query_oco` `oco_queries` listesine eklenir; `oco_query_results` ve
+      `oco_query_results_by_account` dict'leri OCO liste sorgularını simüle eder.
     - `balances` dict'i {account_id: {asset: free}} bakiye simülasyonu.
     - `locked_balances` dict'i {account_id: {asset: locked}} açık emirlerde kilitli
       miktarları simüle eder (3.21); `get_balance_detail` bunu free ile birleştirir.
@@ -134,6 +136,7 @@ class FakeOrderBroker:
     def __init__(self, balances: dict[str, dict] | None = None) -> None:
         self.placed: list[dict] = []
         self.queries: list[dict] = []
+        self.oco_queries: list[dict] = []
         self.cancelled: list[dict] = []
         self.balances = balances or {}
         self.locked_balances: dict[str, dict] = {}
@@ -142,6 +145,8 @@ class FakeOrderBroker:
         self.place_errors_by_account: dict[str, Exception] = {}
         self.query_results: dict[str, object | None] = {}
         self.query_results_by_account: dict[str, object | None] = {}
+        self.oco_query_results: dict[str, object | None] = {}
+        self.oco_query_results_by_account: dict[str, object | None] = {}
         self.cancel_errors: dict[str, Exception] = {}
         self.cancel_all_errors: dict[str, Exception] = {}
         #: Borsada duran (local DB'de kaydı olmayabilir) açık emirler.
@@ -248,6 +253,21 @@ class FakeOrderBroker:
         if not match:
             return None
         return OrderResult(status="FILLED", exchange_order_id="EX1", executed_qty=match[0]["quantity"])
+
+    async def query_oco(self, *, account_id, list_client_order_id):
+        self.oco_queries.append(
+            {"account_id": account_id, "list_client_order_id": list_client_order_id}
+        )
+        from rasattrading_mcp.data.order_broker import OrderResult
+
+        if account_id in self.oco_query_results_by_account:
+            return self.oco_query_results_by_account[account_id]
+        if list_client_order_id in self.oco_query_results:
+            return self.oco_query_results[list_client_order_id]
+        match = [p for p in self.placed if p.get("client_order_id") == list_client_order_id and p.get("order_type") == "OCO"]
+        if not match:
+            return None
+        return OrderResult(status="NEW", exchange_order_id="OL1")
 
     async def cancel_order(self, *, account_id, symbol, client_order_id):
         if client_order_id in self.cancel_errors:

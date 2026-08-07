@@ -476,7 +476,7 @@ async def test_oco_raw_timeout_no_blind_resend(ex_ctx):
     service = ctx["service"]
     cid = to_client_order_id("idem-oco-timeout")
     ctx["broker"].place_errors[cid] = asyncio.TimeoutError("ağ timeout")
-    ctx["broker"].query_results[cid] = None
+    ctx["broker"].oco_query_results[cid] = None
 
     result = await service.place_oco_order(
         account_id=account_id, symbol="BTCUSDT", side="SELL",
@@ -486,6 +486,67 @@ async def test_oco_raw_timeout_no_blind_resend(ex_ctx):
     assert result["status"] == "UNKNOWN"
     assert result["error"]["code"] == ErrorCode.ORDER_UNKNOWN
     assert len(ctx["broker"].placed) == 1
+
+
+async def test_oco_raw_timeout_reconciles_executing_to_new(ex_ctx):
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
+    service = ctx["service"]
+    cid = to_client_order_id("idem-oco-timeout-executing")
+    ctx["broker"].place_errors[cid] = asyncio.TimeoutError("ağ timeout")
+    ctx["broker"].oco_query_results[cid] = OrderResult(
+        status="NEW", exchange_order_id="OL-EXECUTING",
+    )
+
+    result = await service.place_oco_order(
+        account_id=account_id, symbol="BTCUSDT", side="SELL",
+        quantity=1.0, price=110.0, stop_price=95.0, stop_limit_price=94.0,
+        idempotency_key="idem-oco-timeout-executing",
+    )
+
+    assert result["status"] == "NEW"
+    assert result["exchange_order_id"] == "OL-EXECUTING"
+    assert len(ctx["broker"].oco_queries) == 1
+    assert ctx["broker"].queries == []
+    assert len(ctx["broker"].placed) == 1
+
+
+async def test_reconcile_open_oco_uses_query_oco_for_executing(ex_ctx):
+    ctx = ex_ctx
+    account_id = await _add_real_account(ctx)
+    service = ctx["service"]
+    cid = to_client_order_id("oco-startup-executing")
+
+    def _insert(conn):
+        order = service._insert_order(
+            conn, account_id=account_id, idempotency_key="oco-startup-executing",
+            symbol="BTCUSDT", side="SELL", order_type="OCO", quantity=1.0,
+            price=110.0, stop_price=95.0, stop_limit_price=94.0, notional=100.0,
+            reference_price=100.0, equity_snapshot=0.0, status="NEW",
+            client_order_id=cid,
+        )
+        return order["order_id"]
+
+    order_id = await ctx["db"].write(_insert)
+    ctx["broker"].oco_query_results[cid] = OrderResult(
+        status="NEW", exchange_order_id="OL-STARTUP",
+    )
+
+    result = await service.reconcile_open_orders()
+
+    assert result["scanned"] == 1
+    assert result["reconciled"] == 1
+    assert result["unchanged"] == 0
+    assert len(ctx["broker"].oco_queries) == 1
+    assert ctx["broker"].oco_queries[0]["list_client_order_id"] == cid
+    assert ctx["broker"].queries == []
+
+    def _q(conn):
+        return dict(conn.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,)).fetchone())
+
+    row = await ctx["db"].read(_q)
+    assert row["status"] == "NEW"
+    assert row["exchange_order_id"] == "OL-STARTUP"
 
 
 async def test_broker_request_maps_timeout_to_timestamp():
