@@ -60,7 +60,7 @@ class FakeRest:
                     for s in fapi_symbols
                 ]
             }
-        if path == "/api/v3/klines":
+        if path in ("/api/v3/klines", "/fapi/v1/klines"):
             symbol = params.get("symbol")
             if symbol in self.fail_kline_for:
                 raise RuntimeError(f"fake network error for {symbol}")
@@ -83,6 +83,37 @@ class FakeRest:
                 }
             ]
         raise AssertionError(f"FakeRest bilinmeyen path: {path}")
+
+
+class FakeClock:
+    """BinanceClock taklidi: offset ve availability testte kontrol edilebilir.
+
+    - `server_now()` `available` ise `time.time() + offset_seconds` döner;
+      değilse `None` (fail-closed senaryoları).
+    - `set_offset` / `set_available` ile host-sunucu saat kayması ve
+      clock-unavailable durumları simüle edilir.
+    """
+
+    def __init__(self, offset: float = 0.0, available: bool = True) -> None:
+        self.offset_seconds = float(offset)
+        self._available = available
+
+    def server_now(self) -> float | None:
+        if not self._available:
+            return None
+        import time
+
+        return time.time() + self.offset_seconds
+
+    @property
+    def available(self) -> bool:
+        return self._available
+
+    def set_offset(self, offset: float) -> None:
+        self.offset_seconds = float(offset)
+
+    def set_available(self, available: bool) -> None:
+        self._available = available
 
 
 class FakeOrderBroker:

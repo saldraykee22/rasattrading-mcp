@@ -74,12 +74,12 @@ async def test_pa_freshness_fresh_for_latest_closed(db):
 
 
 async def test_klineservice_freshness_uses_seconds(db, cfg):
-    from tests.helpers import FakeRest
+    from tests.helpers import FakeClock, FakeRest
     from rasattrading_mcp.data.universe import UniverseService
 
     fake = FakeRest(["BTCUSDT"])
     uni = UniverseService(fake, cfg)
-    svc = KlineService(fake, db, uni, cfg)
+    svc = KlineService(fake, fake, db, uni, cfg, clock=FakeClock())
 
     latest_closed = int(time.time() // PERIOD) * PERIOD - PERIOD
     fresh_rows = [{"open_time": latest_closed - 5 * PERIOD}, {"open_time": latest_closed}]
@@ -90,13 +90,13 @@ async def test_klineservice_freshness_uses_seconds(db, cfg):
 
 async def test_get_candles_cold_seconds_trigger_refetch(cfg, db):
     """Saniye cinsinden eski mum 'warm' sanılmamalı → öncelikli yeniden çekim tetiklenmeli."""
-    from tests.helpers import FakeRest
+    from tests.helpers import FakeClock, FakeRest
     from rasattrading_mcp.data.universe import UniverseService
 
     fake = FakeRest(["BTCUSDT"])
     uni = UniverseService(fake, cfg)
     await uni.sync()
-    svc = KlineService(fake, db, uni, cfg)
+    svc = KlineService(fake, fake, db, uni, cfg, clock=FakeClock())
     await svc.start()
     try:
 

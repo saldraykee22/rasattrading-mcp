@@ -95,14 +95,14 @@ async def test_s1_pa_meta_carries_freshness_note(db, cfg):
 
 
 async def test_s1_klineservice_freshness_strict(db, cfg):
-    """KlineService.freshness_for de fazladan bir period toleransı içermez."""
-    from tests.helpers import FakeRest
+    """KlineService.freshness_for da fazladan bir period toleransı içermez."""
+    from tests.helpers import FakeClock, FakeRest
     from rasattrading_mcp.data.klines import KlineService
     from rasattrading_mcp.data.universe import UniverseService
 
     fake = FakeRest(["BTCUSDT"])
     uni = UniverseService(fake, cfg)
-    svc = KlineService(fake, db, uni, cfg)
+    svc = KlineService(fake, fake, db, uni, cfg, clock=FakeClock())
     latest_closed = int(time.time() // PERIOD) * PERIOD - PERIOD
     fresh_rows = [{"open_time": latest_closed - 5 * PERIOD}, {"open_time": latest_closed}]
     stale_rows = [{"open_time": latest_closed - 5 * PERIOD}, {"open_time": latest_closed - PERIOD}]

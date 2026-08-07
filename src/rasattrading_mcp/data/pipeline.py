@@ -10,6 +10,7 @@ from ..config import Config
 from ..storage.db import Database
 from ..storage.retention import prune_candles, prune_futures_context
 from .binance_client import BinanceREST
+from .clock import BinanceClock
 from .futures import FuturesContextPoller
 from .klines import KlineService
 from .miniticker import MiniTickerClient, TickerCache
@@ -40,9 +41,10 @@ class DataPipeline:
         self.rest = rest or BinanceREST(config.rest_spot_base, self.budget)
         self.futures_rest = futures_rest or BinanceREST(config.rest_futures_base, self.budget)
         self.universe = UniverseService(self.rest, config)
+        self.clock = BinanceClock(self.rest)
         self.ticker_cache = TickerCache()
         self.miniticker = MiniTickerClient(config.ws_all_miniticker_url, self.ticker_cache)
-        self.klines = KlineService(self.rest, db, self.universe, config)
+        self.klines = KlineService(self.rest, self.futures_rest, db, self.universe, config, self.clock)
         self.futures = FuturesContextPoller(self.futures_rest, db, self.universe, config)
         self._stop = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
@@ -55,6 +57,11 @@ class DataPipeline:
             await self.universe.sync()
         except Exception:  # noqa: BLE001
             logger.warning("ilk universe senkronizasyonu başarısız — arka planda tekrar denenir")
+        # Server clock: kapanış/freshness kararlarının dayanağı. İlk senkron başarısızsa
+        # kline saklama fail-closed olur (stale) — arka plan döngüsü tekrar dener.
+        if not await self.clock.sync():
+            logger.warning("ilk server clock senkronu başarısız — kline verisi fail-closed stale kalır")
+        self.clock.start()
 
         self._tasks.append(asyncio.create_task(self.miniticker.run(self._stop)))
         await self.klines.start()
@@ -78,6 +85,7 @@ class DataPipeline:
     async def stop(self) -> None:
         self._stop.set()
         await self.klines.stop()
+        await self.clock.stop()
         for t in self._tasks:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)

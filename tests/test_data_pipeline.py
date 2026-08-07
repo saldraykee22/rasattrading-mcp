@@ -407,10 +407,13 @@ async def test_parse_klines_bad_row_skipped():
     assert rows[0]["open_time"] == 1700000000
 
 
+from tests.helpers import FakeClock
+
+
 async def _make_klines(cfg, db, fake):
     universe = UniverseService(fake, cfg)
     await universe.sync()
-    service = KlineService(fake, db, universe, cfg)
+    service = KlineService(fake, fake, db, universe, cfg, clock=FakeClock())
     await service.start()
     return universe, service
 
