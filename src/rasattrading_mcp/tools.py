@@ -216,7 +216,9 @@ register_tool(
         description=(
             "Hesap için isteğe bağlı risk politikası tanımlar: max_notional_per_order, "
             "max_aggregate_exposure, allowed_symbols. Varsayılan tamamen boş/limitsiz. "
-            "Cap'ler KATI üst sınırdır — tolerans uygulanmaz, yuvarlama sonrası nihai değer `<= cap` olmalıdır."
+            "Cap'ler KATI üst sınırdır — tolerans uygulanmaz, yuvarlama sonrası nihai değer `<= cap` olmalıdır. "
+            "Patch'te gönderilmeyen değerler korunur; temizleme yalnızca açık `clear_max_notional`, "
+            "`clear_max_exposure` veya `clear_allowed_symbols` boolean'larıyla yapılır."
         ),
         input_schema={
             "type": "object",
@@ -225,6 +227,9 @@ register_tool(
                 "max_notional_per_order": {"type": "number", "exclusiveMinimum": 0},
                 "max_aggregate_exposure": {"type": "number", "exclusiveMinimum": 0},
                 "allowed_symbols": {"type": "array", "items": {"type": "string", "minLength": 1}},
+                "clear_max_notional": {"type": "boolean", "description": "max_notional_per_order değerini temizle"},
+                "clear_max_exposure": {"type": "boolean", "description": "max_aggregate_exposure değerini temizle"},
+                "clear_allowed_symbols": {"type": "boolean", "description": "allowed_symbols listesini temizle"},
                 "request_id": {"type": "string"},
                 "idempotency_key": {"type": "string"},
             },
@@ -426,7 +431,9 @@ register_tool(
             "Hesabın (veya account_id='all' ise tüm hesapların) açık emirlerini iptal edip "
             "base asset bakiyelerini market fiyatından satar. Kısmi başarıda hangi hesabın "
             "kapandığı/kapanamadığı açıkça raporlanır; idempotenttir (tekrar çalıştırma çift "
-            "satış yapmaz)."
+            "satış yapmaz). Paper hesapta gerçek bakiye satışı yapılmaz; yanıt `closed=false`, "
+            "`simulated=true` ve `position_close_supported=false` ile yalnızca yerel emir iptalini belirtir. "
+            "İptal geçişleri audit_log'a yazılır."
         ),
         input_schema={
             "type": "object",
