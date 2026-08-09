@@ -2,8 +2,6 @@
 
 AI ajanları için Binance price-action/likidite odaklı MCP sunucusu. Python 3.11, `daemon + ince MCP stdio adapter` mimarisi.
 
-Mimari plan ve ticket'lar (kaynak-of-truth): `C:\Users\alper\.traycer\epics\b7178432-700a-4e7d-98d0-fb965693339d\artifacts\rasattrading-mcp-mimari\`
-
 ## Proje yapısı
 
 ```
