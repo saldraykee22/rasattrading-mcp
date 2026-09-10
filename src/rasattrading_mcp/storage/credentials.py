@@ -75,7 +75,7 @@ class SecretStore:
     @staticmethod
     def _validate_secret(value: str) -> None:
         if not isinstance(value, str) or not value:
-            raise SecretStoreError("credential değeri geçerli bir string olmalı")
+            raise SecretStoreError("credential value must be a valid string")
 
     @staticmethod
     def _keyring_username(account_id: str, field: str) -> str:
@@ -100,15 +100,15 @@ class SecretStore:
                 # the ``(description, bytes)`` tuple used by UnprotectData.
                 ciphertext = protected[1] if isinstance(protected, tuple) else protected
                 if not isinstance(ciphertext, (bytes, bytearray)):
-                    raise TypeError("DPAPI ciphertext tipi geçersiz")
+                    raise TypeError("DPAPI ciphertext has an invalid type")
                 return self.DPAPI_PREFIX + bytes(ciphertext)
             except Exception as exc:  # noqa: BLE001 - do not leak provider details
                 # Do not silently downgrade a Windows installation that has
                 # DPAPI available: an arbitrary keyring backend could be a
                 # plaintext file backend.  Fail closed instead.
-                logger.warning("DPAPI credential encryption başarısız")
+                logger.warning("DPAPI credential encryption failed")
                 if os.name == "nt" and self._win32crypt is not None:
-                    raise SecretStoreUnavailable("Windows DPAPI kullanılamıyor") from exc
+                    raise SecretStoreUnavailable("Windows DPAPI is unavailable") from exc
 
         if self._keyring is not None:
             username = self._keyring_username(account_id, field)
@@ -116,48 +116,48 @@ class SecretStore:
                 self._keyring.set_password(self.KEYRING_SERVICE, username, value)
                 return self.KEYRING_PREFIX + username.encode("utf-8")
             except Exception as exc:  # noqa: BLE001 - provider may include secret text
-                raise SecretStoreUnavailable("OS credential backend kullanılamıyor") from exc
+                raise SecretStoreUnavailable("OS credential backend is unavailable") from exc
 
-        raise SecretStoreUnavailable("Windows DPAPI/keyring backend kullanılamıyor")
+        raise SecretStoreUnavailable("Windows DPAPI/keyring backend is unavailable")
 
     def decrypt(self, account_id: str, field: str, opaque: bytes) -> str:
         """Decrypt an opaque value for internal execution use only."""
 
         if not isinstance(opaque, (bytes, bytearray)):
-            raise SecretDecryptError("credential ciphertext tipi geçersiz")
+            raise SecretDecryptError("credential ciphertext has an invalid type")
         blob = bytes(opaque)
         if blob.startswith(self.DPAPI_PREFIX):
             if self._win32crypt is None:
-                raise SecretDecryptError("DPAPI backend kullanılamıyor")
+                raise SecretDecryptError("DPAPI backend is unavailable")
             try:
                 _description, plaintext = self._win32crypt.CryptUnprotectData(blob[len(self.DPAPI_PREFIX) :], None)
                 if isinstance(plaintext, bytes):
                     return plaintext.decode("utf-8")
                 if isinstance(plaintext, str):
                     return plaintext
-                raise TypeError("DPAPI plaintext tipi geçersiz")
+                raise TypeError("DPAPI plaintext has an invalid type")
             except Exception as exc:  # noqa: BLE001 - never expose ciphertext/secret
-                raise SecretDecryptError("credential çözülemedi") from exc
+                raise SecretDecryptError("could not decrypt credential") from exc
 
         if blob.startswith(self.KEYRING_PREFIX):
             if self._keyring is None:
-                raise SecretDecryptError("keyring backend kullanılamıyor")
+                raise SecretDecryptError("keyring backend is unavailable")
             try:
                 username = blob[len(self.KEYRING_PREFIX) :].decode("utf-8", errors="strict")
                 # Do not trust a copied descriptor to read another field/account.
                 expected = self._keyring_username(account_id, field)
                 if username != expected:
-                    raise SecretDecryptError("credential referansı geçersiz")
+                    raise SecretDecryptError("invalid credential reference")
                 value = self._keyring.get_password(self.KEYRING_SERVICE, username)
             except Exception as exc:  # noqa: BLE001
                 if isinstance(exc, SecretDecryptError):
                     raise
-                raise SecretDecryptError("credential çözülemedi") from exc
+                raise SecretDecryptError("could not decrypt credential") from exc
             if not isinstance(value, str) or not value:
-                raise SecretDecryptError("credential bulunamadı")
+                raise SecretDecryptError("credential not found")
             return value
 
-        raise SecretDecryptError("bilinmeyen credential formatı")
+        raise SecretDecryptError("unknown credential format")
 
     def delete(self, account_id: str, field: str, opaque: bytes | None) -> None:
         """Best-effort cleanup for keyring references; DPAPI needs no cleanup."""
@@ -173,7 +173,7 @@ class SecretStore:
                 return
             self._keyring.delete_password(self.KEYRING_SERVICE, username)
         except Exception:  # noqa: BLE001 - deletion must not log credential material
-            logger.warning("keyring credential cleanup başarısız (account_id=%s, field=%s)", account_id, field)
+            logger.warning("keyring credential cleanup failed (account_id=%s, field=%s)", account_id, field)
 
 
 # Explicit alias for callers/tests that want to document the primary backend.

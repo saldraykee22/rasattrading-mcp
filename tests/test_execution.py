@@ -32,7 +32,7 @@ FILTERS = SymbolFilters(
 
 
 class FakeMarket:
-    """MarketFeed taklidi: sabit fiyat + filtre; stale sembolü taklit edebilir."""
+    """MarketFeed double: fixed price + filters; can simulate a stale symbol."""
 
     def __init__(self) -> None:
         self.price_map = {"BTCUSDT": 100.0, "ETHUSDT": 50.0}
@@ -122,7 +122,7 @@ async def test_same_idempotency_key_no_double_order(ex_ctx):
     )
     assert second["order_id"] == first["order_id"]
     assert second["status"] == "FILLED"
-    assert len(ctx["broker"].placed) == 1  # çift emir yok
+    assert len(ctx["broker"].placed) == 1  # No duplicate order.
 
     rows = await _order_rows(ctx["db"])
     assert len(rows) == 1
@@ -133,7 +133,7 @@ async def test_retry_after_timeout_reconciles_not_replaces(ex_ctx):
     account_id = await _add_real_account(ctx)
     service = ctx["service"]
     cid = to_client_order_id("idem-reconcile")
-    ctx["broker"].place_errors[cid] = RasatError(ErrorCode.TIMEOUT, "ağ zaman aşımı")
+    ctx["broker"].place_errors[cid] = RasatError(ErrorCode.TIMEOUT, "network timeout")
     ctx["broker"].query_results[cid] = OrderResult(status="FILLED", exchange_order_id="EX777", executed_qty=1.0, avg_price=100.0)
 
     result = await service.place_order(
@@ -142,8 +142,8 @@ async def test_retry_after_timeout_reconciles_not_replaces(ex_ctx):
     )
     assert result["status"] == "FILLED"
     assert result["exchange_order_id"] == "EX777"
-    assert len(ctx["broker"].placed) == 1  # körlemesine tekrar gönderim yok
-    assert len(ctx["broker"].queries) == 1  # reconcile sorgulandı
+    assert len(ctx["broker"].placed) == 1  # No blind resubmission.
+    assert len(ctx["broker"].queries) == 1  # Reconciliation was queried.
 
 
 async def test_timeout_unknown_no_blind_retry(ex_ctx):
@@ -151,8 +151,8 @@ async def test_timeout_unknown_no_blind_retry(ex_ctx):
     account_id = await _add_real_account(ctx)
     service = ctx["service"]
     cid = to_client_order_id("idem-unknown")
-    ctx["broker"].place_errors[cid] = RasatError(ErrorCode.TIMEOUT, "ağ zaman aşımı")
-    ctx["broker"].query_results[cid] = None  # Binance'te bulunamadı
+    ctx["broker"].place_errors[cid] = RasatError(ErrorCode.TIMEOUT, "network timeout")
+    ctx["broker"].query_results[cid] = None  # Not found on Binance.
 
     result = await service.place_order(
         account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="MARKET",
@@ -164,14 +164,14 @@ async def test_timeout_unknown_no_blind_retry(ex_ctx):
 
 
 async def test_unknown_retry_requeries_and_discovers_filled(ex_ctx):
-    # 3.17: UNKNOWN kayıtlı emir, aynı key ile retry'de Binance'e TEKRAR sorulur;
-    # gerçekte FILLED olmuşsa kayıt güncellenir ve stored UNKNOWN dönmez.
+    # 3.17: an order recorded as UNKNOWN is queried AGAIN on Binance during a
+    # retry with the same key; if actually FILLED, update the record and do not return UNKNOWN.
     ctx = ex_ctx
     account_id = await _add_real_account(ctx)
     service = ctx["service"]
     cid = to_client_order_id("idem-unknown-fill")
-    ctx["broker"].place_errors[cid] = RasatError(ErrorCode.TIMEOUT, "ağ zaman aşımı")
-    ctx["broker"].query_results[cid] = None  # ilk deneme: bulunamadı → UNKNOWN
+    ctx["broker"].place_errors[cid] = RasatError(ErrorCode.TIMEOUT, "network timeout")
+    ctx["broker"].query_results[cid] = None  # First attempt: not found → UNKNOWN.
 
     first = await service.place_order(
         account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="MARKET",
@@ -179,7 +179,7 @@ async def test_unknown_retry_requeries_and_discovers_filled(ex_ctx):
     )
     assert first["status"] == "UNKNOWN"
 
-    # ikinci retry: emir artık Binance'te FILLED görünüyor
+    # Second retry: the order now appears FILLED on Binance.
     ctx["broker"].place_errors.pop(cid)
     ctx["broker"].query_results[cid] = OrderResult(status="FILLED", exchange_order_id="EX-FILL", executed_qty=1.0, avg_price=100.0)
 
@@ -189,19 +189,19 @@ async def test_unknown_retry_requeries_and_discovers_filled(ex_ctx):
     )
     assert second["status"] == "FILLED"
     assert second["exchange_order_id"] == "EX-FILL"
-    assert len(ctx["broker"].placed) == 1  # çift emir yok
-    # kayıt güncellendi
+    assert len(ctx["broker"].placed) == 1  # No duplicate order.
+    # Record updated.
     rows = await _order_rows(ctx["db"])
     assert rows[0]["status"] == "FILLED"
 
 
 async def test_unknown_retry_still_unknown_when_not_found(ex_ctx):
-    # 3.17: UNKNOWN kayıt, retry'de borsada hâlâ doğrulanamıyorsa UNKNOWN kalır.
+    # 3.17: an UNKNOWN record remains UNKNOWN when it is still unverified on retry.
     ctx = ex_ctx
     account_id = await _add_real_account(ctx)
     service = ctx["service"]
     cid = to_client_order_id("idem-unknown-2")
-    ctx["broker"].place_errors[cid] = RasatError(ErrorCode.TIMEOUT, "ağ zaman aşımı")
+    ctx["broker"].place_errors[cid] = RasatError(ErrorCode.TIMEOUT, "network timeout")
     ctx["broker"].query_results[cid] = None
 
     await service.place_order(
@@ -213,18 +213,18 @@ async def test_unknown_retry_still_unknown_when_not_found(ex_ctx):
         quantity=1.0, idempotency_key="idem-unknown-2",
     )
     assert second["status"] == "UNKNOWN"
-    assert len(ctx["broker"].placed) == 1  # körlemesine tekrar gönderim yok
-    # ikinci retry de Binance'i sorguladı (reconcile)
+    assert len(ctx["broker"].placed) == 1  # No blind resubmission.
+    # The second retry also queried Binance (reconciliation).
     assert len(ctx["broker"].queries) == 2
 
 
 async def test_unknown_order_included_in_total_exposure(ex_ctx):
-    # 3.17: UNKNOWN emirler exposure'a konservatif olarak (dolu varsayılarak) dahil.
+    # 3.17: Include UNKNOWN orders in exposure conservatively (assume filled).
     ctx = ex_ctx
     account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
     service = ctx["service"]
     cid = to_client_order_id("idem-exposure-unknown")
-    ctx["broker"].place_errors[cid] = RasatError(ErrorCode.TIMEOUT, "ağ zaman aşımı")
+    ctx["broker"].place_errors[cid] = RasatError(ErrorCode.TIMEOUT, "network timeout")
     ctx["broker"].query_results[cid] = None
 
     result = await service.place_order(
@@ -240,7 +240,7 @@ async def test_unknown_order_included_in_total_exposure(ex_ctx):
     assert exposure["total"] == pytest.approx(200.0)
 
 
-# ---------- idempotency preflight'tan önce (3.12) ----------
+# ---------- idempotency before preflight (3.12) ----------
 
 
 async def test_execute_retry_with_stale_price_returns_stored_result(ex_ctx):
@@ -254,7 +254,7 @@ async def test_execute_retry_with_stale_price_returns_stored_result(ex_ctx):
     )
     assert first["results"][0]["status"] == "FILLED"
 
-    # piyasa stale olsa bile aynı key → stored sonuç (STALE_DATA değil)
+    # Same key returns the stored result even when the market is stale (not STALE_DATA).
     ctx["market"].stale.add("BTCUSDT")
     second = await service.execute_on_accounts(
         account_ids=[account_id], symbol="BTCUSDT", side="BUY", entry=100, stop_loss=95,
@@ -262,7 +262,7 @@ async def test_execute_retry_with_stale_price_returns_stored_result(ex_ctx):
     )
     assert second["results"][0]["status"] == "FILLED"
     assert second["results"][0]["order_id"] == first["results"][0]["order_id"]
-    assert len(ctx["broker"].placed) == 1  # çift emir yok
+    assert len(ctx["broker"].placed) == 1  # No duplicate order.
 
 
 async def test_place_order_retry_with_stale_price_returns_stored_result(ex_ctx):
@@ -294,7 +294,7 @@ async def test_concurrent_same_account_no_race(ex_ctx):
     account_id = await _add_real_account(ctx)
     service = ctx["service"]
 
-    # Aynı hesapta farklı idempotency key'ler ile eşzamanlı — her ikisi de işlenmeli, race yok.
+    # Concurrent calls with different idempotency keys on one account—both must process, no race.
     results = await asyncio.gather(
         service.place_order(account_id=account_id, symbol="BTCUSDT", side="BUY",
                             order_type="MARKET", quantity=1.0, idempotency_key="concurrent-1"),
@@ -331,7 +331,7 @@ async def test_execute_on_accounts_partial_success(ex_ctx):
     ids = []
     for i in range(10):
         ids.append(await _add_real_account(ctx, label=f"acc{i}", tags=["batch"]))
-    # 3 hesabın bakiyesi 0 → yetersiz bakiye
+    # Three accounts have zero balance → insufficient balance.
     ctx["broker"].balances[ids[0]] = {"USDT": 0.0}
     ctx["broker"].balances[ids[1]] = {"USDT": 0.0}
     ctx["broker"].balances[ids[2]] = {"USDT": 0.0}
@@ -344,7 +344,7 @@ async def test_execute_on_accounts_partial_success(ex_ctx):
     assert result["count"] == 10
     assert result["succeeded"] == 7
     assert result["failed"] == 3
-    # kalan 7 hesap etkilenmedi — emirleri işlendi
+    # The remaining seven accounts were unaffected—their orders were processed.
     filled = [r for r in result["results"] if r["status"] == "FILLED"]
     assert len(filled) == 7
     rejected = [r for r in result["results"] if r["status"] == "REJECTED"]
@@ -400,14 +400,14 @@ async def test_override_allows_cap_exceedance_once(ex_ctx):
     await ctx["risk"].set_risk_policy(account_id, max_notional_per_order=150)
     service = ctx["service"]
 
-    # cap 150; 1 BTC * 100 = 100 notional → cap altında, geçer
+    # cap 150; 1 BTC * 100 = 100 notional → below cap, passes.
     ok = await service.place_order(
         account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="MARKET",
         quantity=1.0, idempotency_key="cap-ok",
     )
     assert ok["status"] == "FILLED"
 
-    # 2 BTC * 100 = 200 notional > 150 cap → override yoksa reddedilir
+    # 2 BTC * 100 = 200 notional > 150 cap → rejected without override.
     with pytest.raises(RasatError) as exc_info:
         await service.place_order(
             account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="MARKET",
@@ -415,15 +415,15 @@ async def test_override_allows_cap_exceedance_once(ex_ctx):
         )
     assert exc_info.value.code == ErrorCode.RISK_LIMIT_EXCEEDED
 
-    # tek kullanımlık override ile bir kez geçer
-    await ctx["risk"].create_override(account_id, reason="bilinçli aşım", idempotency_key="override-1")
+    # Passes once with a one-time override.
+    await ctx["risk"].create_override(account_id, reason="intentional exceedance", idempotency_key="override-1")
     allowed = await service.place_order(
         account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="MARKET",
         quantity=2.0, idempotency_key="cap-override",
     )
     assert allowed["status"] == "FILLED"
 
-    # override tüketildi; yeni aşım tekrar reddedilir
+    # Override consumed; a new exceedance is rejected again.
     with pytest.raises(RasatError) as exc_info:
         await service.place_order(
             account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="MARKET",
@@ -438,14 +438,14 @@ async def test_aggregate_exposure_cap_with_override(ex_ctx):
     await ctx["risk"].set_risk_policy(account_id, max_aggregate_exposure=250)
     service = ctx["service"]
 
-    # 1 BTC = 100 notional; toplam exposure 100 < 250 → geçer
+    # 1 BTC = 100 notional; total exposure 100 < 250 → passes.
     ok = await service.place_order(
         account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="MARKET",
         quantity=1.0, idempotency_key="agg-1",
     )
     assert ok["status"] == "FILLED"
 
-    # 2 BTC = 200; exposure 100+200=300 > 250 → reddedilir
+    # 2 BTC = 200; exposure 100+200=300 > 250 → rejected.
     with pytest.raises(RasatError) as exc_info:
         await service.place_order(
             account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="MARKET",
@@ -453,8 +453,8 @@ async def test_aggregate_exposure_cap_with_override(ex_ctx):
         )
     assert exc_info.value.code == ErrorCode.RISK_LIMIT_EXCEEDED
 
-    # override ile bir kez geçer
-    await ctx["risk"].create_override(account_id, reason="aggr aşım", idempotency_key="agg-ovr")
+    # Passes once with an override.
+    await ctx["risk"].create_override(account_id, reason="aggregate exceedance", idempotency_key="agg-ovr")
     allowed = await service.place_order(
         account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="MARKET",
         quantity=2.0, idempotency_key="agg-3",
@@ -462,16 +462,16 @@ async def test_aggregate_exposure_cap_with_override(ex_ctx):
     assert allowed["status"] == "FILLED"
 
 
-# ---------- serbest bakiye kontrolü (3.8: equity değil, available) ----------
+# ---------- free-balance check (3.8: available, not equity) ----------
 
 
 async def test_buy_uses_free_quote_not_equity(ex_ctx):
     ctx = ex_ctx
-    # BTC holdingli hesap: equity (1*100 + 100 = 200) > serbest USDT (100)
+    # Account holding BTC: equity (1*100 + 100 = 200) > free USDT (100).
     account_id = await _add_real_account(ctx, balance_usdt=100.0, base_holdings={"BTC": 1.0})
     service = ctx["service"]
 
-    # equity yetse bile serbest USDT'yi aşan 1 BTC (100 + 0.1 fee) → INSUFFICIENT_BALANCE
+    # 1 BTC exceeds free USDT even though equity is sufficient (100 + 0.1 fee) → INSUFFICIENT_BALANCE.
     with pytest.raises(RasatError) as exc_info:
         await service.place_order(
             account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="MARKET",
@@ -480,7 +480,7 @@ async def test_buy_uses_free_quote_not_equity(ex_ctx):
     assert exc_info.value.code == ErrorCode.INSUFFICIENT_BALANCE
     assert len(ctx["broker"].placed) == 0  # borsaya gitmedi
 
-    # 0.9 BTC (90 + 0.09) serbest USDT içinde → geçer
+    # 0.9 BTC (90 + 0.09) fits within free USDT → passes.
     ok = await service.place_order(
         account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="MARKET",
         quantity=0.9, idempotency_key="buy-free-ok",
@@ -497,7 +497,7 @@ async def test_buy_zero_balance_insufficient(ex_ctx):
             account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="MARKET",
             quantity=1.0, idempotency_key="zero-bal",
         )
-    assert exc_info.value.code == ErrorCode.INSUFFICIENT_BALANCE  # INVALID_REQUEST değil
+    assert exc_info.value.code == ErrorCode.INSUFFICIENT_BALANCE  # Not INVALID_REQUEST.
     assert len(ctx["broker"].placed) == 0
 
 
@@ -506,7 +506,7 @@ async def test_sell_requires_free_base(ex_ctx):
     account_id = await _add_real_account(ctx, base_holdings={"BTC": 0.5})
     service = ctx["service"]
 
-    # 0.5 BTC var; 1.0 satılamaz → INSUFFICIENT_BALANCE
+    # 0.5 BTC exists; 1.0 cannot be sold → INSUFFICIENT_BALANCE.
     with pytest.raises(RasatError) as exc_info:
         await service.place_order(
             account_id=account_id, symbol="BTCUSDT", side="SELL", order_type="MARKET",
@@ -530,12 +530,12 @@ async def test_execute_sell_requires_free_base(ex_ctx):
         account_ids=[account_id], symbol="BTCUSDT", side="SELL", entry=100, stop_loss=105,
         risk_pct=0.01, idempotency_key="sell-sized",
     )
-    # risk sizing ~20 BTC üretir ama serbest base 0.05 → borsaya gitmeden reddedilir
+    # Risk sizing produces ~20 BTC but free base is 0.05 → reject before the exchange.
     assert result["results"][0]["status"] == "REJECTED"
     assert result["results"][0]["error"]["code"] == ErrorCode.INSUFFICIENT_BALANCE
     assert len(ctx["broker"].placed) == 0
 
-    # yeterli base varsa SELL işlenir
+    # With sufficient base, SELL is processed.
     ok_id = await _add_real_account(ctx, label="sell-ok", base_holdings={"BTC": 1.0})
     ok = await service.execute_on_accounts(
         account_ids=[ok_id], symbol="BTCUSDT", side="SELL", entry=100, stop_loss=105,
@@ -544,7 +544,7 @@ async def test_execute_sell_requires_free_base(ex_ctx):
     assert ok["results"][0]["status"] == "FILLED"
 
 
-# ---------- accuracy checks her zaman aktif ----------
+# ---------- accuracy checks are always active ----------
 
 
 async def test_stale_price_rejects(ex_ctx):
@@ -582,16 +582,16 @@ async def test_trading_lock_required(ex_ctx):
         account_ids=[account_id], symbol="BTCUSDT", side="BUY", entry=100, stop_loss=95,
         risk_pct=0.01, idempotency_key="paper-lock",
     )
-    # paper hesap simüle eder, reddetmez
+    # Paper account simulates; it does not reject.
     assert result["results"][0]["status"] == "paper"
 
 
-# ---------- 3.20 M1: equity_snapshot saklanıyor ----------
+# ---------- 3.20 M1: equity_snapshot is stored ----------
 
 
 async def test_equity_snapshot_persisted_in_order_row(ex_ctx):
-    # 3.20 M1: execute_on_accounts equity'yi hesaplar; bu değer orders tablosunda
-    # kalıcı olarak saklanmalı ve sonuca yansımalı.
+    # 3.20 M1: execute_on_accounts calculates equity; this value must be persisted
+    # in the orders table and reflected in the result.
     ctx = ex_ctx
     account_id = await _add_real_account(ctx, balance_usdt=10000.0, base_holdings={"BTC": 1.0})
     service = ctx["service"]
@@ -613,7 +613,7 @@ async def test_equity_snapshot_persisted_in_order_row(ex_ctx):
 
 
 async def test_equity_snapshot_persisted_place_order(ex_ctx):
-    # 3.20 M1: place_order da equity snapshot'ı saklar.
+    # 3.20 M1: place_order also stores the equity snapshot.
     ctx = ex_ctx
     account_id = await _add_real_account(ctx, balance_usdt=2000.0)
     service = ctx["service"]
@@ -631,11 +631,11 @@ async def test_equity_snapshot_persisted_place_order(ex_ctx):
     assert row["equity_snapshot"] == pytest.approx(2000.0)
 
 
-# ---------- 3.20 M4: eksik zorunlu parametre INVALID_REQUEST ----------
+# ---------- 3.20 M4: missing required parameter INVALID_REQUEST ----------
 
 
 async def test_execute_missing_entry_invalid_request(ex_ctx):
-    # 3.20 M4: entry eksikken float(None) TypeError → UNKNOWN değil; INVALID_REQUEST.
+    # 3.20 M4: missing entry returns INVALID_REQUEST, not float(None) TypeError → UNKNOWN.
     ctx = ex_ctx
     account_id = await _add_real_account(ctx)
     service = ctx["service"]
@@ -661,7 +661,7 @@ async def test_execute_missing_risk_pct_invalid_request(ex_ctx):
 
 
 async def test_place_order_missing_quantity_invalid_request(ex_ctx):
-    # 3.20 M4: quantity eksikken float(None) TypeError değil; INVALID_REQUEST.
+    # 3.20 M4: missing quantity returns INVALID_REQUEST, not float(None) TypeError.
     ctx = ex_ctx
     account_id = await _add_real_account(ctx)
     service = ctx["service"]
@@ -675,7 +675,7 @@ async def test_place_order_missing_quantity_invalid_request(ex_ctx):
 
 
 async def test_execute_non_numeric_entry_invalid_request(ex_ctx):
-    # 3.20 M4: sayısal olmayan entry de INVALID_REQUEST (UNKNOWN değil).
+    # 3.20 M4: non-numeric entry also returns INVALID_REQUEST (not UNKNOWN).
     ctx = ex_ctx
     account_id = await _add_real_account(ctx)
     service = ctx["service"]
@@ -691,10 +691,10 @@ async def test_execute_non_numeric_entry_invalid_request(ex_ctx):
 
 
 async def test_get_account_balance_includes_locked_and_holdings(ex_ctx):
-    # 3.21: açık emirde kilitli (locked) USDT/BTC + elde tutulan BTC değeri toplama
-    # dahil edilmeli; sadece serbest bakiyeyi döndüren eski davranış olmamalı.
+    # 3.21: include USDT/BTC locked in open orders + held BTC value; do not retain
+    # the old behavior that returned only free balance.
     ctx = ex_ctx
-    # 100 USDT serbest + 0.5 BTC serbest + 0.25 BTC kilitli (açık emir)
+    # 100 USDT free + 0.5 BTC free + 0.25 BTC locked (open order).
     account_id = await _add_real_account(ctx, balance_usdt=100.0, base_holdings={"BTC": 0.5})
     ctx["broker"].locked_balances[account_id] = {"BTC": 0.25}
     service = ctx["service"]
@@ -702,10 +702,10 @@ async def test_get_account_balance_includes_locked_and_holdings(ex_ctx):
     result = await service.get_account_balance(account_id=account_id)
 
     assert result["quote_asset"] == "USDT"
-    assert result["free"] == pytest.approx(100.0)  # serbest USDT
+    assert result["free"] == pytest.approx(100.0)  # Free USDT.
     # kilitli: 0.25 BTC * 100 (market price BTCUSDT=100) = 25
     assert result["locked"] == pytest.approx(25.0)
-    # holdings: 0.5 BTC serbest * 100 = 50
+    # holdings: 0.5 BTC free * 100 = 50
     assert result["holdings_value"] == pytest.approx(50.0)
     assert result["total"] == pytest.approx(100.0 + 25.0 + 50.0)
     assert result["equity"] == result["total"]
@@ -732,7 +732,7 @@ async def test_get_account_balance_quote_locked_included(ex_ctx):
 
 
 async def test_get_account_balance_no_credentials_rejected(ex_ctx):
-    # 3.21: credential'sız (public/read-only) hesapta bakiye sorgulanamaz.
+    # 3.21: balance cannot be queried for an account without credentials (public/read-only).
     ctx = ex_ctx
     account_id = await _add_paper_account(ctx, label="pub")
     service = ctx["service"]
@@ -750,7 +750,7 @@ async def test_get_account_balance_missing_account_id(ex_ctx):
 
 
 async def test_get_account_balance_dispatches_via_tool(ex_ctx):
-    # 3.21: get_account_balance tool registry + dispatcher üzerinden çağrılabilir.
+    # 3.21: get_account_balance is callable through the tool registry + dispatcher.
     from rasattrading_mcp.daemon.handlers import build_dispatcher
     from rasattrading_mcp.daemon.readiness import Readiness
 
@@ -775,12 +775,12 @@ async def test_get_account_balance_dispatches_via_tool(ex_ctx):
     assert meta.source == "binance"
 
 
-# ---------- get_open_orders: borsadaki gerçek açık emirler ----------
+# ---------- get_open_orders: real open exchange orders ----------
 
 
 async def test_get_open_orders_legacy_broker_shape_and_dispatch(ex_ctx):
-    # FakeOrderBroker'ın legacy shape'inde `raw` yok; bu servis çağrısı
-    # fallback alanları None ile güvenle dönmeli ve handler üzerinden de çalışmalı.
+    # FakeOrderBroker's legacy shape has no `raw`; this service call must safely
+    # return fallback fields as None and also work through the handler.
     ctx = ex_ctx
     account_id = await _add_real_account(ctx, balance_usdt=100.0)
     service = ctx["service"]
@@ -875,7 +875,7 @@ async def test_get_open_orders_no_credentials_rejected(ex_ctx):
     assert exc_info.value.code == ErrorCode.ACCOUNT_NO_CREDENTIALS
 
 
-# ---------- get_unprotected_positions: korumasız spot pozisyonlar ----------
+# ---------- get_unprotected_positions: unprotected spot positions ----------
 
 
 async def test_find_unprotected_positions_detects_and_dispatches(ex_ctx):

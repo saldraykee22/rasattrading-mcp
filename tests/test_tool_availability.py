@@ -1,10 +1,10 @@
-"""Ticket 1-5: pipeline kapalıyken tool kullanılabilirliği (review bulgusu H6).
+"""Ticket 1-5: tool availability with pipeline disabled (review finding H6).
 
 Beklentiler:
-- Pipeline kapalıyken get_audit_log çalışmalı (DB-yerel, pipeline gerektirmez).
-- Gerçekten pipeline gerektiren tool'lar PIPELINE_UNAVAILABLE dönmeli (TOOL_NOT_FOUND değil).
-- Dispatcher, pipeline durumundan bağımsız 32 tool'un 32'sini de kayıtlı tutmalı
-  (adapter'ın tanıttığı liste ile tutarlı).
+- get_audit_log must work with pipeline disabled (DB-local, no pipeline required).
+- Tools that truly require pipeline must return PIPELINE_UNAVAILABLE (not TOOL_NOT_FOUND).
+- Dispatcher must keep all 32 tools registered regardless of pipeline state
+  (consistent with the adapter's advertised list).
 """
 
 import json
@@ -38,7 +38,7 @@ def _ready():
 
 
 async def _make_no_pipeline_app(cfg, with_pipeline_stub=False):
-    """Daemon'un pipeline'sız kurulumunu taklit eder: db + audit, pipeline yok."""
+    """Simulate a daemon setup without pipeline: db + audit, no pipeline."""
     db = Database(cfg.db_path)
     await db.start()
     await run_migrations(db)
@@ -102,7 +102,7 @@ async def test_pipeline_tools_return_pipeline_unavailable(cfg):
     try:
         async with TestServer(app) as server:
             async with TestClient(server) as client:
-                # execute_on_accounts: pipeline'a bağımlı → anlamlı hata, TOOL_NOT_FOUND değil
+                # execute_on_accounts: depends on pipeline → meaningful error, not TOOL_NOT_FOUND.
                 resp = await _post(
                     client,
                     "execute_on_accounts",
@@ -115,12 +115,12 @@ async def test_pipeline_tools_return_pipeline_unavailable(cfg):
                 assert body["ok"] is False
                 assert body["error"]["code"] == "PIPELINE_UNAVAILABLE"
 
-                # get_candles de pipeline'a bağımlı
+                # get_candles also depends on pipeline.
                 resp2 = await _post(client, "get_candles", {"symbol": "BTCUSDT", "timeframe": "15m"})
                 body2 = await resp2.json()
                 assert body2["error"]["code"] == "PIPELINE_UNAVAILABLE"
 
-                # gerçekten bilinmeyen tool hâlâ TOOL_NOT_FOUND
+                # A genuinely unknown tool is still TOOL_NOT_FOUND.
                 resp3 = await _post(client, "no_such_tool", {})
                 body3 = await resp3.json()
                 assert body3["error"]["code"] == "TOOL_NOT_FOUND"

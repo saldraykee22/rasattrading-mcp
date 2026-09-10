@@ -1,11 +1,13 @@
-"""Daemon oto-başlatma + stale-lock recovery (adapter tarafı).
+"""Daemon auto-start and stale-lock recovery on the adapter side.
 
-Kurallar:
-- Kilit yoksa: daemon'ı detached süreç olarak başlat.
-- Kilit sahibi ölmüşse (PID canlı değil): stale kabul et, temizle, yeniden başlat.
-- Kilit sahibi canlıysa: HTTP /health probuyla doğrula (1.3). Probu birkaç kez dener
-  (daemon daha server'ı bağlamamış olabilir); hâlâ yanıt yoksa stale kabul eder.
-- `ready` olana kadar bekle; timeoute girerse fail-closed (hata fırlatır).
+Rules:
+- If there is no lock, start the daemon as a detached process.
+- If the lock owner has exited (the PID is not alive), treat the lock as stale,
+  remove it, and restart.
+- If the lock owner is alive, verify it with an HTTP /health probe (1.3). Retry
+  the probe several times because the daemon may not have bound its server yet;
+  if it still does not respond, treat the lock as stale.
+- Wait until `ready`; fail closed by raising an error on timeout.
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ class DaemonUnavailableError(RasatError):
 
 
 def _spawn_daemon(config: Config) -> None:
-    """Daemon'ı detached (kendi süreç grubunda) başlatır."""
+    """Start the daemon detached in its own process group."""
     config.data_dir.mkdir(parents=True, exist_ok=True)
     config.log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -54,18 +56,18 @@ def _spawn_daemon(config: Config) -> None:
             creationflags=creationflags,
             close_fds=True,
         )
-    logger.info("daemon başlatıldı: %s", " ".join(cmd))
+    logger.info("daemon started: %s", " ".join(cmd))
 
 
 def _cleanup_stale_lock(config: Config) -> None:
     lock = read_lock(config.lock_path)
     if lock is not None and not owner_alive(lock):
         config.lock_path.unlink(missing_ok=True)
-        logger.info("stale kilit temizlendi (pid=%s)", lock.pid)
+        logger.info("removed stale lock (pid=%s)", lock.pid)
 
 
 async def _wait_for_lock(config: Config, timeout: float) -> LockInfo:
-    """Daemon'un kilit dosyasını oluşturmasını bekle."""
+    """Wait for the daemon to create its lock file."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         lock = read_lock(config.lock_path)
@@ -73,12 +75,12 @@ async def _wait_for_lock(config: Config, timeout: float) -> LockInfo:
             return lock
         await asyncio.sleep(0.2)
     raise DaemonUnavailableError(
-        f"daemon kilit dosyası oluşturamadı ({timeout}s içinde)", code=ErrorCode.TIMEOUT
+        f"daemon did not create a lock file within {timeout}s", code=ErrorCode.TIMEOUT
     )
 
 
 async def _http_probe_ok(config: Config, token: str) -> bool:
-    """HTTP /health probu: daemon canlı ve token sahibi mi?"""
+    """Probe HTTP /health to check whether the daemon is alive and owns the token."""
     try:
         client = DaemonClient(config, token)
         try:
@@ -103,7 +105,7 @@ async def _http_state(config: Config, token: str) -> str | None:
 
 
 async def _wait_until_ready(config: Config, lock: LockInfo, timeout: float) -> None:
-    """HTTP /health üzerinden `ready` beklenir (yetkili kanal)."""
+    """Wait for `ready` through HTTP /health, the authoritative channel."""
     deadline = time.monotonic() + timeout
     last_state: str | None = None
     while time.monotonic() < deadline:
@@ -114,13 +116,13 @@ async def _wait_until_ready(config: Config, lock: LockInfo, timeout: float) -> N
                 return
         await asyncio.sleep(0.25)
     raise DaemonUnavailableError(
-        f"daemon {timeout}s içinde ready olmadı (son state={last_state})",
+        f"daemon was not ready within {timeout}s (last state={last_state})",
         code=ErrorCode.NOT_READY,
     )
 
 
 async def ensure_daemon(config: Config) -> str:
-    """Daemon'un ayakta ve ready olduğunu garanti eder. Bearer token döner."""
+    """Ensure that the daemon is running and ready, then return its bearer token."""
     _cleanup_stale_lock(config)
 
     lock = read_lock(config.lock_path)
@@ -128,16 +130,16 @@ async def ensure_daemon(config: Config) -> str:
         _spawn_daemon(config)
         lock = await _wait_for_lock(config, timeout=config.ready_timeout_seconds)
     elif not owner_alive(lock):
-        # tekrar kontrol et (race)
+        # Check again for a race.
         if read_lock(config.lock_path) is not None:
             config.lock_path.unlink(missing_ok=True)
         _spawn_daemon(config)
         lock = await _wait_for_lock(config, timeout=config.ready_timeout_seconds)
     elif await _http_probe_ok(config, lock.token):
-        # canlı ve HTTP'de doğrulandı — devam
+        # Verified as alive over HTTP; continue.
         pass
     else:
-        # PID canlı ama HTTP probu başarısız: retry sonrası stale kabul et
+        # The PID is alive but the HTTP probe failed; treat it as stale after retries.
         retries = max(config.lock_probe_retries, 1)
         ok = False
         for _ in range(retries):
@@ -146,7 +148,7 @@ async def ensure_daemon(config: Config) -> str:
                 break
             await asyncio.sleep(config.lock_probe_delay)
         if not ok:
-            logger.warning("kilit sahibi PID canlı ama HTTP yanıt vermiyor — stale kabul ediliyor (pid=%s)", lock.pid)
+            logger.warning("lock owner PID is alive but HTTP is not responding — treating lock as stale (pid=%s)", lock.pid)
             config.lock_path.unlink(missing_ok=True)
             _spawn_daemon(config)
             lock = await _wait_for_lock(config, timeout=config.ready_timeout_seconds)

@@ -1,7 +1,8 @@
-"""MCP adapter: stdio üzerinden gelen tool çağrılarını daemon'a HTTP ile iletir.
+"""MCP adapter: forwards tool calls received over stdio to the daemon over HTTP.
 
-İnce istemci — iş mantığı yok. `ensure_daemon` ile daemon'ı başlatır/bağlanır,
-tool listesini paylaşılan registry'den yansıtır, cevapları ortak envelope ile döner.
+Thin client with no business logic. Starts/connects to the daemon with
+`ensure_daemon`, mirrors the tool list from the shared registry, and returns
+responses in the common envelope.
 """
 
 from __future__ import annotations
@@ -37,11 +38,11 @@ def build_mcp_tools() -> list[Tool]:
 
 
 def build_initialization_options(server: Server) -> InitializationOptions:
-    """mcp SDK >=1.29 `Server.run` için gerekli InitializationOptions.
+    """InitializationOptions required by `Server.run` in mcp SDK >=1.29.
 
-    SDK 1.29 ile `initialization_options` zorunlu hale geldi; capabilities
-    alanı da pydantic tarafından required. Ayrı tutulması test edilebilirliği
-    sağlar (stdio yolu hiçbir unit testte sarmalanmıyor).
+Starting with SDK 1.29, `initialization_options` is required, and the
+capabilities field is also required by pydantic. Keeping this separate
+improves testability (the stdio path is not wrapped in unit tests).
     """
     return InitializationOptions(
         server_name="rasattrading-mcp",
@@ -54,7 +55,7 @@ def build_initialization_options(server: Server) -> InitializationOptions:
 
 
 def build_adapter_server(client: DaemonClient) -> Server:
-    """MCP LowLevelServer'ı kurar: tool listesi registry'den, çağrılar daemon'a."""
+    """Build the MCP LowLevelServer: tools come from the registry, calls go to the daemon."""
     server = Server("rasattrading-mcp")
 
     @server.list_tools()
@@ -66,10 +67,10 @@ def build_adapter_server(client: DaemonClient) -> Server:
         try:
             envelope = await client.call_tool(name, arguments or {})
         except DaemonUnavailableError as exc:
-            logger.error("daemon isteği iletilemedi: %s", exc.message)
+            logger.error("could not forward daemon request: %s", exc.message)
             return _error_result(exc.code or ErrorCode.INTERNAL_ERROR, exc.message)
         except Exception as exc:  # noqa: BLE001
-            logger.exception("tool çağrısı hatası: %s", name)
+            logger.exception("tool call failed: %s", name)
             return _error_result(ErrorCode.INTERNAL_ERROR, str(exc))
         return _envelope_to_result(envelope)
 
@@ -93,7 +94,7 @@ async def run_adapter(config: Config) -> int:
     try:
         token = await ensure_daemon(config)
     except DaemonUnavailableError as exc:
-        logger.error("daemon hazır edilemedi: %s", exc.message)
+        logger.error("could not make daemon ready: %s", exc.message)
         return 1
 
     client = DaemonClient(config, token)
@@ -113,9 +114,9 @@ async def run_adapter(config: Config) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="rasattrading-mcp", description="Rasattrading MCP adapter (thin client)")
-    p.add_argument("--data-dir", help="veri dizini (varsayılan: ~/.rasattrading)")
+    p.add_argument("--data-dir", help="data directory (default: ~/.rasattrading)")
     p.add_argument("--port", type=int, help="daemon HTTP portu")
-    p.add_argument("--no-pipeline", action="store_true", help="daemon'ı pipeline'sız başlat")
+    p.add_argument("--no-pipeline", action="store_true", help="start the daemon without the pipeline")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return p
 

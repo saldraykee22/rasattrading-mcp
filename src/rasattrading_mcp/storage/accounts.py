@@ -1,4 +1,4 @@
-"""Account CRUD and credential handling for Module 3 ticket 3.1."""
+"""Account CRUD and credential handling."""
 
 from __future__ import annotations
 
@@ -20,9 +20,9 @@ logger = logging.getLogger("rasattrading.storage.accounts")
 _MAX_LABEL_LENGTH = 200
 _ALLOWED_MARKET = "spot"
 
-#: Açık/aktif sayılan emir durumları — varlığında hesap silinemez (T04).
-#: RECONCILE_REQUIRED, T00 state sözleşmesindeki canonical durumdur (UNKNOWN gibi
-#: belirsiz/çözülmemiş emir) ve fail-closed olarak silme engelidir.
+#: Order states considered open/active — an account cannot be deleted while present (T04).
+#: RECONCILE_REQUIRED is the canonical T00 state for an uncertain/unresolved order
+#: (like UNKNOWN) and blocks deletion fail closed.
 _ACTIVE_ORDER_STATUSES = ("NEW", "PARTIALLY_FILLED", "UNKNOWN", ORDER_RECONCILE_REQUIRED)
 _ACCOUNT_FIELDS = (
     "account_id",
@@ -41,7 +41,7 @@ def _public_account(row: Any) -> dict[str, Any]:
     """Convert an account row without ever including encrypted columns."""
 
     if row is None:
-        raise ValueError("account satırı yok")
+        raise ValueError("account row is missing")
     raw_tags = row["tags"] if isinstance(row, sqlite3.Row) else row.get("tags", "[]")
     try:
         tags = json.loads(raw_tags) if isinstance(raw_tags, str) else raw_tags
@@ -66,12 +66,12 @@ def _public_account(row: Any) -> dict[str, Any]:
 
 def _validate_label(label: Any) -> str:
     if not isinstance(label, str):
-        raise RasatError(ErrorCode.INVALID_REQUEST, "label zorunlu (string)")
+        raise RasatError(ErrorCode.INVALID_REQUEST, "label is required (string)")
     normalized = label.strip()
     if not normalized:
-        raise RasatError(ErrorCode.INVALID_REQUEST, "label boş olamaz")
+        raise RasatError(ErrorCode.INVALID_REQUEST, "label cannot be empty")
     if len(normalized) > _MAX_LABEL_LENGTH:
-        raise RasatError(ErrorCode.INVALID_REQUEST, f"label en fazla {_MAX_LABEL_LENGTH} karakter olabilir")
+        raise RasatError(ErrorCode.INVALID_REQUEST, f"label can be at most {_MAX_LABEL_LENGTH} characters")
     return normalized
 
 
@@ -79,13 +79,13 @@ def _validate_tags(tags: Any) -> list[str]:
     if tags is None:
         return []
     if not isinstance(tags, list) or any(not isinstance(tag, str) for tag in tags):
-        raise RasatError(ErrorCode.INVALID_REQUEST, "tags string listesi olmalı")
+        raise RasatError(ErrorCode.INVALID_REQUEST, "tags must be a list of strings")
     normalized: list[str] = []
     seen: set[str] = set()
     for tag in tags:
         value = tag.strip()
         if not value:
-            raise RasatError(ErrorCode.INVALID_REQUEST, "tags boş değer içeremez")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "tags cannot contain empty values")
         if value not in seen:
             seen.add(value)
             normalized.append(value)
@@ -96,20 +96,20 @@ def _validate_credentials(api_key: Any, api_secret: Any) -> tuple[str | None, st
     if api_key is None and api_secret is None:
         return None, None
     if not isinstance(api_key, str) or not isinstance(api_secret, str):
-        raise RasatError(ErrorCode.INVALID_REQUEST, "api_key ve api_secret birlikte string olmalı")
+        raise RasatError(ErrorCode.INVALID_REQUEST, "api_key and api_secret must both be strings")
     if not api_key or not api_secret:
-        raise RasatError(ErrorCode.INVALID_REQUEST, "api_key ve api_secret boş olamaz")
+        raise RasatError(ErrorCode.INVALID_REQUEST, "api_key and api_secret cannot be empty")
     return api_key, api_secret
 
 
 def _removal_reasons(conn: sqlite3.Connection, account_id: str, row: sqlite3.Row) -> list[str]:
-    """Hesabın silinmesini engelleyen bağımlılıkları döner (boş = silme serbest).
+    """Return dependencies that prevent account deletion (empty = deletion allowed).
 
-    - Real trading kilidi açıksa hesap ASLA silinemez (fail-closed).
-    - Açık emir, aktif pending veya risk policy/override kaydı varsa silme
-      reddedilir — aksi halde bu satırlar orphan kalır (foreign key/cascade yok).
-    - Tarihsel (terminal) order/pending kayıtları engel DEĞİLDİR; onlar cascade
-      ile silinmez, hesap silinse bile yerinde kalır.
+    - An account with the real-trading lock is NEVER deletable (fail closed).
+    - Reject deletion when open orders, active pending orders, or risk policy/override
+      records exist; otherwise those rows would become orphans (no foreign-key cascade).
+    - Historical (terminal) order/pending records do NOT block deletion; they are
+      not cascade-deleted and remain after the account is removed.
     """
     reasons: list[str] = []
     if str(row["trading_lock"]) == "real":
@@ -175,7 +175,7 @@ class AccountService:
         normalized_tags = _validate_tags(tags)
         api_key, api_secret = _validate_credentials(api_key, api_secret)
         if market != _ALLOWED_MARKET:
-            raise RasatError(ErrorCode.INVALID_REQUEST, "v1 yalnızca market='spot' destekler")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "v1 supports only market='spot'")
 
         account_id = uuid.uuid4().hex
         encrypted_api_key: bytes | None = None
@@ -189,7 +189,7 @@ class AccountService:
             # ever putting the plaintext into the exception or audit trail.
             self.secret_store.delete(account_id, "api_key", encrypted_api_key)
             self.secret_store.delete(account_id, "api_secret", encrypted_secret)
-            raise RasatError(ErrorCode.CREDENTIAL_STORE_UNAVAILABLE, "OS credential backend kullanılamıyor") from exc
+            raise RasatError(ErrorCode.CREDENTIAL_STORE_UNAVAILABLE, "OS credential backend is unavailable") from exc
 
         now = int(time.time())
         tags_json = json.dumps(normalized_tags, ensure_ascii=False, separators=(",", ":"))
@@ -241,7 +241,7 @@ class AccountService:
         except sqlite3.IntegrityError as exc:
             self.secret_store.delete(account_id, "api_key", encrypted_api_key)
             self.secret_store.delete(account_id, "api_secret", encrypted_secret)
-            raise RasatError(ErrorCode.ACCOUNT_EXISTS, "account oluşturulamadı; benzersiz kısıt ihlali") from exc
+            raise RasatError(ErrorCode.ACCOUNT_EXISTS, "could not create account; unique constraint violation") from exc
         except Exception:
             self.secret_store.delete(account_id, "api_key", encrypted_api_key)
             self.secret_store.delete(account_id, "api_secret", encrypted_secret)
@@ -264,21 +264,21 @@ class AccountService:
         }
 
     async def remove_account(self, account_id: Any, *, actor: str = "mcp-agent") -> dict[str, Any]:
-        """Hesabı yalnızca kullanımda değilken siler (fail-closed, T04).
+        """Delete an account only when it is not in use (fail closed, T04).
 
-        - ``trading_lock=real`` hesap ASLA silinemez.
-        - Açık/UNKNOWN emir, aktif pending veya risk policy/override kaydı varken
-          silme canonical ``ACCOUNT_IN_USE`` ile reddedilir; DB (hesap/emir/
-          pending/risk satırları) ve credentials değiştirilmez.
-        - Kontrol + delete aynı tek-yazıcı DB transaction'ında çalışır; araya
-          yazma giremez, check-then-delete yarışı oluşmaz.
-        - Tarihsel order/audit kayıtları cascade ile silinmez.
-        - Credentials yalnızca başarılı ve izin verilen silme sonrası temizlenir.
-        - Red durumunda audit'e secret içermeyen ``remove_account_refused`` kaydı
-          düşer (transaction ile birlikte commit edilir).
+        - An account with ``trading_lock=real`` can NEVER be deleted.
+        - With open/UNKNOWN orders, active pending orders, or risk policy/override
+          records, reject with canonical ``ACCOUNT_IN_USE``; do not change the DB
+          (account/order/pending/risk rows) or credentials.
+        - Run the check and delete in the same single-writer DB transaction; no
+          interleaved write can create a check-then-delete race.
+        - Do not cascade-delete historical order/audit records.
+        - Clean credentials only after an authorized successful deletion.
+        - On refusal, append a secret-free ``remove_account_refused`` audit record
+          (committed with the transaction).
         """
         if not isinstance(account_id, str) or not account_id.strip():
-            raise RasatError(ErrorCode.INVALID_REQUEST, "account_id zorunlu (string)")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "account_id is required (string)")
         account_id = account_id.strip()
 
         def _remove(
@@ -323,11 +323,11 @@ class AccountService:
 
         removed = await self.db.write(_remove)
         if removed is None:
-            raise RasatError(ErrorCode.ACCOUNT_NOT_FOUND, f"account bulunamadı: {account_id}")
+            raise RasatError(ErrorCode.ACCOUNT_NOT_FOUND, f"account not found: {account_id}")
         if isinstance(removed, dict) and removed.get("refused"):
             raise RasatError(
                 ErrorCode.ACCOUNT_IN_USE,
-                f"account silinemedi; hesap kullanımda: {', '.join(removed['reasons'])}",
+                f"could not delete account; account is in use: {', '.join(removed['reasons'])}",
                 details={"account_id": account_id, "reasons": removed["reasons"]},
             )
         result, encrypted_api_key, encrypted_secret = removed
@@ -339,17 +339,17 @@ class AccountService:
         return result
 
     async def enable_real_trading(self, account_id: Any, *, actor: str = "mcp-agent") -> dict[str, Any]:
-        """Trading kilidini kalıcı olarak `real`'e çevirir (tek yönlü, ticket 3.2).
+        """Permanently switch the trading lock to `real` (one-way, ticket 3.2).
 
-        - Yeni hesap varsayılan `paper`'dır; bu çağrı bir kere yapılınca kalıcı
-          `real`'e geçer ve geri dönüş yoktur (3.5 kill switch hariç).
-        - Zaten `real` ise idempotent davranır (hata değil).
-        - Credential'sız (public/read-only) hesapta real trading anlamsız olduğu
-          için reddedilir — fail-closed.
-        - Değişiklik `audit_log`'a yazılır.
+        - New accounts default to `paper`; once this call runs, switch permanently
+          to `real` and do not allow a return (except the 3.5 kill switch).
+        - If already `real`, behave idempotently (not an error).
+        - Reject credential-less (public/read-only) accounts because real trading is
+          meaningless there — fail closed.
+        - Write the change to `audit_log`.
         """
         if not isinstance(account_id, str) or not account_id.strip():
-            raise RasatError(ErrorCode.INVALID_REQUEST, "account_id zorunlu (string)")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "account_id is required (string)")
         account_id = account_id.strip()
 
         def _flip(conn: sqlite3.Connection) -> dict[str, Any]:
@@ -358,11 +358,11 @@ class AccountService:
                 (account_id,),
             ).fetchone()
             if row is None:
-                raise RasatError(ErrorCode.ACCOUNT_NOT_FOUND, f"account bulunamadı: {account_id}")
+                raise RasatError(ErrorCode.ACCOUNT_NOT_FOUND, f"account not found: {account_id}")
             if not row["encrypted_api_key"] or not row["encrypted_secret"]:
                 raise RasatError(
                     ErrorCode.ACCOUNT_NO_CREDENTIALS,
-                    "credential'sız (public/read-only) hesapta real trading açılamaz",
+                    "cannot enable real trading for a credential-less (public/read-only) account",
                 )
             already_real = str(row["trading_lock"]) == "real"
             if not already_real:
@@ -388,13 +388,13 @@ class AccountService:
         return await self.db.write(_flip)
 
     async def disable_real_trading(self, account_id: Any, *, actor: str = "mcp-agent") -> dict[str, Any]:
-        """Kill switch: real hesabı `paper`'a çevirir (3.5).
+        """Kill switch: switch a real account to `paper` (3.5).
 
-        `enable_real_trading`'in tersi; audit_log'a yazılır. Zaten paper ise
-        idempotent davranır.
+        The inverse of `enable_real_trading`; write to audit_log. If already paper,
+        behave idempotently.
         """
         if not isinstance(account_id, str) or not account_id.strip():
-            raise RasatError(ErrorCode.INVALID_REQUEST, "account_id zorunlu (string)")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "account_id is required (string)")
         account_id = account_id.strip()
 
         def _flip(conn: sqlite3.Connection) -> dict[str, Any]:
@@ -403,7 +403,7 @@ class AccountService:
                 (account_id,),
             ).fetchone()
             if row is None:
-                raise RasatError(ErrorCode.ACCOUNT_NOT_FOUND, f"account bulunamadı: {account_id}")
+                raise RasatError(ErrorCode.ACCOUNT_NOT_FOUND, f"account not found: {account_id}")
             already_paper = str(row["trading_lock"]) != "real"
             if not already_paper:
                 now = int(time.time())
@@ -438,7 +438,7 @@ class AccountService:
 
         row = await self.db.read(_get)
         if row is None:
-            raise RasatError(ErrorCode.ACCOUNT_NOT_FOUND, f"account bulunamadı: {account_id}")
+            raise RasatError(ErrorCode.ACCOUNT_NOT_FOUND, f"account not found: {account_id}")
         return _public_account(row)
 
     async def get_credentials(self, account_id: str) -> tuple[str, str]:
@@ -452,13 +452,13 @@ class AccountService:
 
         row = await self.db.read(_get)
         if row is None:
-            raise RasatError(ErrorCode.ACCOUNT_NOT_FOUND, f"account bulunamadı: {account_id}")
+            raise RasatError(ErrorCode.ACCOUNT_NOT_FOUND, f"account not found: {account_id}")
         if not row["encrypted_api_key"] or not row["encrypted_secret"]:
-            raise RasatError(ErrorCode.ACCOUNT_NO_CREDENTIALS, "account public/read-only modda; API credential yok")
+            raise RasatError(ErrorCode.ACCOUNT_NO_CREDENTIALS, "account is public/read-only; no API credentials")
         try:
             return (
                 self.secret_store.decrypt(account_id, "api_key", row["encrypted_api_key"]),
                 self.secret_store.decrypt(account_id, "api_secret", row["encrypted_secret"]),
             )
         except SecretDecryptError as exc:
-            raise RasatError(ErrorCode.CREDENTIAL_DECRYPT_FAILED, "account credential çözülemedi") from exc
+            raise RasatError(ErrorCode.CREDENTIAL_DECRYPT_FAILED, "could not decrypt account credential") from exc

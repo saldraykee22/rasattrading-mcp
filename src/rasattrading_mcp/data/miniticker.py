@@ -1,8 +1,9 @@
-"""Tek adet "tüm piyasa" miniTicker websocket.
+"""Single market-wide miniTicker WebSocket.
 
-Fiyat/hacim tüm semboller için bellek içi cache'e yazılır (screener filtresi için yeterli;
-DB'ye yazılmaz). WS kopması/gecikme durumunda veri `stale` işaretlenir — sessizce eski
-veri `fresh` gibi dönmez. Reconnect exponential backoff ile, watchdog kopuk bağlantıyı kapatır.
+Price/volume for all symbols are written to an in-memory cache (sufficient for
+screener filters; not written to the DB). On WS disconnect or delay, mark data
+`stale`; do not silently return old data as `fresh`. Reconnect with exponential
+backoff, and let the watchdog close stalled connections.
 """
 
 from __future__ import annotations
@@ -34,11 +35,11 @@ class TickerUpdate:
 
 
 def parse_miniticker_arr(raw: str | bytes) -> list[TickerUpdate]:
-    """`!miniTicker@arr` payload'unu TickerUpdate listesine çevirir.
+    """Convert an `!miniTicker@arr` payload to a list of TickerUpdate objects.
 
-    Binance combined stream (`/stream?streams=!miniTicker@arr`) her mesajı
-    `{"stream": "<name>", "data": [...]}` sarmalıyla gönderir; düz dizi formu
-    (tek akış) da kabul edilir.
+    Binance's combined stream (`/stream?streams=!miniTicker@arr`) wraps each
+    message as `{"stream": "<name>", "data": [...]}`; also accept the plain array
+    form (single stream).
     """
     data = None
     try:
@@ -55,8 +56,8 @@ def parse_miniticker_arr(raw: str | bytes) -> list[TickerUpdate]:
             close = float(item["c"])
             open24h = float(item["o"])
             pct = item.get("P")
-            # `!miniTicker@arr` öğeleri `P` (price change %) taşımaz; o/c'den hesaplanır.
-            # `P` yalnızca 24hr ticker stream'inde bulunur (uyumluluk için kabul edilir).
+            # `!miniTicker@arr` items do not carry `P` (price change %); calculate it from o/c.
+            # `P` exists only in the 24hr ticker stream (accept it for compatibility).
             price_change_pct = float(pct) if pct is not None else ((close - open24h) / open24h * 100.0 if open24h else 0.0)
             updates.append(
                 TickerUpdate(
@@ -77,7 +78,7 @@ def parse_miniticker_arr(raw: str | bytes) -> list[TickerUpdate]:
 
 
 class TickerCache:
-    """Sembol → son 24h ticker + WS sağlığı (fresh/stale)."""
+    """Symbol → latest 24h ticker plus WS health (fresh/stale)."""
 
     def __init__(self, stale_after: float = 30.0) -> None:
         self._data: dict[str, TickerUpdate] = {}
@@ -94,8 +95,8 @@ class TickerCache:
             self.mark_connected()
 
     def mark_connected(self) -> None:
-        """WS bağlantısı kurulduğunda çağrılır — mesaj henüz gelmemiş olsa bile
-        watchdog staleness'i izleyebilsin (hiç mesaj gelmeyen bağlantı da reconnect edilir)."""
+        """Called when the WS connection is established, even before a message arrives,
+        so the watchdog can monitor staleness (a connection with no messages is also reconnected)."""
         self._status = "connected"
         self._status_reason = None
 
@@ -154,7 +155,7 @@ class TickerCache:
 
 
 class MiniTickerClient:
-    """miniTicker WS bağlantısı: reconnect backoff + stale watchdog."""
+    """miniTicker WS connection: reconnect backoff plus stale watchdog."""
 
     def __init__(self, url: str, cache: TickerCache, stale_after: float = 30.0) -> None:
         self._url = url
@@ -166,7 +167,7 @@ class MiniTickerClient:
         while not stop.is_set():
             try:
                 async with websockets.connect(self._url, ping_interval=20, ping_timeout=20, max_size=16 * 1024 * 1024) as ws:
-                    logger.info("miniTicker WS bağlandı")
+                    logger.info("miniTicker WS connected")
                     self._cache.mark_connected()
                     backoff = 1.0
                     async for raw in ws:
@@ -175,15 +176,15 @@ class MiniTickerClient:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
-                self._cache.mark_stale(f"ws hatası: {exc}")
-                logger.warning("miniTicker WS kapandı: %s (backoff=%ss)", exc, round(backoff, 1))
+                self._cache.mark_stale(f"WS error: {exc}")
+                logger.warning("miniTicker WS disconnected: %s (backoff=%ss)", exc, round(backoff, 1))
             if stop.is_set():
                 break
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60.0)
 
     async def run(self, stop: asyncio.Event) -> None:
-        """Bağlantı + watchdog: mesaj akışı durursa bağlantı iptal edilip yeniden kurulur."""
+        """Connection plus watchdog: cancel and rebuild the connection when the message stream stops."""
         check_interval = max(self._stale_after / 2, 5.0)
         while not stop.is_set():
             conn_task = asyncio.create_task(self._connect_loop(stop))
@@ -191,7 +192,7 @@ class MiniTickerClient:
                 while not conn_task.done():
                     await asyncio.sleep(check_interval)
                     if self._cache.status == "connected" and not self._cache.is_fresh():
-                        self._cache.mark_stale("mesaj akışı durdu — reconnect")
+                        self._cache.mark_stale("message stream stopped — reconnect")
                         conn_task.cancel()
             except asyncio.CancelledError:
                 conn_task.cancel()

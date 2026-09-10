@@ -1,21 +1,23 @@
-"""REST kline scheduler + warm-up önceliklendirme (spot/futures kaynak ayrımı).
+"""REST kline scheduler plus warm-up prioritization (spot/futures source separation).
 
-- Sabit set (15m/1h/4h/1d) arka planda sürekli güncellenir: kapalı mum tespit edilince
-  tüm evren için son N bar çekilir; soğuk (symbol,timeframe) çiftleri düşük öncelikle backfill edilir.
-- Agent'ın o an istediği symbol/timeframe **öncelikli** doldurulur (lazy/öncelikli warm-up).
-- Tüm REST çağrıları weight bütçesinden geçer; limit dolarsa kuyruklanır, sistem durmaz.
-- Veri `candles` tablosuna upsert edilir (batch).
-- **Kapalı mum kuralı (plan 2.7/1.4, 1.6):** Binance `/klines` oluşmakta olan barı da
-  döndürür; o bar saklanmaz. Kısmi hacimli forming bar kaydedilseydi, kapanınca
-  `MAX(open_time) == last_closed` olduğu için catchup tetiklenmez ve son "kapalı" mum
-  kısmi hacimle kalırdı. `_store` yalnızca kapanmış barları yazar.
-- **Kaynak ayrımı (T05):** spot `/api/v3/klines`, futures `/fapi/v1/klines` (ayrı REST
-  client). `source` — in-flight dedup, warm-map, scheduler/catch-up ve read/write
-  sorgularının — anahtarının parçasıdır. Futures istekleri spot evreninden bağımsız
-  fapi universe ile doğrulanır; spot verisi futures'ı warm kabul ettirmez.
-- **Server clock (T05):** kapanış/freshness kararları yerel saat değil, Binance
-  `/api/v3/time` offset'li `BinanceClock` üzerinden yapılır. Clock yoksa/stale ise
-  fail-closed davranılır: mum saklanmaz, freshness `stale` sayılır.
+- The fixed set (15m/1h/4h/1d) is updated continuously in the background: when a
+  closed candle is detected, the last N bars are fetched for the whole universe;
+  cold (symbol,timeframe) pairs are backfilled at low priority.
+- The symbol/timeframe currently requested by the agent is filled **first** (lazy,
+  prioritized warm-up).
+- All REST calls use the weight budget; when the limit is reached they queue and the system continues.
+- Data is upserted into the `candles` table in batches.
+- **Closed-candle rule (plans 2.7/1.4, 1.6):** Binance `/klines` also returns the
+  forming bar; do not store it. If a partially formed bar were stored, catch-up
+  would not trigger after it closed because `MAX(open_time) == last_closed`, leaving
+  the last "closed" candle with partial volume. `_store` writes only closed bars.
+- **Source separation (T05):** spot `/api/v3/klines` and futures `/fapi/v1/klines`
+  use separate REST clients. `source` is part of the key for in-flight dedup,
+  warm-map, scheduler/catch-up, and read/write queries. Futures requests are
+  validated against the independent fapi universe; spot data cannot warm futures.
+- **Server clock (T05):** close/freshness decisions use `BinanceClock` with the
+  `/api/v3/time` offset, not the local clock. If the clock is missing/stale, fail
+  closed: do not store candles and mark freshness as `stale`.
 """
 
 from __future__ import annotations
@@ -44,9 +46,9 @@ FUTURES_KLINES_PATH = "/fapi/v1/klines"
 
 
 def parse_klines(raw: list) -> list[dict]:
-    """Binance kline dizisini dict listesine çevirir (open_time saniyeye normalize).
+    """Convert Binance kline arrays to a list of dicts (normalize open_time to seconds).
 
-    Spot ve futures kline dizi şeması aynıdır: [openTime, open, high, low, close,
+    Spot and futures kline array schemas are identical: [openTime, open, high, low, close,
     volume, closeTime, quoteVolume, trades, takerBuyBase, takerBuyQuote, ignore].
     """
     rows = []
@@ -94,7 +96,7 @@ class KlineService:
         self._futures_symbols: set[str] | None = None
         self._futures_sync_at: float = 0.0
 
-    # ---------- yaşam döngüsü ----------
+    # ---------- lifecycle ----------
 
     async def start(self) -> None:
         for _ in range(self._config.kline_workers):
@@ -110,7 +112,7 @@ class KlineService:
                 t.cancel()
         await asyncio.gather(*self._workers, self._scheduler_task, self._backfill_task, return_exceptions=True)
 
-    # ---------- iş kuyruğu (source anahtarın parçasıdır) ----------
+    # ---------- work queue (source is part of the key) ----------
 
     def _enqueue(self, symbol: str, tf: str, limit: int, priority: int, source: str = "spot") -> asyncio.Future:
         key = (symbol, tf, source)
@@ -131,7 +133,7 @@ class KlineService:
                 return
             exc = fut.exception()
             if exc is not None:
-                logger.debug("arka plan kline işi başarısız (%s): %s", key, exc)
+                logger.debug("background kline job failed (%s): %s", key, exc)
 
         return _cb
 
@@ -183,21 +185,21 @@ class KlineService:
 
     @staticmethod
     def _closed_only(rows: list[dict], tf: str, now: float) -> list[dict]:
-        """Hâlâ oluşmakta olan son barı atar (kapalı mum kuralı).
+        """Discard the last still-forming bar (closed-candle rule).
 
-        `now` güvenilir sunucu zamanıdır (server clock); yerel saat değil. Binance
-        `/klines` oluşmakta olan barı da döndürür; kısmi hacimle saklanmamalı.
+        `now` is reliable server time (server clock), not local time. Binance
+        `/klines` also returns the forming bar; do not store it with partial volume.
         """
         period = TIMEFRAME_SECONDS[tf]
         latest_closed = int(now // period) * period - period
         return [r for r in rows if r["open_time"] <= latest_closed]
 
     async def _store(self, symbol: str, tf: str, source: str, rows: list[dict]) -> None:
-        """Kapalı mum kuralı + server clock. Clock yoksa/stale ise hiçbir şey yazmaz (fail-closed)."""
+        """Closed-candle rule plus server clock. Write nothing if the clock is missing/stale (fail closed)."""
         now = self._clock.server_now()
         if now is None:
             logger.warning(
-                "server clock erişilemez/stale — %s/%s (%s) saklanmadı (fail-closed)",
+                "server clock unavailable/stale — did not store %s/%s (%s) (fail closed)",
                 symbol, tf, source,
             )
             return
@@ -219,10 +221,10 @@ class KlineService:
 
         await self._db.write(_write)
 
-    # ---------- warm durumu (source bazlı) ----------
+    # ---------- warm state (per source) ----------
 
     async def _expected_latest_closed(self, tf: str) -> int | None:
-        """Server saatine göre son kapanmış barın open_time'ı; clock yoksa None (fail-closed)."""
+        """Open time of the last closed bar by server time; None if the clock is missing (fail closed)."""
         now = self._clock.server_now()
         if now is None:
             return None
@@ -230,7 +232,7 @@ class KlineService:
         return int(now // period) * period - period
 
     async def _warm_map(self, source: str) -> dict[tuple[str, str], int]:
-        """source'a özel (symbol, timeframe) → en güncel open_time haritası (tek sorgu)."""
+        """Source-specific (symbol, timeframe) → latest open_time map (one query)."""
 
         def _q(conn):
             rows = conn.execute(
@@ -245,13 +247,13 @@ class KlineService:
     async def _is_warm(self, warm_map: dict, symbol: str, tf: str) -> bool:
         latest_closed = await self._expected_latest_closed(tf)
         if latest_closed is None:
-            return False  # clock yok → warm kararı verilemez (fail-closed)
+            return False  # No clock → cannot decide warm state (fail closed).
         return warm_map.get((symbol, tf), 0) >= latest_closed
 
-    # ---------- futures sembol doğrulama ----------
+    # ---------- futures symbol validation ----------
 
     async def _futures_symbol_set(self) -> set[str]:
-        """fapi exchangeInfo'dan TRADING USDT çifti kümesi (TTL'li, FuturesContextPoller gibi)."""
+        """Return the TRADING USDT pair set from fapi exchangeInfo with TTL, as in FuturesContextPoller."""
         now = time.time()
         if self._futures_symbols is None or now - self._futures_sync_at >= self._config.futures_universe_ttl_seconds:
             data = await self._futures_rest.get("/fapi/v1/exchangeInfo", weight=1)
@@ -262,11 +264,11 @@ class KlineService:
             }
             self._futures_symbols = symbols
             self._futures_sync_at = now
-            logger.info("futures kline evreni senkronize: %d çift", len(symbols))
+            logger.info("futures kline universe synchronized: %d pairs", len(symbols))
         return self._futures_symbols
 
     async def _ensure_futures_symbol(self, symbol: str) -> bool:
-        """Sembol futures evreninde mi? Evren yüklenemezse fail-closed (sessizce kabul etme)."""
+        """Check whether a symbol is in the futures universe; fail closed if it cannot be loaded."""
         if self._futures_symbols is None or time.time() - self._futures_sync_at >= self._config.futures_universe_ttl_seconds:
             try:
                 await self._futures_symbol_set()
@@ -274,32 +276,32 @@ class KlineService:
                 if self._futures_symbols is None:
                     raise RasatError(
                         ErrorCode.INVALID_SYMBOL,
-                        f"futures evreni yüklenemedi — sembol doğrulanamadı: {symbol}",
+                        f"could not load futures universe — could not validate symbol: {symbol}",
                     ) from exc
                 logger.warning(
-                    "futures evreni tazelenemedi; önbellek kullanılıyor (%d sembol): %s",
+                    "could not refresh futures universe; using cache (%d symbols): %s",
                     len(self._futures_symbols), exc,
                 )
         return symbol in (self._futures_symbols or set())
 
-    # ---------- öncelikli okuma (agent isteği) ----------
+    # ---------- prioritized reads (agent request) ----------
 
     async def get_candles(self, symbol: str, timeframe: str, limit: int = 300, source: str = "spot") -> list[dict]:
-        """Sembolün mumlarını döndürür; soğuksa önce öncelikli warm-up yapar."""
+        """Return a symbol's candles, performing prioritized warm-up first if cold."""
         if timeframe not in TIMEFRAME_SECONDS:
-            raise RasatError(ErrorCode.INVALID_REQUEST, f"geçersiz timeframe: {timeframe}")
+            raise RasatError(ErrorCode.INVALID_REQUEST, f"invalid timeframe: {timeframe}")
         if limit < 1 or limit > 1000:
-            raise RasatError(ErrorCode.INVALID_REQUEST, f"limit 1-1000 arası olmalı (verildi: {limit})")
+            raise RasatError(ErrorCode.INVALID_REQUEST, f"limit must be between 1 and 1000 (given: {limit})")
         if source not in ("spot", "futures"):
-            raise RasatError(ErrorCode.INVALID_REQUEST, f"geçersiz source: {source}")
+            raise RasatError(ErrorCode.INVALID_REQUEST, f"invalid source: {source}")
         if source == "futures":
             if not await self._ensure_futures_symbol(symbol):
-                raise RasatError(ErrorCode.INVALID_SYMBOL, f"futures evreninde bilinmeyen sembol: {symbol}")
+                raise RasatError(ErrorCode.INVALID_SYMBOL, f"unknown symbol in futures universe: {symbol}")
         elif not await self._universe.ensure_contains(symbol):
-            raise RasatError(ErrorCode.INVALID_SYMBOL, f"evrende bilinmeyen sembol: {symbol}")
+            raise RasatError(ErrorCode.INVALID_SYMBOL, f"unknown symbol in universe: {symbol}")
 
         if timeframe in self._config.kline_intervals:
-            # Sabit set → öncelikli warm-up (source'a özel warm haritası)
+            # Fixed set → prioritized warm-up (source-specific warm map).
             warm_map = await self._warm_map(source)
             if not await self._is_warm(warm_map, symbol, timeframe):
                 fut = self._enqueue(symbol, timeframe, limit, PRIORITY_ONDEMAND, source)
@@ -308,9 +310,9 @@ class KlineService:
                 except RasatError:
                     raise
                 except Exception as exc:  # noqa: BLE001
-                    raise RasatError(ErrorCode.STALE_DATA, f"mum verisi alınamadı: {exc}") from exc
+                    raise RasatError(ErrorCode.STALE_DATA, f"could not retrieve candle data: {exc}") from exc
         else:
-            # Sabit set dışı → istek anında canlı hesapla (arka planda izlenmez)
+            # Outside the fixed set → fetch live on request (not monitored in the background).
             rows = await self._fetch(symbol, timeframe, limit, source)
             if rows:
                 await self._store(symbol, timeframe, source, rows)
@@ -329,16 +331,16 @@ class KlineService:
 
         return await self._db.read(_q)
 
-    # ---------- arka plan döngüleri ----------
+    # ---------- background loops ----------
 
     async def _scheduler_loop(self) -> None:
-        """Kapalı mumları yakalar: timeframe bazında son kapalı bar gecikmeli ise spot evreni için çeker."""
+        """Catch closed candles: fetch for the spot universe when the latest closed bar is delayed by timeframe."""
         while True:
             try:
                 await asyncio.sleep(20)
                 now = self._clock.server_now()
                 if now is None:
-                    # Clock yoksa kapanış hedefi belirlenemez — fail-closed, bu turu atla.
+                    # Without a clock, the close target cannot be determined; fail closed and skip this pass.
                     continue
                 for tf in self._config.kline_intervals:
                     period = TIMEFRAME_SECONDS[tf]
@@ -348,16 +350,16 @@ class KlineService:
             except asyncio.CancelledError:
                 return
             except Exception:  # noqa: BLE001
-                logger.exception("kline scheduler hatası")
+                logger.exception("kline scheduler failed")
 
     async def _needs_catchup(self, tf: str, last_closed: int, source: str) -> bool:
-        """Sembol bazlı catchup ihtiyacı (T2).
+        """Determine the need for symbol-level catch-up (T2).
 
-        Eski davranış timeframe genelinde tek `MAX(open_time)` kontrolü yapıyordu;
-        bir sembol son kapalı bara ulaşınca tüm timeframe için catchup atlanıyor,
-        geride kalan semboller kaçabiliyordu. Artık evrendeki her sembolün kendi
-        `MAX(open_time)`'ı hedef kapalı bara bakılır: en az biri geride kalınca
-        True döner (in-flight dedup çift çekimi zaten önler).
+        The old behavior checked one `MAX(open_time)` for the whole timeframe;
+        once one symbol reached the last closed bar, catch-up was skipped for the
+        whole timeframe and lagging symbols could be missed. Now each symbol's own
+        `MAX(open_time)` is compared with the target closed bar: return True when at
+        least one lags (in-flight dedup already prevents duplicate fetches).
         """
         if source == "futures":
             symbols = await self._futures_symbol_set()
@@ -380,16 +382,16 @@ class KlineService:
         for symbol in self._universe.snapshot():
             self._enqueue(symbol, tf, self._config.kline_catchup_bars, PRIORITY_CLOSED_BAR, source)
         logger.info(
-            "kapalı mum yakalama: %s (%s, hedef open_time=%s, %d sembol)",
+            "closed-candle catch-up: %s (%s, target open_time=%s, %d symbols)",
             tf, source, last_closed, len(self._universe.snapshot()),
         )
 
     async def _backfill_loop(self) -> None:
-        """Soğuk (symbol,timeframe) çiftlerini düşük öncelikle doldurur (spot).
+        """Fill cold (symbol,timeframe) pairs at low priority (spot).
 
-        İlk tur önce uyur: başlangıçta agent'ın öncelikli istekleri kuyruğa
-        girmeden backfill bütçeyi doldurmasın. Clock yoksa warm kararı verilemez
-        — bu tur fail-closed atlanır.
+        Sleep before the first pass so startup backfill does not consume the budget
+        before the agent's prioritized requests enter the queue. Without a clock,
+        warm state cannot be decided; skip this pass fail closed.
         """
         while True:
             try:
@@ -406,21 +408,22 @@ class KlineService:
                                 self._enqueue(symbol, tf, self._config.kline_backfill_bars, PRIORITY_BACKFILL, "spot")
                                 enqueued += 1
                     if enqueued:
-                        logger.info("backfill kuyruğu: %d (symbol,timeframe) çifti", enqueued)
+                        logger.info("backfill queue: %d (symbol,timeframe) pairs", enqueued)
             except asyncio.CancelledError:
                 return
             except Exception:  # noqa: BLE001
-                logger.exception("backfill hatası")
+                logger.exception("backfill failed")
 
     # ---------- helper ----------
 
     def freshness_for(self, symbol: str, tf: str, rows: list[dict]) -> str:
-        """Son barın güncelliğine göre freshness (server clock; toleranssız).
+        """Freshness based on the last bar's recency (server clock; no tolerance).
 
-        `fresh`, DB'deki son mumun timeframe'in son kapanmış mumu olduğu anlamına
-        gelir (`last_open == latest_closed`). Son kapanmış mum henüz saklanmadıysa,
-        clock yoksa veya veri server'a göre "gelecekte" (forming) ise `stale` —
-        fail-closed, eski/oluşmakta olan veri taze sanılmaz.
+        `fresh` means the last candle in the DB is the timeframe's last closed
+        candle (`last_open == latest_closed`). If the last closed candle has not
+        been stored, the clock is missing, or data is "in the future" (forming)
+        relative to the server, return `stale`; fail closed so old/forming data is
+        not treated as fresh.
         """
         if not rows:
             return FRESHNESS_STALE

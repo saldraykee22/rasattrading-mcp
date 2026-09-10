@@ -1,7 +1,7 @@
-"""Ortak tool zarfı (envelope) yardımcıları.
+"""Helpers for the common tool envelope.
 
-İstek:  {...params, request_id?, idempotency_key?}
-Cevap:  {ok, data?, error?{code,message}, meta{as_of, source, freshness, algo_version?}}
+Request:  {...params, request_id?, idempotency_key?}
+Response: {ok, data?, error?{code,message}, meta{as_of, source, freshness, algo_version?}}
 """
 
 from __future__ import annotations

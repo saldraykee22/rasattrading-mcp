@@ -1,9 +1,9 @@
-"""2.3 — VWAP (oturum/session anchored) ve Session/Killzone seviyeleri.
+"""2.3 — VWAP (session anchored) and Session/Killzone levels.
 
-- **VWAP:** Gün (UTC) başına yeniden çapalanır; `(H+L+C)/3 * volume` kümülatif
-  toplam / kümülatif hacim. PA-destekleyici tek indikatör istisnasıdır.
-- **Session seviyeleri:** `KILLZONES` (UTC saat aralıkları) içinde kalan
-  mumların günlük high/low'u. Sabit timezone: `SESSION_TIMEZONE` (UTC).
+- **VWAP:** Re-anchored per UTC day; cumulative `(H+L+C)/3 * volume` divided
+  by cumulative volume. It is the only PA-supporting indicator exception.
+- **Session levels:** Daily high/low of candles within `KILLZONES` (UTC hour ranges).
+  Fixed timezone: `SESSION_TIMEZONE` (UTC).
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from .params import SESSION_ALGO_VERSION, SESSION_TIMEZONE, VWAP_ALGO_VERSION, K
 
 
 def compute_vwap(candles: list[dict], algo_version: str = VWAP_ALGO_VERSION) -> dict[str, Any]:
-    """UTC gününe çapalanmış VWAP serisi ve güncel değer."""
+    """Return the VWAP series anchored to the UTC day and the current value."""
     cum_tp = 0.0
     cum_vol = 0.0
     current_day: int | None = None
@@ -43,7 +43,7 @@ def compute_vwap(candles: list[dict], algo_version: str = VWAP_ALGO_VERSION) -> 
 
 
 def compute_session_levels(candles: list[dict], algo_version: str = SESSION_ALGO_VERSION) -> dict[str, Any]:
-    """Killzone aralıklarına göre günlük high/low seviyeleri."""
+    """Return daily high/low levels for each Killzone range."""
     by_zone: dict[str, list[tuple[str, list[dict]]]] = {name: [] for name in KILLZONES}
     for c in candles:
         dt = datetime.fromtimestamp(c["open_time"], tz=timezone.utc)

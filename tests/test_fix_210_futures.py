@@ -1,9 +1,9 @@
-"""2.10 FIX — futures series ASC/LIMIT (en yeni kayıt) + stale aging.
+"""2.10 FIX — futures series ASC/LIMIT (latest record) + stale aging.
 
-Review kanıtları test'e çevrilir:
-- `load_futures_series(limit=1)` en son kaydı döndürmeli (önceden en eski, event_time=100).
-- Eski futures kaydı `age_stale_rows` ile zamanla `stale`'e dönmeli.
-- Alarm/screener OI değişimi artık tek örneğe indirgenmeyip en yeni seriyle eşleşebilmeli.
+Review evidence is converted into tests:
+- `load_futures_series(limit=1)` must return the latest record (previously oldest, event_time=100).
+- An old futures record must become `stale` over time through `age_stale_rows`.
+- Alert/screener OI change must match the latest series, not be reduced to one sample.
 """
 
 import time
@@ -71,22 +71,22 @@ async def _seed_candles(db, symbol, rows):
 
 
 # ---------------------------------------------------------------------------
-# Series sıralaması
+# Series ordering
 # ---------------------------------------------------------------------------
 
 
 async def test_series_limit_1_returns_latest(db):
-    """Review kanıtı: limit=1 en ESKİ kaydı döndürüyordu (event_time=100)."""
+    """Review evidence: limit=1 returned the OLDEST record (event_time=100)."""
     await _seed_futures(db, "BTCUSDT", "open_interest", [(100, 10.0), (200, 20.0), (300, 30.0)])
     series = await load_futures_series(db, "BTCUSDT", "open_interest", limit=1)
     assert len(series) == 1
-    assert series[0]["event_time"] == 300  # en yeni
+    assert series[0]["event_time"] == 300  # newest
 
 
 async def test_series_limit_n_latest_chronological(db):
     await _seed_futures(db, "BTCUSDT", "open_interest", [(100, 10.0), (200, 20.0), (300, 30.0), (400, 40.0)])
     series = await load_futures_series(db, "BTCUSDT", "open_interest", limit=2)
-    assert [s["event_time"] for s in series] == [300, 400]  # en yeni 2, kronolojik
+    assert [s["event_time"] for s in series] == [300, 400]  # latest two, chronological
 
 
 async def test_series_all_chronological(db):
@@ -102,13 +102,13 @@ async def test_series_all_chronological(db):
 
 async def test_stale_aging_marks_old_rows(db, cfg):
     now = int(time.time())
-    await _seed_futures(db, "BTCUSDT", "open_interest", [(100, 10.0)], fetched_at=now - 7200)  # 2 saat önce
+    await _seed_futures(db, "BTCUSDT", "open_interest", [(100, 10.0)], fetched_at=now - 7200)  # 2 hours ago.
     await _seed_futures(db, "BTCUSDT", "open_interest", [(200, 20.0)], fetched_at=now)
     from tests.helpers import FakeRest
 
     poller = FuturesContextPoller(FakeRest(["BTCUSDT"]), db, None, cfg)
     aged = await poller.age_stale_rows(now)
-    assert aged == 1  # sadece eski satır yaşlandı
+    assert aged == 1  # Only the old row aged.
     series = await load_futures_series(db, "BTCUSDT", "open_interest")
     by_ts = {s["event_time"]: s["freshness"] for s in series}
     assert by_ts[100] == "stale"
@@ -125,14 +125,14 @@ async def test_fresh_rows_not_aged(db, cfg):
 
 
 # ---------------------------------------------------------------------------
-# Alarm OI değişimi artık seriyle eşleşebiliyor
+# Alert OI change can now match the series
 # ---------------------------------------------------------------------------
 
 
 async def test_alarm_oi_change_triggers_with_series(db, cfg):
-    """Alarm OI değişimi en yeni fresh seriyi kullanır (tek örneğe indirgenmez)."""
+    """Alert OI change uses the latest fresh series (not reduced to one sample)."""
     await _seed_candles(db, "BTCUSDT", UPTREND)
-    await _seed_futures(db, "BTCUSDT", "open_interest", [(100, 10.0), (200, 30.0)])  # %200 artış
+    await _seed_futures(db, "BTCUSDT", "open_interest", [(100, 10.0), (200, 30.0)])  # 200% increase.
     engine = PAEngine(db)
     alarms = AlarmService(db, engine=engine)
     engine.alarm_service = alarms

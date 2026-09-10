@@ -1,11 +1,11 @@
-"""Kilit dosyası yönetimi.
+"""Lock-file management.
 
-Kilit dosyası tek bir daemon'un ayakta olduğunu garanti eder ve IPC kimlik bilgilerini taşır:
-PID + process başlangıç zamanı + rastgele nonce (PID reuse'a karşı) + rastgele bearer token.
+The lock file guarantees that only one daemon is running and carries IPC credentials:
+PID + process start time + random nonce (against PID reuse) + random bearer token.
 
-- İlk oluşturma atomiktir (O_CREAT|O_EXCL): aynı anda iki daemon kazanamaz (race yok).
-- Stale-lock recovery: sahibi ölmüş (PID canlı değil) ise temizlenir.
-- State güncellemeleri atomic replace (temp + os.replace) ile yapılır, token/pid/nonce korunur.
+- Initial creation is atomic (O_CREAT|O_EXCL): two daemons cannot win concurrently.
+- Stale-lock recovery: remove the lock when its owner has exited (the PID is not alive).
+- State updates use atomic replace (temp + os.replace), preserving token/pid/nonce.
 """
 
 from __future__ import annotations
@@ -23,10 +23,10 @@ LOCK_VERSION = 1
 
 
 class LockHeldError(Exception):
-    """Kilit başka bir canlı daemon tarafından tutuluyor."""
+    """The lock is held by another live daemon."""
 
     def __init__(self, existing: "LockInfo") -> None:
-        super().__init__(f"daemon zaten çalışıyor (pid={existing.pid})")
+        super().__init__(f"daemon is already running (pid={existing.pid})")
         self.existing = existing
 
 
@@ -86,8 +86,8 @@ class LockInfo:
 
 
 def pid_alive(pid: int) -> bool:
-    """PID canlı mı? (psutil tabanlı — os.kill'in Windows'taki sahte KeyboardInterrupt
-    quirk'ünden kaçınır ve PID reuse'u önlemek için start_time eşleşmesine izin verir)"""
+    """Is the PID alive? Uses psutil to avoid os.kill's false Windows KeyboardInterrupt
+    quirk and allows start_time matching to prevent PID reuse."""
     if pid <= 0:
         return False
     try:
@@ -97,7 +97,7 @@ def pid_alive(pid: int) -> bool:
 
 
 def owner_alive(info: LockInfo, start_time_tolerance: float = 2.0) -> bool:
-    """Kilit sahibi hâlâ aynı process mi? PID + process başlangıç zamanı eşleşmeli."""
+    """Is the lock owner still the same process? PID and process start time must match."""
     if info.pid <= 0:
         return False
     if not pid_alive(info.pid):
@@ -110,7 +110,7 @@ def owner_alive(info: LockInfo, start_time_tolerance: float = 2.0) -> bool:
 
 
 def read_lock(path: Path) -> LockInfo | None:
-    """Kilit dosyasını okur. Yoksa veya bozuksa None döner."""
+    """Read the lock file. Return None if it is missing or corrupted."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -129,8 +129,8 @@ def _write_atomic(path: Path, payload: dict) -> None:
         try:
             os.chmod(tmp, 0o600)
         except OSError:
-            pass  # Windows'ta best-effort
-        # Windows'ta hedef kısa süreli kilitlenebilir (okuyucu/AV) — retry
+            pass  # Best effort on Windows.
+        # On Windows, the target may be locked briefly by a reader/AV; retry.
         last_err: Exception | None = None
         for _ in range(5):
             try:
@@ -145,7 +145,7 @@ def _write_atomic(path: Path, payload: dict) -> None:
 
 
 class LockManager:
-    """Daemon tarafı: kilidi alır, state günceller, bırakır."""
+    """Daemon-side lock acquisition, state updates, and release."""
 
     def __init__(self, path: Path, port: int) -> None:
         self._path = path
@@ -157,20 +157,21 @@ class LockManager:
         return self._info
 
     def acquire(self, max_retries: int = 5) -> LockInfo:
-        """Kilit dosyasını atomik oluşturur. Başka canlı daemon varsa LockHeldError fırlatır."""
+        """Atomically create the lock file; raise LockHeldError if another daemon is alive."""
         for _ in range(max_retries):
             existing = read_lock(self._path)
 
             if existing is None and self._path.exists():
-                # Bozuk veya yazılma aşamasında olabilir (O_EXCL + JSON yazma arası boşluk).
-                # Rakip hâlâ yazıyorken silmeyelim: birkaç kez tekrar oku.
+                # It may be corrupted or still being written (the gap between O_EXCL
+                # and writing JSON). Do not delete it while a rival may still be writing;
+                # read it again several times.
                 for _ in range(3):
                     time.sleep(0.02)
                     existing = read_lock(self._path)
                     if existing is not None:
                         break
                 if existing is None:
-                    # Hâlâ okunamıyor → gerçekten bozuk/stale, temizle
+                    # Still unreadable → genuinely corrupted/stale; remove it.
                     self._path.unlink(missing_ok=True)
 
             if existing is not None and not owner_alive(existing):
@@ -184,7 +185,7 @@ class LockManager:
             try:
                 fd = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             except FileExistsError:
-                continue  # bir rakip kazandı; tekrar değerlendir
+                continue  # A rival won; evaluate again.
 
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(info.to_dict(), f)
@@ -198,14 +199,14 @@ class LockManager:
         )
 
     def update_state(self, state: str) -> None:
-        """Kilit dosyasını atomic replace ile günceller (token/pid/nonce korunur)."""
+        """Update the lock file with atomic replace (preserving token/pid/nonce)."""
         if self._info is None:
-            raise RuntimeError("lock alınmadan state güncellenemez")
+            raise RuntimeError("cannot update state before acquiring the lock")
         self._info.state = state
         _write_atomic(self._path, self._info.to_dict())
 
     def release(self) -> None:
-        """Yalnızca bizim kilidimizse siler (halefin kilit dosyasına dokunmaz)."""
+        """Remove the lock only if it is ours (do not touch a successor's lock file)."""
         if self._info is None:
             return
         current = read_lock(self._path)

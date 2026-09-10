@@ -15,7 +15,7 @@ def mk(rows):
     ]
 
 
-# UPTREND yapısı: bos_bullish@7 ve bos@12; son kırmızı mum idx6 (OB adayı)
+# UPTREND structure: bos_bullish@7 and bos@12; last red candle idx6 (OB candidate).
 OBS = [
     (100, 100.5, 99.5, 100),      # 0
     (100, 100.5, 99.5, 100),      # 1
@@ -25,7 +25,7 @@ OBS = [
     (101, 101.5, 100.5, 101),     # 5
     (101, 101.5, 100.5, 100.5),   # 6  RED → OB
     (100.5, 103, 101, 102.5),     # 7  bos_bullish@7 (102)
-    (102, 102.5, 101.5, 102),     # 8  low 101.5 → OB'ye giriş (mitigated)
+    (102, 102.5, 101.5, 102),     # 8  low 101.5 → enters OB (mitigated).
     (102, 102.5, 101.5, 102),     # 9
     (102.5, 103.5, 102, 103),     # 10
     (103, 103.5, 102.5, 103),     # 11
@@ -34,7 +34,7 @@ OBS = [
     (104, 104.5, 103.5, 103.5),   # 14
 ]
 
-# OB sonrası fiyat bölgeyi aşar (breaker)
+# Price crosses the zone after OB (breaker).
 BREAKER = OBS[:8] + [
     (102, 102.5, 101.5, 102),     # 8
     (101.5, 102, 100.4, 100.3),   # 9  close 100.3 < OB.low 100.5 → breaker
@@ -43,7 +43,7 @@ BREAKER = OBS[:8] + [
 
 FVG = [
     (100, 101, 99, 100.5),        # 0  high 101
-    (100.6, 100.8, 100.4, 100.6), # 1  ortadaki mum
+    (100.6, 100.8, 100.4, 100.6), # 1  middle candle
     (101.5, 103, 101.3, 102.5),   # 2  low 101.3 > 101 → bullish FVG [101, 101.3]
     (102, 102.5, 100.6, 101.5),   # 3  low 100.6 ≤ 101.3 → mitigated
 ]
@@ -54,8 +54,9 @@ def test_order_block_after_bos():
     res = compute_order_blocks(mk(OBS), st)
     assert res["algo_version"] == OBFVG_ALGO_VERSION
     obs = res["order_blocks"]
-    # 2 BOS event'i (7 ve 12) aynı mumu (candle 6) OB adayı seçti → aynı fiyat
-    # aralığı dedup ile tek mantıksal bölgeye iner (2.15), ilk (en erken) kayıt kalır.
+    # Two BOS events (7 and 12) selected the same candle (candle 6) as OB
+    # candidate → dedup reduces the same price range to one logical zone (2.15),
+    # preserving the first (earliest) record.
     assert len(obs) == 1
     ob = next(o for o in obs if o["event_index"] == 7)
     assert ob["direction"] == "bullish"
@@ -70,14 +71,14 @@ def test_order_block_becomes_breaker():
     res = compute_order_blocks(mk(BREAKER), st)
     ob = next(o for o in res["order_blocks"] if o["event_index"] == 7)
     assert ob["zone_type"] == "breaker"
-    # Breaker: kapanışla kırılmış OB → artık geçerli değil, mitigated=true (2.15)
+    # Breaker: OB broken on close → no longer valid, mitigated=true (2.15).
     assert ob["mitigated"] is True
 
 
 def test_fvg_detection_and_mitigation():
     st = {"events": [], "swings": []}
     res = compute_order_blocks(mk(FVG), st)
-    assert len(res["order_blocks"]) == 0  # olay yok → OB yok
+    assert len(res["order_blocks"]) == 0  # No event → no OB.
     fvgs = res["fvgs"]
     assert len(fvgs) == 1
     fvg = fvgs[0]
@@ -104,12 +105,12 @@ def test_fvg_bearish():
 def test_fvg_min_gap_filter():
     rows = [
         (100, 101, 99, 100.5),        # high 101
-        (100.6, 101.1, 100.4, 100.6), # middle — ikinci boşluk oluşturmaz
+        (100.6, 101.1, 100.4, 100.6), # middle — does not create a second gap.
         (101.5, 103, 101.05, 102.5),  # gap 101→101.05 = %0.05
     ]
     st = {"events": [], "swings": []}
     res = compute_order_blocks(mk(rows), st, min_gap_pct=0.1)
-    assert res["fvgs"] == []  # küçük boşluk elenir
+    assert res["fvgs"] == []  # Small gap is filtered out.
     res2 = compute_order_blocks(mk(rows), st, min_gap_pct=0.0)
     assert len(res2["fvgs"]) == 1
 
@@ -145,7 +146,7 @@ def test_vwap_resets_at_day_rollover():
         {"open_time": 86400, "open": 50, "high": 50, "low": 50, "close": 50, "volume": 10},
     ]
     res = compute_vwap(rows)
-    assert res["points"][-1]["vwap"] == 50.0  # yeni güne çapalanır
+    assert res["points"][-1]["vwap"] == 50.0  # Anchored to the new day.
     assert res["anchored_at"] == 86400
 
 
@@ -164,7 +165,7 @@ def test_session_levels_per_killzone():
         {"open_time": _epoch(3), "high": 105, "low": 101},   # asian
         {"open_time": _epoch(10), "high": 110, "low": 102},  # london
         {"open_time": _epoch(14), "high": 112, "low": 103},  # newyork
-        {"open_time": _epoch(6), "high": 106, "low": 99},    # asian (daha düşük low)
+        {"open_time": _epoch(6), "high": 106, "low": 99},    # Asian (lower low).
     ]
     res = compute_session_levels(candles)
     assert res["algo_version"] == SESSION_ALGO_VERSION
@@ -172,7 +173,7 @@ def test_session_levels_per_killzone():
     by_name = {s["name"]: s for s in res["sessions"]}
     assert by_name["asian"]["high"] == 106
     assert by_name["asian"]["low"] == 99
-    assert by_name["london"]["high"] == 112  # 14:00 london (7-16) ile newyork'u kapsar
+    assert by_name["london"]["high"] == 112  # 14:00 falls within both the London (7-16) and New York sessions
     assert by_name["newyork"]["high"] == 112
 
 

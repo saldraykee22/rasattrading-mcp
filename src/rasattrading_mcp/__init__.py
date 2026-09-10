@@ -1,3 +1,3 @@
-"""Rasattrading MCP — AI ajanlar için Binance price-action/likidite odaklı MCP sunucusu."""
+"""Rasattrading MCP — a Binance price-action/liquidity-focused MCP server for AI agents."""
 
 __version__ = "0.1.0"

@@ -1,11 +1,11 @@
-"""Bağımsız `emergency_stop` hash-chain log (ticket 3.6).
+"""Independent `emergency_stop` hash-chain log (ticket 3.6).
 
-Daemon çökse/erişilemez olsa bile emergency_stop kendi append-only log dosyasına
-yazar — audit bütünlüğü daemon'un ayakta olmasına bağlı kalmaz. Format audit_log
-ile AYNI hash-chain desenini kullanır (`hash_entry`), böylece daemon açılışta bu
-dosyayı okuyup `audit_log`'a birebir reconcile edebilir.
+Even if the daemon crashes or is unreachable, emergency_stop writes to its own
+append-only log file; audit integrity does not depend on the daemon being alive.
+Use the SAME hash-chain pattern as audit_log (`hash_entry`) so the daemon can read
+this file at startup and reconcile it exactly into `audit_log`.
 
-Dosya: data_dir/emergency_stop.log — her satır tek JSON entry'si.
+File: data_dir/emergency_stop.log — one JSON entry per line.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ class EmergencyLog:
         self.path = path
 
     def append(self, *, actor: str, action: str, details: dict | None = None) -> str:
-        """Bir satır ekler; entry'nin hash'ini döner (reconcile dedup anahtarı)."""
+        """Append a row and return the entry hash (reconciliation dedup key)."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as fh:
             prev = self._tail()
@@ -70,34 +70,34 @@ class EmergencyLog:
         return rows
 
     def verify(self) -> list[dict]:
-        """Zincir bütünlüğünü doğrular; kırık satırları döner (boş = sağlam)."""
+        """Verify chain integrity and return broken rows (empty = intact)."""
         broken: list[dict] = []
         prev_hash = GENESIS_HASH
         prev_seq = 0
         for row in self.entries():
             if row.get("_corrupt"):
-                broken.append({"seq": row.get("seq"), "reason": "bozuk satır (JSON değil)"})
+                broken.append({"seq": row.get("seq"), "reason": "corrupt row (not JSON)"})
                 continue
             seq = int(row["seq"])
             details_json = json.dumps(row.get("details", {}), ensure_ascii=False, sort_keys=True, default=str)
             created_at = int(row["created_at"])
             if seq != prev_seq + 1:
-                broken.append({"seq": seq, "reason": f"seq atlama/silinme (beklenen {prev_seq + 1})"})
+                broken.append({"seq": seq, "reason": f"sequence gap/deletion (expected {prev_seq + 1})"})
             if str(row.get("prev_hash")) != prev_hash:
-                broken.append({"seq": seq, "reason": "zincir kopması (prev_hash uyuşmuyor)"})
+                broken.append({"seq": seq, "reason": "chain break (prev_hash mismatch)"})
             expected = hash_entry(prev_hash, seq, str(row["actor"]), str(row["action"]), details_json, created_at)
             if str(row.get("hash")) != expected:
-                broken.append({"seq": seq, "reason": "hash uyuşmazlığı (satır değiştirilmiş)"})
+                broken.append({"seq": seq, "reason": "hash mismatch (row changed)"})
             prev_hash = str(row["hash"])
             prev_seq = seq
         return broken
 
     def is_action_done(self, action: str, idem_key: str, status: str | None = None) -> bool:
-        """Aynı (action, idem_key) daha önce loglandı mı? — idempotency için.
+        """Check whether (action, idem_key) was logged before — for idempotency.
 
-        `status` verilirse yalnızca o terminal duruma sahip kayıt "done" sayılır
-        (3.15): NEW/PARTIALLY_FILLED/UNKNOWN ile biten bir sell "done" değildir,
-        sonraki koşuda broker'dan gerçek durumu sorgulanıp reconcile edilir.
+        If `status` is supplied, count only a record with that terminal status as
+        "done" (3.15): a sell ending in NEW/PARTIALLY_FILLED/UNKNOWN is not done;
+        query the broker's real state and reconcile on the next run.
         """
         for row in self.entries():
             if row.get("_corrupt"):
@@ -113,12 +113,12 @@ class EmergencyLog:
 
 
 async def reconcile_emergency_log(db, audit, log: EmergencyLog) -> dict:
-    """Daemon açılışında emergency_stop log'unu `audit_log`'a mutabakat eder.
+    """Reconcile the emergency_stop log into `audit_log` at daemon startup.
 
-    - Her emergency entry `audit_log`'a `action="emergency_stop"` olarak yazılır.
-    - Idempotent: `emergency_reconciled` tablosunda kayıtlı hash'ler tekrar yazılmaz.
-    - Log dosyası bozuksa (hash kırılması) bu durum da audit'e not düşülür;
-      yine de satırlar yazılır, bozulma rapor edilir.
+    - Write every emergency entry to `audit_log` as `action="emergency_stop"`.
+    - Idempotent: do not rewrite hashes already in `emergency_reconciled`.
+    - If the log file is corrupt (broken hash), note that in audit as well; still
+      write the rows and report the corruption.
     """
     from .audit import AuditLog
 
@@ -157,5 +157,5 @@ async def reconcile_emergency_log(db, audit, log: EmergencyLog) -> dict:
     written, broken_count = await db.write(_reconcile)
     result = {"reconciled": written, "log_broken": broken}
     if broken:
-        logger.warning("emergency_stop.log zincir kırılması tespit edildi: %s", broken)
+        logger.warning("detected emergency_stop.log chain break: %s", broken)
     return result

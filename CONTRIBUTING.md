@@ -6,10 +6,13 @@ before opening a pull request.
 
 ## Development environment
 
+Create an isolated Python 3.11+ environment and install the project with its development
+extras:
+
 ```
 python -m venv .venv
-.venv\Scripts\pip install -e .[dev]
-.venv\Scripts\python -m pytest -q
+.venv/bin/python -m pip install -e '.[dev]'
+.venv/bin/python -m pytest -q
 ```
 
 The full test suite currently runs **525 tests** and must pass before any merge. Run it before
@@ -53,16 +56,14 @@ created from the current `main`.
 
 ## Development rules and security constraints
 
-`AGENTS.md` (in the repo root) is the authoritative set of development and security rules for
-contributors. It is written for AI agents as well as humans, and it must not be weakened. In
-particular, before changing anything, read it for:
+Contributors should preserve these invariants:
 
-- the paper-mode default and the one-way `enable_real_trading` unlock,
-- credential handling (DPAPI encryption, no plaintext storage, no logging of keys),
-- the immutable/append-only price-action records,
-- the allowlisted `scan_market` filter AST (no raw SQL injection paths),
-- the closed-candle rule for price-action calculations,
-- the Binance HMAC signature ordering constraint,
-- the daemon-independent `emergency_stop.py` requirement.
+- Accounts start in paper mode; enabling real trading is a deliberate, one-way operation.
+- Credentials must be encrypted at rest, never logged, and never committed in plaintext.
+- Price-action records are immutable and append-only.
+- `scan_market` filters must remain an allowlisted AST rather than raw SQL or free-form input.
+- Price-action calculations must use closed candles only.
+- Binance request signing must preserve the query-string order sent by the HTTP client.
+- The emergency-stop command must remain usable independently of the daemon.
 
 If your change touches any of these, call it out explicitly in the pull request description.

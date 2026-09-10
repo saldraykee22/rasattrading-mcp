@@ -1,4 +1,4 @@
-"""Uygulama konfigürasyonu. Ortam değişkenleri + override'larla kurulur."""
+"""Application configuration built from environment variables and overrides."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pathlib import Path
 DEFAULT_DATA_DIR = Path.home() / ".rasattrading"
 DEFAULT_PORT = 8751
 
-# timeframes -> saniye (sabit izlenen set + talep anında hesaplanabilen tüm Binance interval'leri)
+# timeframes -> seconds (fixed monitored set plus all Binance intervals supported on demand)
 TIMEFRAME_SECONDS: dict[str, int] = {
     "1m": 60,
     "3m": 180,
@@ -38,7 +38,7 @@ DEFAULT_CANDLES_RETENTION_DAYS: dict[str, int] = {
 
 @dataclass(frozen=True)
 class Config:
-    """Daemon + adapter ortak konfigürasyonu."""
+    """Configuration shared by the daemon and adapter."""
 
     data_dir: Path
     host: str = "127.0.0.1"
@@ -92,7 +92,7 @@ class Config:
 
     @property
     def ws_force_order_url(self) -> str:
-        """Tüm sembollerdeki piyasa geneli likidasyon emirleri (public, imza gerekmez)."""
+        """Market-wide liquidation orders for all symbols (public; no signature required)."""
         return f"{self.ws_futures_base}/ws/!forceOrder@arr"
 
     @classmethod

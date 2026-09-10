@@ -1,9 +1,9 @@
-"""Binance REST istemcisi: weight bütçesi + 429/418 exponential backoff.
+"""Binance REST client: weight budget plus 429/418 exponential backoff.
 
 401/403 → RasatError(UNAUTHORIZED), 400/404 → RasatError(INVALID_REQUEST)
-(bilinmeyen sembol gibi — futures'ta olmayan spot çifti), 429/418 → backoff ile
-retry, diğer hatalar → RasatError(INTERNAL_ERROR).
-Test edilebilirlik için `session` enjekte edilebilir (FakeSession ile).
+(for example, an unknown symbol or spot pair unavailable in futures), 429/418 →
+retry with backoff, other errors → RasatError(INTERNAL_ERROR).
+The `session` can be injected for testing (with FakeSession).
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ def kline_weight(limit: int) -> int:
 
 
 class BinanceREST:
-    """Weight-bütçeli Binance REST istemcisi (signed istek yok — public market data)."""
+    """Weight-budgeted Binance REST client (no signed requests — public market data)."""
 
     def __init__(
         self,
@@ -56,7 +56,7 @@ class BinanceREST:
         return self._session
 
     async def get(self, path: str, params: dict | None = None, weight: int = 1) -> Any:
-        """GET isteği — bütçeyi kullanır, 429'da backoff, hataları RasatError'a çevirir."""
+        """GET request — consume the budget, back off on 429, and map errors to RasatError."""
         await self._budget.acquire(weight)
         session = await self._get_session()
         last_exc: RasatError | None = None
@@ -76,12 +76,12 @@ class BinanceREST:
                     if resp.status in (401, 403):
                         raise RasatError(
                             ErrorCode.UNAUTHORIZED,
-                            f"Binance {resp.status} — API key gerekiyor olabilir ({path})",
+                            f"Binance {resp.status} — an API key may be required ({path})",
                         )
                     if resp.status in (400, 404):
                         raise RasatError(
                             ErrorCode.INVALID_REQUEST,
-                            f"Binance {resp.status} — geçersiz istek ({path})",
+                            f"Binance {resp.status} — invalid request ({path})",
                         )
                     resp.raise_for_status()
                     ctype = resp.headers.get("Content-Type", "")
@@ -89,13 +89,13 @@ class BinanceREST:
                         return await resp.json()
                     return await resp.text()
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                last_exc = RasatError(ErrorCode.INTERNAL_ERROR, f"Binance istek hatası ({path}): {exc}")
+                last_exc = RasatError(ErrorCode.INTERNAL_ERROR, f"Binance request failed ({path}): {exc}")
                 if attempt < self._retries - 1:
                     await asyncio.sleep(backoff_delay(attempt, base=0.5))
             except RasatError:
                 raise
 
-        raise last_exc or RasatError(ErrorCode.INTERNAL_ERROR, f"Binance istek başarısız: {path}")
+        raise last_exc or RasatError(ErrorCode.INTERNAL_ERROR, f"Binance request failed: {path}")
 
     async def close(self) -> None:
         if self._own_session and self._session is not None and not self._session.closed:

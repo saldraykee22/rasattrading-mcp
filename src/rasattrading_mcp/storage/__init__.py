@@ -1,1 +1,1 @@
-"""Depolama katmanı: SQLite (WAL), tek yazma kuyruğu, migration, audit, retention."""
+"""Storage layer: SQLite (WAL), single write queue, migrations, audit, and retention."""

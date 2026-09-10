@@ -1,16 +1,16 @@
-"""T2 FIX — PA katmanı server clock tutarlılığı + screener fail-closed + OI durumu.
+"""T2 FIX — PA server-clock consistency + screener fail-closed + OI state.
 
-Review bulguları test'e çevrilir (fix-t2-data-pa-clock ticket'ı):
+Review findings converted to tests (fix-t2-data-pa-clock ticket):
 - `pa/swings.filter_closed_candles`, `pa/analysis.freshness_for`, `pa/worker.latest_closed`
-  yerel saat kullanıyordu; data katmanı (klines) server clock kullanıyor. Host saati
-  kayarsa PA kararları kayıyordu → `PAEngine._now()` (pipeline clock, yoksa yerel saat)
-  ortak kaynak yapıldı, kapanmış-mum/freshness kararları buna geçirildi.
-- `klines._needs_catchup` timeframe genelinde tek MAX kontrolü yapıyordu → sembol bazlı.
-- `futures.poll_open_interest` hata sonrası durumu "ok" ile eziyordu → gerçek durum korunur.
-- Screener stale sembolleri sonuca karışık tazelikte sokuyordu (fail-open) → `require_fresh`.
-- Screener soğuk evrende bütçesiz `engine.analyze` çağırıyordu → K3 bütçe deseni.
+  used local time; the data layer (klines) uses the server clock. Host clock skew
+  shifted PA decisions → `PAEngine._now()` (pipeline clock, otherwise local time)
+  became the shared source for closed-candle/freshness decisions.
+- `klines._needs_catchup` used one MAX check for the whole timeframe → per symbol.
+- `futures.poll_open_interest` overwrote post-error state with "ok" → preserve real state.
+- Screener mixed stale symbols into results (fail-open) → `require_fresh`.
+- Screener called `engine.analyze` without a budget in a cold universe → K3 budget pattern.
 
-Kapsam: pa/swings, pa/analysis, pa/worker, pa/screener, data/klines, data/futures.
+Scope: pa/swings, pa/analysis, pa/worker, pa/screener, data/klines, data/futures.
 """
 
 import time
@@ -92,14 +92,14 @@ async def seed_at(db, symbol, rows, open_times):
 
 
 # ---------------------------------------------------------------------------
-# PA katmanı server clock (kapanmış-mum + freshness)
+# PA server clock (closed candle + freshness)
 # ---------------------------------------------------------------------------
 
 
 def test_pa_filter_closed_candles_uses_server_clock():
-    """Host saati server'dan 2 period ilerideyken kapanış kararı server clock'a göre verilir.
+    """When host time is two periods ahead of server, close decisions use server clock.
 
-    Host'un "kapanmış" saydığı son bar, server'a göre hâlâ oluşuyordur — filter onu atar.
+    The last bar host considers "closed" is still forming according to server—filter it out.
     """
     clock = FakeClock(offset=-2 * PERIOD)
     now = clock.server_now()
@@ -114,64 +114,64 @@ def test_pa_filter_closed_candles_uses_server_clock():
     ]
     kept = filter_closed_candles(candles, TF, now=now)
     assert [c["open_time"] for c in kept] == [server_latest_closed - PERIOD, server_latest_closed]
-    # `now` verilmezse yerel saat — eski davranış korunur
+    # Without `now`, use local time—the old behavior is preserved.
     kept_local = filter_closed_candles(candles, TF)
     assert host_latest_closed in [c["open_time"] for c in kept_local]
 
 
 def test_pa_freshness_uses_server_clock():
-    """Freshness `now` parametresiyle server clock'a göre hesaplanır (T2).
+    """Freshness is calculated against server clock with the `now` parameter (T2).
 
-    Host saatinden `PERIOD` geride olan server clock'ta, server'ın son kapanmış
-    mumu (`server_latest_closed`) fresh'tir — ama yerel saatle (host) hesaplanırsa
-    aynı bar `stale` görünürdü (yanlış stale riski). Fix, kararı server clock'a bağlar.
+    With server clock one `PERIOD` behind host time, the server's last closed
+    candle (`server_latest_closed`) is fresh—but with local (host) time the same
+    candle would appear `stale` (false-stale risk). The fix ties the decision to server clock.
     """
     clock = FakeClock(offset=-PERIOD)
     server_now = clock.server_now()
     server_latest_closed = int(server_now // PERIOD) * PERIOD - PERIOD
 
-    # Server clock ile server'ın son kapanmış mumu fresh
+    # Server's last closed candle is fresh with server clock.
     assert PAEngine.freshness_for(TF, server_latest_closed, now=server_now) == FRESHNESS_FRESH
-    # Yerel saatle (now verilmezse) aynı bar stale görünür → veri katmanıyla tutarsızlık
+    # With local time (when now is omitted), the same candle appears stale → inconsistent with data layer.
     assert PAEngine.freshness_for(TF, server_latest_closed) == FRESHNESS_STALE
 
 
 async def test_pa_engine_now_prefers_pipeline_clock(db):
-    """`PAEngine._now()` pipeline clock varken server saatini döner; yoksa yerel saati."""
+    """`PAEngine._now()` returns server time when pipeline clock exists; otherwise local time."""
     clock = FakeClock(offset=7 * 60)
     engine = PAEngine(db, pipeline=FakePipeline(clock))
     assert engine._now() == pytest.approx(clock.server_now(), abs=1)
 
-    engine_local = PAEngine(db)  # pipeline yok → yerel saat
+    engine_local = PAEngine(db)  # No pipeline → local time.
     assert engine_local._now() == pytest.approx(time.time(), abs=1)
 
 
 async def test_pa_freshness_instance_uses_server_clock(db):
-    """`PAEngine.freshness()` örnek metodu server clock'a bağlıdır (screener/worker kullanımı)."""
+    """`PAEngine.freshness()` instance method uses server clock (for screener/worker)."""
     clock = FakeClock(offset=-PERIOD)
     engine = PAEngine(db, pipeline=FakePipeline(clock))
     server_latest_closed = int(clock.server_now() // PERIOD) * PERIOD - PERIOD
 
     assert engine.freshness(TF, server_latest_closed) == FRESHNESS_FRESH
-    # Yerel saatle aynı bar stale görünür — örnek metot server clock kullandığı için fresh
+    # The same candle appears stale with local time—it is fresh because the instance method uses server clock.
     assert PAEngine.freshness_for(TF, server_latest_closed) == FRESHNESS_STALE
 
 
 def test_pa_worker_latest_closed_uses_server_clock():
-    """`PAWorker.latest_closed` `now` ile server'ın son kapalı barını döndürür."""
+    """`PAWorker.latest_closed` returns the server's last closed bar using `now`."""
     clock = FakeClock(offset=-PERIOD)
     server_latest_closed = int(clock.server_now() // PERIOD) * PERIOD - PERIOD
     host_latest_closed = int(time.time() // PERIOD) * PERIOD - PERIOD
 
     assert PAWorker.latest_closed(TF, now=clock.server_now()) == server_latest_closed
-    assert PAWorker.latest_closed(TF) == host_latest_closed  # now yoksa yerel saat
+    assert PAWorker.latest_closed(TF) == host_latest_closed  # Without now, local time.
 
 
 async def test_worker_processes_when_server_clock_says_closed(db, cfg):
-    """Host saati kaymış olsa da server clock'a göre kapalı olan bar worker tarafından işlenir.
+    """The worker processes a bar closed according to server clock even when host time is skewed.
 
-    Eski davranış (yerel saat) host saatine göre "kapalı olmayan" barı stale sayıp
-    turu atlıyordu; server clock ile data katmanıyla tutarlı işlenir.
+    The old behavior (local time) considered a bar "not closed" by host time,
+    marked it stale, and skipped the cycle; server clock keeps it consistent with the data layer.
     """
     clock = FakeClock(offset=-PERIOD)
     engine = PAEngine(db, pipeline=FakePipeline(clock))
@@ -187,13 +187,13 @@ async def test_worker_processes_when_server_clock_says_closed(db, cfg):
 
 
 async def test_worker_skips_when_data_behind_server(db, cfg):
-    """Server clock'a göre veri son kapanmış bara yetişmemişse (bir period geride)
-    worker turu işlemez — fail-closed (2.12 davranışı server clock ile korunur)."""
+    """If data is one period behind the server's last closed bar, the worker skips
+    the cycle—fail-closed (2.12 behavior preserved with server clock)."""
     clock = FakeClock(offset=-PERIOD)
     engine = PAEngine(db, pipeline=FakePipeline(clock))
     server_latest_closed = int(clock.server_now() // PERIOD) * PERIOD - PERIOD
 
-    # Son mum server'ın son kapanmış barından bir period geride
+    # Last candle is one period behind the server's last closed bar.
     await seed_at(db, "BTCUSDT", UPTREND, _fresh_times(len(UPTREND), now=clock.server_now() - PERIOD))
     worker = PAWorker(engine, FakeUniverse(["BTCUSDT"]), cfg)
 
@@ -202,7 +202,7 @@ async def test_worker_skips_when_data_behind_server(db, cfg):
 
 
 # ---------------------------------------------------------------------------
-# Screener: require_fresh (fail-closed) + analiz bütçesi
+# Screener: require_fresh (fail-closed) + analysis budget
 # ---------------------------------------------------------------------------
 
 
@@ -219,22 +219,22 @@ async def _seed_old(db, symbol, rows):
 
 
 async def test_screener_require_fresh_excludes_stale(db):
-    """`require_fresh=True` (varsayılan): stale eşleşenler sonuç listesinden çıkar,
-    `stale_symbols` alanında raporlanır (alarmlarla aynı fail-closed davranış)."""
-    await _seed_old(db, "BTCUSDT", UPTREND)  # eski damgalı → stale
+    """`require_fresh=True` (default): stale matches are removed from results and
+    reported in `stale_symbols` (same fail-closed behavior as alarms)."""
+    await _seed_old(db, "BTCUSDT", UPTREND)  # Old timestamp → stale.
     await _seed_old(db, "SOLUSDT", [(105 - i * 0.5, 105.5 - i * 0.5, 104.5 - i * 0.5, 105 - i * 0.5) for i in range(15)])
     screener = Screener(db)
 
     res = await screener.scan([{"type": "price_change", "window_bars": 10, "min": 2}])
-    assert res["symbols"] == []  # tüm eşleşenler stale → sonuç boş (fail-closed)
-    assert res["freshness"] == FRESHNESS_FRESH  # sunulan sonuç yok → stale veri yok
+    assert res["symbols"] == []  # All matches stale → empty result (fail-closed).
+    assert res["freshness"] == FRESHNESS_FRESH  # No result presented → no stale data.
     stale_syms = {s["symbol"] for s in res["stale_symbols"]}
-    assert "BTCUSDT" in stale_syms  # eşleşip stale kaldığı için ayrı raporda
-    assert "SOLUSDT" not in stale_syms  # filtreyle eşleşmedi → stale listesinde de yok
+    assert "BTCUSDT" in stale_syms  # Matched but stale, so separately reported.
+    assert "SOLUSDT" not in stale_syms  # Did not match the filter → not in stale list.
 
 
 async def test_screener_require_fresh_false_keeps_legacy_behavior(db):
-    """`require_fresh=False`: stale eşleşenler işaretlenerek sonuca girer (eski davranış)."""
+    """`require_fresh=False`: stale matches enter results marked as stale (old behavior)."""
     await _seed_old(db, "BTCUSDT", UPTREND)
     screener = Screener(db)
 
@@ -242,39 +242,39 @@ async def test_screener_require_fresh_false_keeps_legacy_behavior(db):
     btc = next(s for s in res["symbols"] if s["symbol"] == "BTCUSDT")
     assert btc["data_stale"] is True
     assert res["freshness"] == FRESHNESS_STALE
-    assert res["stale_symbols"] == []  # require_fresh=False → stale semboller sonuçta işaretli
+    assert res["stale_symbols"] == []  # require_fresh=False → stale symbols are marked in results.
 
 
 async def test_screener_analysis_budget_defers_cold_symbols(db):
-    """K3 deseni: depolanmış analiz yokken on-demand `analyze` bütçeyle sınırlanır;
-    bütçeyi aşan semboller ertelenir (`deferred_analysis`), scan dakikalarca sürmez."""
+    """K3 pattern: when no stored analysis exists, on-demand `analyze` is budgeted;
+    symbols over budget are deferred (`deferred_analysis`), so the scan does not take minutes."""
     for sym in ("BTCUSDT", "ETHUSDT"):
         await seed_at(db, sym, UPTREND, _fresh_times(len(UPTREND)))
     screener = Screener(db, compute_budget=1)
 
     res = await screener.scan([{"type": "structure_event", "event": "bos_bullish"}])
-    assert res["deferred_analysis"] == 1  # 2 sembolden 1'i analiz edildi, 1'i ertelendi
-    assert res["total_matched"] == 1  # yalnızca analiz edilen sembol değerlendirilebildi
+    assert res["deferred_analysis"] == 1  # 1 of 2 symbols analyzed, 1 deferred
+    assert res["total_matched"] == 1  # Only the analyzed symbol could be evaluated.
 
 
 async def test_screener_budget_resets_each_scan(db):
-    """Her scan turu bütçeyi sıfırlar — ertelenen sembol bir sonraki turda işlenebilir."""
+    """Each scan cycle resets the budget—the deferred symbol can be processed next cycle."""
     for sym in ("BTCUSDT", "ETHUSDT"):
         await seed_at(db, sym, UPTREND, _fresh_times(len(UPTREND)))
     screener = Screener(db, compute_budget=1)
 
     first = await screener.scan([{"type": "structure_event", "event": "bos_bullish"}])
-    assert first["deferred_analysis"] == 1  # BTCUSDT analiz edildi, ETHUSDT ertelendi
+    assert first["deferred_analysis"] == 1  # BTCUSDT analyzed, ETHUSDT deferred
     assert first["total_matched"] == 1
 
-    # İkinci turda bütçe sıfırlandı; BTCUSDT artık depolanmış → ETHUSDT de analiz edilir
+    # Budget reset on the second cycle; BTCUSDT is now stored → ETHUSDT is also analyzed.
     second = await screener.scan([{"type": "structure_event", "event": "bos_bullish"}])
     assert second["deferred_analysis"] == 0
     assert second["total_matched"] == 2
 
 
 # ---------------------------------------------------------------------------
-# klines: sembol bazlı catchup
+# klines: per-symbol catch-up
 # ---------------------------------------------------------------------------
 
 
@@ -298,19 +298,19 @@ async def _max_open_for(db, symbol):
 
 
 async def test_needs_catchup_symbol_level(cfg, db):
-    """Bir sembol güncelken diğer sembol gerideyse catchup atlanmaz (T2)."""
+    """Catch-up is not skipped when one symbol is current and another is behind (T2)."""
     fake = FakeRest(["BTCUSDT", "ETHUSDT"])
     _, svc = await _klines_svc(cfg, db, fake)
     try:
         last_closed = int(time.time() // PERIOD) * PERIOD - PERIOD
 
-        # BTCUSDT güncel (son kapalı bar), ETHUSDT bir period geride
+        # BTCUSDT current (last closed bar), ETHUSDT one period behind.
         await seed_at(db, "BTCUSDT", UPTREND, _fresh_times(len(UPTREND)))
         await seed_at(db, "ETHUSDT", UPTREND, _fresh_times(len(UPTREND), now=time.time() - PERIOD))
 
         assert await svc._needs_catchup(TF, last_closed, "spot") is True
 
-        # Her ikisi de güncel → catchup gerekmez
+        # Both current → no catch-up needed.
         await seed_at(db, "ETHUSDT", UPTREND, _fresh_times(len(UPTREND)))
         assert await svc._needs_catchup(TF, last_closed, "spot") is False
     finally:
@@ -318,11 +318,11 @@ async def test_needs_catchup_symbol_level(cfg, db):
 
 
 async def test_needs_catchup_no_symbols_false(cfg, db):
-    """Evrende sembol yoksa catchup gerekmez (tek MAX kontrolündeki None davranışı korunur)."""
+    """No catch-up is needed when a symbol is absent from the universe (preserve single-MAX None behavior)."""
     fake = FakeRest(["BTCUSDT"])
     _, svc = await _klines_svc(cfg, db, fake)
     try:
-        # BTCUSDT evrende ama hiç veri yok → catchup gerekir
+        # BTCUSDT is in the universe but has no data → catch-up is needed.
         last_closed = int(time.time() // PERIOD) * PERIOD - PERIOD
         assert await svc._needs_catchup(TF, last_closed, "spot") is True
     finally:
@@ -330,7 +330,7 @@ async def test_needs_catchup_no_symbols_false(cfg, db):
 
 
 # ---------------------------------------------------------------------------
-# futures: OI poll durumu yalnızca temiz turda "ok" olur
+# futures: OI poll state is "ok" only on a clean cycle
 # ---------------------------------------------------------------------------
 
 
@@ -349,11 +349,11 @@ async def test_oi_poll_ok_only_on_clean_round(cfg, db):
 
 
 async def test_oi_poll_rate_limited_status_preserved(cfg, db):
-    """RATE_LIMITED'te durum `rate_limited` kalır; döngü sonunda `ok` ile ezilmez."""
+    """On RATE_LIMITED, state remains `rate_limited`; it is not overwritten with `ok` at cycle end."""
     class _OiRateRest(FakeRest):
         async def get(self, path, params=None, weight=1):
             if path == "/fapi/v1/openInterest":
-                raise RasatError(ErrorCode.RATE_LIMITED, "bütçe dolu")
+                raise RasatError(ErrorCode.RATE_LIMITED, "budget exhausted")
             return await super().get(path, params, weight)
 
     fake = _OiRateRest(["BTCUSDT"])
@@ -364,11 +364,11 @@ async def test_oi_poll_rate_limited_status_preserved(cfg, db):
 
 
 async def test_oi_poll_error_status_preserved(cfg, db):
-    """Genel hata (timeout vb.) durumu `error` yapar; `ok` yazılmaz."""
+    """A general error (timeout, etc.) sets state to `error`; it does not write `ok`."""
     class _OiFailRest(FakeRest):
         async def get(self, path, params=None, weight=1):
             if path == "/fapi/v1/openInterest":
-                raise RasatError(ErrorCode.INTERNAL_ERROR, "ağ hatası")
+                raise RasatError(ErrorCode.INTERNAL_ERROR, "network error")
             return await super().get(path, params, weight)
 
     fake = _OiFailRest(["BTCUSDT"])
@@ -378,7 +378,7 @@ async def test_oi_poll_error_status_preserved(cfg, db):
 
 
 async def test_oi_poll_invalid_symbol_400_still_ok(cfg, db):
-    """400 (sembol fapi'de yok) bir sembolü kümeden düşürür ama döngü temiz tamamlanır → `ok`."""
+    """400 (symbol absent from fapi) drops a symbol from the set but completes the cycle cleanly → `ok`."""
     class _Oi400Rest(FakeRest):
         def __init__(self, symbols):
             super().__init__(symbols)

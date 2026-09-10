@@ -1,14 +1,14 @@
-"""Ortak execution validator (T01).
+"""Shared execution validator (T01).
 
-`place_order` / `place_oco_order` / `execute_on_accounts` broker çağrısından
-ÖNCE bu validator'ı kullanır; JSON schema'ya güvenilmez. Bu katman canonical
-`INVALID_REQUEST` veya `FILTER_VIOLATION` üretir ve broker asla çağrılmaz.
+`place_order` / `place_oco_order` / `execute_on_accounts` use this validator
+BEFORE calling the broker; the JSON schema is not trusted. This layer produces
+canonical `INVALID_REQUEST` or `FILTER_VIOLATION`, and the broker is never called.
 
-Kontroller tek yerde:
-- sonlu sayılar (NaN/Infinity reddi);
+All checks are centralized here:
+- finite numbers (NaN/Infinity rejected);
 - side/order_type allowlist;
-- MARKET/LIMIT/STOP_LOSS_LIMIT/OCO koşullu alanları;
-- stop yönü (market'e göre) ve OCO fiyat geometrisi;
+- MARKET/LIMIT/STOP_LOSS_LIMIT/OCO conditional fields;
+- stop direction (relative to the market) and OCO price geometry;
 - SymbolFilters: min/max quantity, step size, min notional, price tick/min/max.
 """
 
@@ -28,21 +28,21 @@ _ALIGN_EPS = 1e-6
 
 def normalize_side(side) -> str:
     if not isinstance(side, str) or not side.strip():
-        raise RasatError(ErrorCode.INVALID_REQUEST, "side zorunlu (BUY|SELL)")
+        raise RasatError(ErrorCode.INVALID_REQUEST, "side is required (BUY|SELL)")
     side_n = side.strip().upper()
     if side_n not in SIDES:
-        raise RasatError(ErrorCode.INVALID_REQUEST, f"geçersiz side: {side!r} (BUY|SELL)")
+        raise RasatError(ErrorCode.INVALID_REQUEST, f"invalid side: {side!r} (BUY|SELL)")
     return side_n
 
 
 def normalize_order_type(order_type) -> str:
     if not isinstance(order_type, str) or not order_type.strip():
-        raise RasatError(ErrorCode.INVALID_REQUEST, "order_type zorunlu")
+        raise RasatError(ErrorCode.INVALID_REQUEST, "order_type is required")
     ot = order_type.strip().upper()
     if ot not in ORDER_TYPES:
         raise RasatError(
             ErrorCode.INVALID_REQUEST,
-            f"geçersiz order_type: {order_type!r} ({'/'.join(ORDER_TYPES)})",
+            f"invalid order_type: {order_type!r} ({'/'.join(ORDER_TYPES)})",
         )
     return ot
 
@@ -67,7 +67,7 @@ def _check_filters_finite(filters: SymbolFilters) -> None:
         if value is None or not math.isfinite(float(value)):
             raise RasatError(
                 ErrorCode.FILTER_VIOLATION,
-                f"{filters.symbol} {field} geçersiz (sonlu değil)",
+                f"{filters.symbol} {field} is invalid (not finite)",
             )
 
 
@@ -82,14 +82,14 @@ def validate_execution_order(
     filters: SymbolFilters | None = None,
     market_price: float | None = None,
 ) -> dict:
-    """Ortak doğrulama; normalize edilmiş alanları döner.
+    """Shared validation; returns normalized fields.
 
     Returns:
         {side, order_type, quantity, price, stop_price, stop_limit_price, notional}
 
-    `notional` = quantity * price; price yoksa (MARKET) quantity * market_price.
-    `filters`/`market_price` verilmediğinde o kontroller atlanır (pre-validation
-    çağrıları için); tam yol her ikisini de geçirir.
+    `notional` = quantity * price; when price is absent (MARKET), quantity * market_price.
+    When `filters`/`market_price` are absent, those checks are skipped (for
+    pre-validation calls); the full path passes both.
     """
     side_n = normalize_side(side)
     ot = normalize_order_type(order_type)
@@ -100,65 +100,65 @@ def validate_execution_order(
     stop_limit_price = _require_positive_optional(stop_limit_price, "stop_limit_price")
     market_price = _require_positive_optional(market_price, "market_price")
 
-    # Koşullu alanlar
+    # Conditional fields
     if ot == "LIMIT":
         if price is None:
-            raise RasatError(ErrorCode.INVALID_REQUEST, "LIMIT emirde price zorunlu")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "price is required for LIMIT orders")
     elif ot == "STOP_LOSS_LIMIT":
         if price is None:
-            raise RasatError(ErrorCode.INVALID_REQUEST, "STOP_LOSS_LIMIT emirde price zorunlu")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "price is required for STOP_LOSS_LIMIT orders")
         if stop_price is None:
-            raise RasatError(ErrorCode.INVALID_REQUEST, "STOP_LOSS_LIMIT emirde stop_price zorunlu")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "stop_price is required for STOP_LOSS_LIMIT orders")
         if market_price is not None:
             if side_n == "SELL" and stop_price >= market_price:
                 raise RasatError(
                     ErrorCode.INVALID_REQUEST,
-                    "SELL stop emrinde stop_price piyasa fiyatının altında olmalı",
+                    "SELL stop_price must be below the market price",
                 )
             if side_n == "BUY" and stop_price <= market_price:
                 raise RasatError(
                     ErrorCode.INVALID_REQUEST,
-                    "BUY stop emrinde stop_price piyasa fiyatının üstünde olmalı",
+                    "BUY stop_price must be above the market price",
                 )
     elif ot == "OCO":
         if price is None:
-            raise RasatError(ErrorCode.INVALID_REQUEST, "OCO emirde price (kâr hedefi) zorunlu")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "price (profit target) is required for OCO orders")
         if stop_price is None:
-            raise RasatError(ErrorCode.INVALID_REQUEST, "OCO emirde stop_price zorunlu")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "stop_price is required for OCO orders")
         if stop_limit_price is None:
-            raise RasatError(ErrorCode.INVALID_REQUEST, "OCO emirde stop_limit_price zorunlu")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "stop_limit_price is required for OCO orders")
         if side_n == "SELL":
             if stop_limit_price >= stop_price:
                 raise RasatError(
                     ErrorCode.INVALID_REQUEST,
-                    "SELL OCO'da stop_limit_price stop_price'dan düşük olmalı",
+                    "SELL OCO stop_limit_price must be below stop_price",
                 )
             if price <= stop_price:
                 raise RasatError(
                     ErrorCode.INVALID_REQUEST,
-                    "SELL OCO'da price (kâr hedefi) stop_price'ın üstünde olmalı",
+                    "SELL OCO price (profit target) must be above stop_price",
                 )
         else:
             if stop_limit_price <= stop_price:
                 raise RasatError(
                     ErrorCode.INVALID_REQUEST,
-                    "BUY OCO'da stop_limit_price stop_price'dan yüksek olmalı",
+                    "BUY OCO stop_limit_price must be above stop_price",
                 )
             if price >= stop_price:
                 raise RasatError(
                     ErrorCode.INVALID_REQUEST,
-                    "BUY OCO'da price (kâr hedefi) stop_price'ın altında olmalı",
+                    "BUY OCO price (profit target) must be below stop_price",
                 )
         if market_price is not None:
             if side_n == "SELL" and stop_price >= market_price:
                 raise RasatError(
                     ErrorCode.INVALID_REQUEST,
-                    "SELL OCO'da stop_price giriş fiyatının altında olmalı",
+                    "SELL OCO stop_price must be below the entry price",
                 )
             if side_n == "BUY" and stop_price <= market_price:
                 raise RasatError(
                     ErrorCode.INVALID_REQUEST,
-                    "BUY OCO'da stop_price giriş fiyatının üstünde olmalı",
+                    "BUY OCO stop_price must be above the entry price",
                 )
 
     reference = price if price is not None else market_price
@@ -169,19 +169,19 @@ def validate_execution_order(
         if qty < filters.min_qty:
             raise RasatError(
                 ErrorCode.FILTER_VIOLATION,
-                f"miktar LOT_SIZE minQty altında: {qty} < {filters.min_qty} ({filters.symbol})",
+                f"quantity is below LOT_SIZE minQty: {qty} < {filters.min_qty} ({filters.symbol})",
             )
         if qty > filters.max_qty:
             raise RasatError(
                 ErrorCode.FILTER_VIOLATION,
-                f"miktar LOT_SIZE maxQty üstünde: {qty} > {filters.max_qty} ({filters.symbol})",
+                f"quantity is above LOT_SIZE maxQty: {qty} > {filters.max_qty} ({filters.symbol})",
             )
         if filters.step_size and filters.step_size > 0:
             steps = qty / filters.step_size
             if abs(steps - round(steps)) > _ALIGN_EPS:
                 raise RasatError(
                     ErrorCode.FILTER_VIOLATION,
-                    f"miktar LOT_SIZE stepSize katı değil: {qty} (step {filters.step_size}, {filters.symbol})",
+                    f"quantity is not a multiple of LOT_SIZE stepSize: {qty} (step {filters.step_size}, {filters.symbol})",
                 )
         for pname, pval in (
             ("price", price),
@@ -193,21 +193,21 @@ def validate_execution_order(
             if pval < filters.min_price or pval > filters.max_price:
                 raise RasatError(
                     ErrorCode.FILTER_VIOLATION,
-                    f"{pname} PRICE_FILTER dışında: {pval} ([{filters.min_price}, {filters.max_price}])",
+                    f"{pname} is outside PRICE_FILTER: {pval} ([{filters.min_price}, {filters.max_price}])",
                 )
             if filters.tick_size and filters.tick_size > 0:
                 ticks = (pval - filters.min_price) / filters.tick_size
                 if abs(ticks - round(ticks)) > _ALIGN_EPS:
                     raise RasatError(
                         ErrorCode.FILTER_VIOLATION,
-                        f"{pname} PRICE_FILTER tickSize katı değil: {pval} (tick {filters.tick_size})",
+                        f"{pname} is not a multiple of PRICE_FILTER tickSize: {pval} (tick {filters.tick_size})",
                     )
         if notional is None:
-            raise RasatError(ErrorCode.INVALID_REQUEST, f"{ot} emir için fiyat/referans fiyatı gerekli")
+            raise RasatError(ErrorCode.INVALID_REQUEST, f"price/reference price is required for {ot} orders")
         if notional < filters.min_notional:
             raise RasatError(
                 ErrorCode.FILTER_VIOLATION,
-                f"tutar MIN_NOTIONAL altında: {notional} < {filters.min_notional} ({filters.symbol})",
+                f"notional is below MIN_NOTIONAL: {notional} < {filters.min_notional} ({filters.symbol})",
             )
 
     return {

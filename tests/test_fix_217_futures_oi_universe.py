@@ -1,15 +1,15 @@
-"""2.17 FIX — futures OI poll'ü fapi sembol kümesiyle filtrelenir.
+"""2.17 FIX — futures OI polling is filtered by the fapi symbol set.
 
-Canlı gözlem: spot evrenindeki tokenized hisse senedi çiftleri (SMCIBUSDT,
-ALABBUSDT, ...) ve spot-only semboller futures'ta (fapi) yok; `poll_open_interest`
-evrendeki her sembole `/fapi/v1/openInterest` isteği atınca her turda ~100+ 400
-hatası + log spam + boşa rate-limit bütçesi üretiyordu.
+Live observation: tokenized stock pairs in the spot universe (SMCIBUSDT,
+ALABBUSDT, ...) and spot-only symbols are absent from futures (fapi); `poll_open_interest`
+when requesting `/fapi/v1/openInterest` for every universe symbol, produced 100+
+400 errors per cycle, log spam, and wasted rate-limit budget.
 
 Fix:
-- fapi `/fapi/v1/exchangeInfo`'dan TRADING USDT kümesi TTL'li çekilir.
-- OI poll'ü yalnızca o kümedeki sembollere istek atar.
-- 400 düşen sembol (exchangeInfo'ya rağmen fapi'de yok) kümeden düşürülür,
-  sonraki turlarda tekrar denenmez.
+- Fetch the TRADING USDT set from fapi `/fapi/v1/exchangeInfo` with a TTL.
+- OI polling requests only symbols in that set.
+- Remove a symbol returning 400 (absent from fapi despite exchangeInfo) from the set,
+  it is not retried in subsequent cycles.
 """
 
 import pytest
@@ -57,13 +57,13 @@ async def _stored_oi(db):
 
 
 async def test_oi_poll_skips_symbols_not_on_futures(cfg, db):
-    """Spot evreninde olup fapi'de olmayan sembollere OI isteği atılmaz."""
-    fake = FakeRest(["BTCUSDT", "SMCIBUSDT", "ALABBUSDT"])  # spot evreni
-    fake.fapi_symbols = ["BTCUSDT"]  # futures'ta yalnızca BTCUSDT var
+    """Do not request OI for symbols in spot universe but absent from fapi."""
+    fake = FakeRest(["BTCUSDT", "SMCIBUSDT", "ALABBUSDT"])  # spot universe
+    fake.fapi_symbols = ["BTCUSDT"]  # Only BTCUSDT is in futures.
     _, poller = await _poller(cfg, db, fake, universe_symbols=["BTCUSDT", "SMCIBUSDT", "ALABBUSDT"])
 
     n = await poller.poll_open_interest()
-    assert n == 1  # yalnızca BTCUSDT
+    assert n == 1  # Only BTCUSDT.
 
     oi_calls = [c for c in fake.calls if c[0] == "/fapi/v1/openInterest"]
     assert len(oi_calls) == 1
@@ -75,18 +75,18 @@ async def test_oi_poll_skips_symbols_not_on_futures(cfg, db):
 
 
 async def test_oi_poll_caches_futures_universe(cfg, db):
-    """fapi exchangeInfo her poll'de değil, TTL süresince bir kez çekilir."""
+    """Fetch fapi exchangeInfo once during the TTL, not on every poll."""
     fake = FakeRest(["BTCUSDT", "ETHUSDT"])
     _, poller = await _poller(cfg, db, fake)
 
     await poller.poll_open_interest()
     await poller.poll_open_interest()
     ei_calls = [c for c in fake.calls if c[0] == "/fapi/v1/exchangeInfo"]
-    assert len(ei_calls) == 1  # ikinci poll TTL içinde → cache'ten
+    assert len(ei_calls) == 1  # Second poll is within TTL → from cache.
 
 
 async def test_oi_poll_refreshes_after_ttl(cfg, db):
-    """TTL dolunca fapi kümesi yeniden çekilir (yeni listelenen çiftler yakalanır)."""
+    """When TTL expires, refetch fapi set (newly listed pairs are picked up)."""
     fake = FakeRest(["BTCUSDT"])
     poller = FuturesContextPoller(
         fake, db, UniverseService(fake, cfg), Config(data_dir=cfg.data_dir, futures_universe_ttl_seconds=0)
@@ -98,7 +98,7 @@ async def test_oi_poll_refreshes_after_ttl(cfg, db):
 
 
 async def test_oi_poll_drops_symbol_after_400(cfg, db):
-    """exchangeInfo'da görünüp OI'da 400 dönen sembol kümeden düşürülür."""
+    """A symbol in exchangeInfo that returns 400 from OI is removed from the set."""
     class _FuturesRest(FakeRest):
         def __init__(self, symbols):
             super().__init__(symbols)
@@ -107,7 +107,7 @@ async def test_oi_poll_drops_symbol_after_400(cfg, db):
         async def get(self, path, params=None, weight=1):
             if path == "/fapi/v1/openInterest" and (params or {}).get("symbol") in self.fail_oi_for:
                 self.calls.append((path, dict(params or {}), weight))
-                raise RasatError(ErrorCode.INVALID_REQUEST, "Binance 400 — geçersiz istek")
+                raise RasatError(ErrorCode.INVALID_REQUEST, "Binance 400 — invalid request")
             return await super().get(path, params, weight)
 
     fake = _FuturesRest(["BTCUSDT", "ETHUSDT"])
@@ -115,12 +115,12 @@ async def test_oi_poll_drops_symbol_after_400(cfg, db):
     _, poller = await _poller(cfg, db, fake)
 
     n = await poller.poll_open_interest()
-    assert n == 1  # ETHUSDT düştü, BTCUSDT yazıldı
+    assert n == 1  # ETHUSDT was removed, BTCUSDT was written.
 
     oi_calls = [c for c in fake.calls if c[0] == "/fapi/v1/openInterest"]
     assert [c[1]["symbol"] for c in oi_calls] == ["BTCUSDT", "ETHUSDT"]
 
-    # İkinci turda ETHUSDT tekrar denenmemeli (kümeden düşürüldü)
+    # Do not retry ETHUSDT on the second cycle (removed from the set).
     fake.fail_oi_for = set()
     n2 = await poller.poll_open_interest()
     assert n2 == 1

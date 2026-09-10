@@ -1,20 +1,20 @@
-"""2.6 — Alarm Motoru (pasif ama kalıcı kayıt defteri).
+"""2.6 — Alarm engine (passive but persistent registry).
 
 State machine: `armed → triggered → cooldown → armed`.
-- Tetikleme, PA analizi güncellendiğinde (`PAEngine.analyze` → `on_analysis_updated`)
-  event-driven çalışır.
-- Dedup: `triggered_alerts(alert_id, trigger_key)` UNIQUE — aynı bar/veri
-  penceresi (trigger_key) aynı alarmı tekrar tetiklemez.
-- Kalıcılık: tetiklenen kayıtlar `triggered_alerts` tablosunda kalıcıdır;
-  agent kapalıyken tetiklenenler `get_triggered_alerts` ile sonradan okunur.
-- Stale kuralı: stale veriye dayalı değerlendirmede tetiklenmez (eksik/stale
-  sembol için değerlendirme ertelenir, sessizce eski veriyle tetiklenmez).
+- Triggering is event-driven when PA analysis is updated (`PAEngine.analyze` →
+  `on_analysis_updated`).
+- Dedup: `triggered_alerts(alert_id, trigger_key)` UNIQUE — the same alert does
+  not trigger again for the same candle/data window (`trigger_key`).
+- Persistence: triggered records remain in `triggered_alerts`; records triggered
+  while the agent is offline can later be read with `get_triggered_alerts`.
+- Stale rule: do not trigger on stale data (defer evaluation for missing/stale
+  symbols; never silently trigger on old data).
 
-Koşullar, screener'daki allowlisted filtre AST'sini kullanır (aynı güvenli
-değerlendirme). 2.19: tetiklenmede harici bildirim komutu çalıştırılabilir
-(`notify_command`, örn. `traycer agent send` ile ajana uyandırma); alarm
-tanımı `order_spec` taşıyorsa tetiklenmede `pending_orders`'a onay bekleyen
-emir kaydı düşer — emir OTOMATİK açılmaz, onaylanınca açılır.
+Conditions use the screener's allowlisted filter AST (the same safe evaluation).
+2.19: triggering can run an external notification command (`notify_command`, for
+example `agent notify`); if an alert definition carries `order_spec`, triggering
+creates an approval-pending order record in `pending_orders` — the order is NOT
+opened automatically and is opened only after approval.
 """
 
 from __future__ import annotations
@@ -52,14 +52,14 @@ STATE_ARMED = "armed"
 STATE_TRIGGERED = "triggered"
 STATE_COOLDOWN = "cooldown"
 
-# Canonical pending state isimleri (T00 sözleşmesi — storage.state tek kaynak).
+# Canonical pending-state names (T00 contract — storage.state is the single source).
 PENDING_AWAITING = "awaiting_approval"
 
-# order_spec içinde izin verilen anahtarlar (allowlist — serbest parametre yok)
+# Allowed keys in order_spec (allowlist — no arbitrary parameters).
 ORDER_SPEC_KEYS = {"account_id", "symbol", "side", "entry", "stop_loss", "risk_pct", "order_type"}
 
-# notify şablonundaki {placeholder} belirteci — tek geçişte değiştirilir, böylece
-# değer içindeki başka placeholder benzeri metin ikinci kez ikame edilmez.
+# {placeholder} marker in the notify template — substitute in one pass so
+# placeholder-like text inside values is not substituted a second time.
 _PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
 
 
@@ -74,9 +74,9 @@ class AlarmService:
         self.db = db
         self.engine = engine
         self._notify_command = notify_command
-        # K3: depolanmış analiz yokken talep üzerine `analyze` (ve dolayısıyla
-        # warm-up/backfill yükü) başıboş artmasın — her değerlendirme turunda
-        # sınırlı sayıda on-demand hesaplamaya izin verilir, aşanlar ertelenir.
+        # K3: bound on-demand `analyze` (and therefore warm-up/backfill load) when
+        # no stored analysis exists; permit only a limited number per evaluation pass
+        # and defer the rest.
         if compute_budget is None:
             cfg = engine.config if engine is not None else None
             compute_budget = getattr(cfg, "alarm_compute_budget", 8) if cfg is not None else 8
@@ -84,7 +84,7 @@ class AlarmService:
         self._compute_used = 0
 
     def begin_evaluation_pass(self) -> None:
-        """Yeni değerlendirme turu başlangıcı: on-demand PA hesap bütçesi sıfırlanır (K3)."""
+        """Start a new evaluation pass: reset the on-demand PA computation budget (K3)."""
         self._compute_used = 0
 
     # ---------- CRUD ----------
@@ -99,11 +99,11 @@ class AlarmService:
         order_spec: dict | None = None,
     ) -> dict:
         if not isinstance(symbol, str) or not symbol:
-            raise RasatError(ErrorCode.INVALID_REQUEST, "symbol zorunlu (string)")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "symbol is required (string)")
         if not isinstance(timeframe, str) or not timeframe:
-            raise RasatError(ErrorCode.INVALID_REQUEST, "timeframe zorunlu (string)")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "timeframe is required (string)")
         if not isinstance(cooldown_seconds, int) or cooldown_seconds < 0:
-            raise RasatError(ErrorCode.INVALID_REQUEST, "cooldown_seconds >= 0 integer olmalı")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "cooldown_seconds must be a non-negative integer")
         root = validate_filters(condition)
         definition = {
             "type": "simple",
@@ -119,24 +119,24 @@ class AlarmService:
 
     @staticmethod
     def _validate_order_spec(spec: dict) -> dict:
-        """order_spec allowlist doğrulaması (2.19 + T02): yalnızca bilinen anahtarlar.
+        """Validate the order_spec allowlist (2.19 + T02): known keys only.
 
-        T02: risk_pct onay bekleyen emir için zorunludur (approve aşamasında
-        boyutlandırma bunu kullanır) ve finite olmalıdır; limit emir için entry
-        pozitif finite sayı olmalıdır — broker'a gitmeden önce INVALID_REQUEST.
+        T02: risk_pct is required for an approval-pending order (used for sizing
+        during approval) and must be finite; entry for a limit order must be a
+        positive finite number — INVALID_REQUEST before reaching the broker.
         """
         if not isinstance(spec, dict):
-            raise RasatError(ErrorCode.INVALID_REQUEST, "order_spec nesne olmalı")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "order_spec must be an object")
         for key in spec:
             if key not in ORDER_SPEC_KEYS:
-                raise RasatError(ErrorCode.INVALID_REQUEST, f"order_spec bilinmeyen anahtar: {key}")
+                raise RasatError(ErrorCode.INVALID_REQUEST, f"unknown order_spec key: {key}")
         for required in ("account_id", "symbol", "side"):
             if not spec.get(required):
-                raise RasatError(ErrorCode.INVALID_REQUEST, f"order_spec.{required} zorunlu")
+                raise RasatError(ErrorCode.INVALID_REQUEST, f"order_spec.{required} is required")
         if spec["side"] not in ("BUY", "SELL"):
-            raise RasatError(ErrorCode.INVALID_REQUEST, "order_spec.side BUY|SELL olmalı")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "order_spec.side must be BUY|SELL")
         if spec.get("order_type", "market") not in ("market", "limit"):
-            raise RasatError(ErrorCode.INVALID_REQUEST, "order_spec.order_type market|limit olmalı")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "order_spec.order_type must be market|limit")
         AlarmService._validate_execution_inputs(
             risk_pct=spec.get("risk_pct"),
             entry=spec.get("entry"),
@@ -147,32 +147,32 @@ class AlarmService:
 
     @staticmethod
     def _validate_execution_inputs(risk_pct: Any, entry: Any, stop_loss: Any = None, order_type: Any = None) -> None:
-        """Approve öncesi execution preflight (T02): risk_pct zorunlu + finite.
+        """Execution preflight before approval (T02): risk_pct required + finite.
 
-        Alarm oluşturma (`_validate_order_spec`) ve onay handler'ı bu tek
-        doğrulamayı kullanır. NaN/Infinity fail-open geçemez; eksik risk_pct
-        broker'a gitmeden INVALID_REQUEST döner.
+        Alert creation (`_validate_order_spec`) and the approval handler share this
+        validation. NaN/Infinity cannot pass fail-open; missing risk_pct returns
+        INVALID_REQUEST before reaching the broker.
         """
         if risk_pct is None or isinstance(risk_pct, bool):
-            raise RasatError(ErrorCode.INVALID_REQUEST, "order_spec.risk_pct zorunlu (onay sonrası boyutlandırma için)")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "order_spec.risk_pct is required (for post-approval sizing)")
         if not isinstance(risk_pct, (int, float)):
-            raise RasatError(ErrorCode.INVALID_REQUEST, "order_spec.risk_pct sayı olmalı")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "order_spec.risk_pct must be a number")
         risk = float(risk_pct)
         if not math.isfinite(risk) or not (0 < risk <= 1):
-            raise RasatError(ErrorCode.INVALID_REQUEST, "order_spec.risk_pct (0,1] aralığında ve finite olmalı")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "order_spec.risk_pct must be finite and in the (0,1] range")
         for name, value in (("entry", entry), ("stop_loss", stop_loss)):
             if value is None:
                 continue
             if isinstance(value, bool):
-                raise RasatError(ErrorCode.INVALID_REQUEST, f"order_spec.{name} sayı olmalı")
+                raise RasatError(ErrorCode.INVALID_REQUEST, f"order_spec.{name} must be a number")
             if not isinstance(value, (int, float)):
-                raise RasatError(ErrorCode.INVALID_REQUEST, f"order_spec.{name} sayı olmalı")
+                raise RasatError(ErrorCode.INVALID_REQUEST, f"order_spec.{name} must be a number")
             value_f = float(value)
             if not math.isfinite(value_f) or value_f <= 0:
-                raise RasatError(ErrorCode.INVALID_REQUEST, f"order_spec.{name} pozitif finite olmalı")
+                raise RasatError(ErrorCode.INVALID_REQUEST, f"order_spec.{name} must be positive and finite")
         if (order_type or "market").lower() == "limit":
             if entry is None:
-                raise RasatError(ErrorCode.INVALID_REQUEST, "limit emir için order_spec.entry zorunlu")
+                raise RasatError(ErrorCode.INVALID_REQUEST, "order_spec.entry is required for a limit order")
 
     async def create_composite_alert(
         self,
@@ -182,16 +182,16 @@ class AlarmService:
         note: str | None = None,
     ) -> dict:
         if not isinstance(clauses, list) or not clauses:
-            raise RasatError(ErrorCode.INVALID_REQUEST, "en az bir clause gerekli")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "at least one clause is required")
         if not isinstance(cooldown_seconds, int) or cooldown_seconds < 0:
-            raise RasatError(ErrorCode.INVALID_REQUEST, "cooldown_seconds >= 0 integer olmalı")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "cooldown_seconds must be a non-negative integer")
         combine = (combine or "AND").upper()
         if combine not in ("AND", "OR"):
-            raise RasatError(ErrorCode.INVALID_REQUEST, f"combine yalnızca AND|OR: {combine}")
+            raise RasatError(ErrorCode.INVALID_REQUEST, f"combine must be AND|OR: {combine}")
         norm_clauses = []
         for cl in clauses:
             if not isinstance(cl, dict) or not cl.get("symbol") or not cl.get("timeframe"):
-                raise RasatError(ErrorCode.INVALID_REQUEST, "her clause symbol+timeframe+filters taşımalı")
+                raise RasatError(ErrorCode.INVALID_REQUEST, "each clause must contain symbol+timeframe+filters")
             norm_clauses.append(
                 {
                     "symbol": cl["symbol"],
@@ -225,7 +225,7 @@ class AlarmService:
 
     async def delete_alert(self, alert_id: str) -> int:
         if not isinstance(alert_id, str) or not alert_id:
-            raise RasatError(ErrorCode.INVALID_REQUEST, "alert_id zorunlu (string)")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "alert_id is required (string)")
 
         def _w(conn) -> int:
             cur = conn.execute("DELETE FROM alerts WHERE alert_id=?", (alert_id,))
@@ -233,7 +233,7 @@ class AlarmService:
 
         removed = await self.db.write(_w)
         if removed == 0:
-            raise RasatError(ErrorCode.NOT_FOUND, f"alarm bulunamadı: {alert_id}")
+            raise RasatError(ErrorCode.NOT_FOUND, f"alert not found: {alert_id}")
         return removed
 
     async def list_alerts(self) -> list[dict]:
@@ -254,11 +254,11 @@ class AlarmService:
 
     @staticmethod
     def _lazy_state(state: str, cooldown_until: int | None, now: int) -> str:
-        """Görünür state: kalıcı `state` + `cooldown_until`'dan türetilir.
+        """Derive visible state from persistent `state` + `cooldown_until`.
 
-        - `cooldown_until` gelecekte → `cooldown` (kalıcı, restart sonrası korunur).
-        - `cooldown_until` geçmişte → `armed` (cooldown bitti).
-        - `triggered` + cooldown_until NULL (cooldown=0) → hemen yeniden kurulabilir → `armed`.
+        - `cooldown_until` in the future → `cooldown` (persistent, survives restart).
+        - `cooldown_until` in the past → `armed` (cooldown ended).
+        - `triggered` + cooldown_until NULL (cooldown=0) → immediately reusable → `armed`.
         """
         if cooldown_until is not None:
             if now < cooldown_until:
@@ -269,12 +269,12 @@ class AlarmService:
         return state
 
     async def _maybe_trigger(self, alert_id: str, trigger_key: str, payload: dict, cooldown_seconds: int) -> dict | None:
-        """Koşul eşleşti; dedup + state kontrolü yapıp kalıcı kayda geçer.
+        """Persist a matching condition after dedup and state checks.
 
-        2.19: tetiklenmede (a) `notify_command` harici komutu çalıştırılır
-        (ajan uyandırma / bildirim), (b) alarm tanımında `order_spec` varsa
-        `pending_orders`'a `awaiting_approval` kaydı düşer — emir otomatik
-        AÇILMAZ, `approve_pending_order` onayı bekler.
+        2.19: on trigger, (a) run the external `notify_command` (wake/notify the
+        agent), and (b) if the alert definition has `order_spec`, add an
+        `awaiting_approval` record to `pending_orders`; the order is NOT opened
+        automatically and waits for `approve_pending_order`.
         """
         now = int(time.time())
         definition: dict = {}
@@ -283,16 +283,16 @@ class AlarmService:
             nonlocal definition
             row = conn.execute("SELECT state, cooldown_until, definition FROM alerts WHERE alert_id=?", (alert_id,)).fetchone()
             if row is None:
-                raise RasatError(ErrorCode.NOT_FOUND, f"alarm bulunamadı: {alert_id}")
+                raise RasatError(ErrorCode.NOT_FOUND, f"alert not found: {alert_id}")
             definition = json.loads(row["definition"])
             state = self._lazy_state(row["state"], row["cooldown_until"], now)
             if state != STATE_ARMED:
-                return None  # cooldown'da → tetiklenmez
+                return None  # In cooldown → do not trigger.
             exists = conn.execute(
                 "SELECT 1 FROM triggered_alerts WHERE alert_id=? AND trigger_key=?", (alert_id, trigger_key)
             ).fetchone()
             if exists is not None:
-                return None  # aynı veri penceresi → dedup
+                return None  # Same data window → dedup.
             conn.execute(
                 "INSERT INTO triggered_alerts (alert_id, trigger_key, payload, triggered_at) VALUES (?,?,?,?)",
                 (alert_id, trigger_key, json.dumps(payload, ensure_ascii=False), now),
@@ -327,18 +327,18 @@ class AlarmService:
         return res
 
     def _notify(self, definition: dict, payload: dict, alert_id: str | None = None) -> None:
-        """Harici bildirim komutu (2.19; T02 güvenli argv): fire-and-forget.
+        """External notification command (2.19; T02 safe argv): fire-and-forget.
 
-        Komut şablonu `shlex.split` ile güvenli argv listesine parse edilir ve
-        `shell=False` ile çalıştırılır — pipe, redirection ve shell expansion
-        desteklenmez (yorumlanmaz, literal argv elemanı olur). {alert_id},
-        {symbol}, {timeframe}, {note}, {price} yer tutucuları token bazında
-        tek geçişte doldurulur; değerler shell kodu değil sıradan argv
-        elemanıdır (`note` içindeki `; whoami` process başlatmaz).
+        Parse the command template into a safe argv list with `shlex.split` and
+        run with `shell=False`; pipes, redirections, and shell expansion are not
+        supported (they remain literal argv elements). Substitute the {alert_id},
+        {symbol}, {timeframe}, {note}, and {price} placeholders per token in one
+        pass; values are ordinary argv elements, not shell code (`; whoami` inside
+        `note` does not start a process).
 
-        Parse hatasında notify fail-closed kalır: hiçbir process başlamaz,
-        alarm state'i bozulmaz, yalnızca log üretilir. Komutun tamamı
-        loglanmaz (note/hassas içerik sızmaz).
+        On parse failure, notification stays fail closed: start no process, do not
+        change alert state, and only log. Do not log the full command (no note/sensitive
+        content leakage).
         """
         command = self._notify_command
         if not command:
@@ -353,7 +353,7 @@ class AlarmService:
         try:
             template = shlex.split(command)
         except ValueError as exc:
-            logger.warning("alarm bildirimi şablonu parse edilemedi (notify atlandı): %s", exc)
+            logger.warning("could not parse alert notification template (notification skipped): %s", exc)
             return
         argv = [_PLACEHOLDER_RE.sub(lambda m: fmt.get(m.group(1), m.group(0)), arg) for arg in template]
         try:
@@ -368,14 +368,14 @@ class AlarmService:
                 stderr=subprocess.DEVNULL,
                 creationflags=flags,
             )
-            logger.info("alarm bildirimi gönderildi: %s", payload.get("alert_id"))
+            logger.info("alert notification sent: %s", payload.get("alert_id"))
         except Exception as exc:  # noqa: BLE001
-            logger.warning("alarm bildirimi başarısız: %s", exc)
+            logger.warning("alert notification failed: %s", exc)
 
-    # ---------- değerlendirme ----------
+    # ---------- evaluation ----------
 
     async def _clause_context(self, symbol: str, timeframe: str) -> dict | None:
-        """Bir sembolün güncel analizini (depolanmış/istenirse hesaplanmış) context yapar."""
+        """Build current analysis context for a symbol (stored or computed on demand)."""
         candles = await self.engine._read_candles(symbol, timeframe, 300)
         if not candles:
             return None
@@ -387,7 +387,7 @@ class AlarmService:
         ob = await _read_current(self.db, "order_blocks", symbol, timeframe)
         if ms is None or lz is None or ob is None:
             if self._compute_used >= self._compute_budget:
-                return None  # K3: on-demand PA bütçesi doldu → bu turda ertelenir
+                return None  # K3: on-demand PA budget exhausted → defer this pass.
             self._compute_used += 1
             await self.engine.analyze(symbol, timeframe)
             ms = await _read_current(self.db, "market_structure", symbol, timeframe)
@@ -397,7 +397,7 @@ class AlarmService:
             return None
         as_of = ms["effective_from"]
         if self.engine.freshness(timeframe, as_of) != FRESHNESS_FRESH:
-            return None  # stale → değerlendirme ertelenir (tetiklenmez)
+            return None  # Stale → defer evaluation (do not trigger).
         from .vwap_sessions import compute_vwap
 
         ctx: dict[str, Any] = {
@@ -422,14 +422,14 @@ class AlarmService:
         return series[-1] if series else None
 
     async def on_analysis_updated(self, symbol: str, timeframe: str, analysis: dict) -> list[dict]:
-        """PA analizi güncellendi → ilgili basit + kompozit alarmları değerlendir.
+        """Evaluate related simple and composite alerts after PA analysis updates.
 
-        Freshness kapısı (2.8): analiz snapshot'ı stale ise fail-closed — tetiklenmez.
-        Context kapanmış mumlardan kurulur; oluşmakta olan bar dahil edilmez.
+        Freshness gate (2.8): fail closed and do not trigger when the analysis
+        snapshot is stale. Build context from closed candles; exclude the forming bar.
         """
         as_of = analysis.get("as_of")
         if self.engine.freshness(timeframe, as_of) != FRESHNESS_FRESH:
-            return []  # stale analiz → tetikleme yok
+            return []  # Stale analysis → no trigger.
         triggers: list[dict] = []
         candles = await self.engine._read_candles(symbol, timeframe, 300)
         candles = filter_closed_candles(candles, timeframe)
@@ -444,7 +444,7 @@ class AlarmService:
         for alert in alerts:
             definition = json.loads(alert["definition"])
             if definition.get("type") != "simple":
-                continue  # kompozitler aşağıda ayrıca değerlendirilir
+                continue  # Composite alerts are evaluated below.
             state = self._lazy_state(alert["state"], alert.get("cooldown_until"), int(time.time()))
             if state != STATE_ARMED:
                 continue
@@ -462,10 +462,10 @@ class AlarmService:
         return triggers
 
     async def evaluate_symbol(self, symbol: str, timeframe: str) -> list[dict]:
-        """Talep üzerine değerlendirme: depolanmış analizden (daemon arka plan döngüsü için).
+        """On-demand evaluation from stored analysis (for the daemon background loop).
 
-        PA kaydı yoksa `_clause_context` analizi hesaplatır — alarm döngüsü,
-        agent tool çağırmadan güncel kayıtlara dayanır (boş dönmez).
+        If no PA record exists, `_clause_context` computes the analysis so the
+        alarm loop relies on current records without an agent tool call (not empty).
         """
         alerts = await self._alerts_by_symbol(symbol, timeframe)
         triggers: list[dict] = []
@@ -511,7 +511,7 @@ class AlarmService:
         for clause in definition["clauses"]:
             ctx = await self._clause_context(clause["symbol"], clause["timeframe"])
             if ctx is None:
-                return None  # herhangi bir clause'ta veri eksik/stale → ertelenir
+                return None  # defer when any clause has missing or stale data
             contexts.append((clause, ctx))
         if definition["combine"] == "AND":
             matched = all(_eval_node(c["condition"], ctx) for c, ctx in contexts)
@@ -527,7 +527,7 @@ class AlarmService:
             definition["cooldown_seconds"],
         )
 
-    # ---------- sorgu yardımcıları ----------
+    # ---------- query helpers ----------
 
     @staticmethod
     def _ctx_from_analysis(analysis: dict, candles: list[dict] | None = None) -> dict:
@@ -570,7 +570,7 @@ class AlarmService:
         return await self.db.read(_q)
 
     async def alert_symbols(self) -> list[tuple[str, str]]:
-        """Tüm alarmların (simple + kompozit clause) ihtiyaç duyduğu (symbol, timeframe) çiftleri."""
+        """Return the (symbol, timeframe) pairs needed by all alerts (simple + composite clauses)."""
         def _q(conn):
             rows = conn.execute("SELECT definition FROM alerts").fetchall()
             pairs: set[tuple[str, str]] = set()
@@ -587,7 +587,7 @@ class AlarmService:
 
     async def get_triggered_alerts(self, alert_id: str | None = None, limit: int = 50, cursor: int | None = None) -> dict:
         if not 1 <= limit <= 500:
-            raise RasatError(ErrorCode.INVALID_REQUEST, f"limit 1-500 arası olmalı (verildi: {limit})")
+            raise RasatError(ErrorCode.INVALID_REQUEST, f"limit must be between 1 and 500 (given: {limit})")
 
         def _q(conn):
             sql = "SELECT alert_id, trigger_key, payload, triggered_at FROM triggered_alerts"
@@ -616,12 +616,12 @@ class AlarmService:
             "next_cursor": (cursor or 0) + len(rows) if has_more else None,
         }
 
-    # ---------- onay bekleyen emirler (2.19) ----------
+    # ---------- approval-pending orders (2.19) ----------
 
     async def get_pending_orders(self, status: str | None = None, limit: int = 50) -> dict:
-        """Onay bekleyen / geçmiş bekleyen emir kayıtlarını listeler."""
+        """List approval-pending and historical pending-order records."""
         if not 1 <= limit <= 500:
-            raise RasatError(ErrorCode.INVALID_REQUEST, f"limit 1-500 arası olmalı (verildi: {limit})")
+            raise RasatError(ErrorCode.INVALID_REQUEST, f"limit must be between 1 and 500 (given: {limit})")
         valid_statuses = (
             PENDING_AWAITING,
             PENDING_APPROVED,
@@ -632,7 +632,7 @@ class AlarmService:
             PENDING_EXPIRED,
         )
         if status is not None and status not in valid_statuses:
-            raise RasatError(ErrorCode.INVALID_REQUEST, f"bilinmeyen status: {status}")
+            raise RasatError(ErrorCode.INVALID_REQUEST, f"unknown status: {status}")
 
         def _q(conn):
             sql = "SELECT * FROM pending_orders"
@@ -677,14 +677,14 @@ class AlarmService:
 
         rec = await self.db.read(_q)
         if rec is None:
-            raise RasatError(ErrorCode.NOT_FOUND, f"bekleyen emir bulunamadı: {order_id}")
+            raise RasatError(ErrorCode.NOT_FOUND, f"pending order not found: {order_id}")
         return rec
 
     async def _fill_pending_entry(self, order_id: str, entry: float) -> None:
-        """Market emir onayında eksik entry'yi güncel piyasa fiyatıyla doldurur (T3).
+        """Fill a missing market-order entry with the current market price on approval (T3).
 
-        Storage tarafında entry zorunlu; onaylanan kayıtta eksikse kalıcı rejected
-        üretiliyordu. Fiyat kalıcı kayda işlenir ki yeniden onay/audit tutarlı olsun.
+        Storage requires entry; a missing value in an approved record used to create
+        a permanent rejection. Persist the price so re-approval/audit remains consistent.
         """
 
         def _w(conn):
@@ -693,7 +693,7 @@ class AlarmService:
         await self.db.write(_w)
 
     async def approve_pending_order(self, order_id: str) -> dict:
-        """Onay: `awaiting_approval → approved`. Emir açma handler'da yapılır."""
+        """Approve: `awaiting_approval → approved`. The handler opens the order."""
         now = int(time.time())
 
         def _w(conn):
@@ -704,14 +704,14 @@ class AlarmService:
             if cur.rowcount == 0:
                 row = conn.execute("SELECT status FROM pending_orders WHERE order_id=?", (order_id,)).fetchone()
                 if row is None:
-                    raise RasatError(ErrorCode.NOT_FOUND, f"bekleyen emir bulunamadı: {order_id}")
-                raise RasatError(ErrorCode.INVALID_REQUEST, f"onaylanabilir durumda değil: {row['status']}")
+                    raise RasatError(ErrorCode.NOT_FOUND, f"pending order not found: {order_id}")
+                raise RasatError(ErrorCode.INVALID_REQUEST, f"not approvable in current state: {row['status']}")
             return {"order_id": order_id, "status": PENDING_APPROVED}
 
         return await self.db.write(_w)
 
     async def reject_pending_order(self, order_id: str, reason: str | None = None) -> dict:
-        """Red: `awaiting_approval → rejected` (emir açılmaz)."""
+        """Reject: `awaiting_approval → rejected` (the order is not opened)."""
         now = int(time.time())
 
         def _w(conn):
@@ -722,19 +722,18 @@ class AlarmService:
             if cur.rowcount == 0:
                 row = conn.execute("SELECT status FROM pending_orders WHERE order_id=?", (order_id,)).fetchone()
                 if row is None:
-                    raise RasatError(ErrorCode.NOT_FOUND, f"bekleyen emir bulunamadı: {order_id}")
-                raise RasatError(ErrorCode.INVALID_REQUEST, f"reddedilebilir durumda değil: {row['status']}")
+                    raise RasatError(ErrorCode.NOT_FOUND, f"pending order not found: {order_id}")
+                raise RasatError(ErrorCode.INVALID_REQUEST, f"not rejectable in current state: {row['status']}")
             return {"order_id": order_id, "status": PENDING_REJECTED}
 
         return await self.db.write(_w)
 
     async def approve_and_claim_pending_execution(self, order_id: str) -> dict:
-        """Onay + execution claim (T00 CAS): `awaiting_approval → approved → executing`.
+        """Approval + execution claim (T00 CAS): `awaiting_approval → approved → executing`.
 
-        İki CAS geçişi tek transaction'da yapılır; iki eşzamanlı `approve`
-        çağrısından yalnızca biri execution claim alabilir (ikincisi
-        INVALID_REQUEST). Transaction yarım kalmadan commit edilir — onay sonrası
-        `approved`'da kilitlenme penceresi yoktur.
+        Perform both CAS transitions in one transaction; only one of two concurrent
+        `approve` calls can claim execution (the other gets INVALID_REQUEST). Commit
+        the transaction atomically; there is no post-approval window stuck in `approved`.
         """
         now = int(time.time())
 
@@ -746,8 +745,8 @@ class AlarmService:
             if cur.rowcount == 0:
                 row = conn.execute("SELECT status FROM pending_orders WHERE order_id=?", (order_id,)).fetchone()
                 if row is None:
-                    raise RasatError(ErrorCode.NOT_FOUND, f"bekleyen emir bulunamadı: {order_id}")
-                raise RasatError(ErrorCode.INVALID_REQUEST, f"onaylanabilir durumda değil: {row['status']}")
+                    raise RasatError(ErrorCode.NOT_FOUND, f"pending order not found: {order_id}")
+                raise RasatError(ErrorCode.INVALID_REQUEST, f"not approvable in current state: {row['status']}")
             cur2 = conn.execute(
                 "UPDATE pending_orders SET status=?, execution_started_at=?, last_attempt_at=?, "
                 "execution_error_code=NULL, execution_error_message=NULL "
@@ -755,16 +754,16 @@ class AlarmService:
                 (PENDING_EXECUTING, now, now, order_id, PENDING_APPROVED),
             )
             if cur2.rowcount == 0:
-                raise RasatError(ErrorCode.INTERNAL_ERROR, "execution claim alınamadı")
+                raise RasatError(ErrorCode.INTERNAL_ERROR, "could not claim execution")
             return {"order_id": order_id, "status": PENDING_EXECUTING}
 
         return await self.db.write(_w)
 
     async def complete_pending_execution(self, order_id: str, executed_order_id: str | None) -> dict:
-        """Terminal başarı (CAS): `executing → executed`.
+        """Terminal success (CAS): `executing → executed`.
 
-        `executed_order_id` yalnızca kesin gerçek emir kimliği için doldurulur
-        (real → exchange_order_id, paper → yerel emir kaydı).
+        Populate `executed_order_id` only with a definite real order ID
+        (real → exchange_order_id, paper → local order record).
         """
         now = int(time.time())
 
@@ -777,8 +776,8 @@ class AlarmService:
             if cur.rowcount == 0:
                 row = conn.execute("SELECT status FROM pending_orders WHERE order_id=?", (order_id,)).fetchone()
                 if row is None:
-                    raise RasatError(ErrorCode.NOT_FOUND, f"bekleyen emir bulunamadı: {order_id}")
-                raise RasatError(ErrorCode.INVALID_REQUEST, f"executed'a geçilebilir durumda değil: {row['status']}")
+                    raise RasatError(ErrorCode.NOT_FOUND, f"pending order not found: {order_id}")
+                raise RasatError(ErrorCode.INVALID_REQUEST, f"cannot transition to executed from current state: {row['status']}")
             return {"order_id": order_id, "status": PENDING_EXECUTED, "executed_order_id": executed_order_id}
 
         return await self.db.write(_w)
@@ -786,13 +785,13 @@ class AlarmService:
     async def fail_pending_execution(
         self, order_id: str, *, status: str, error_code: str, error_message: str
     ) -> dict:
-        """Terminal/hata (CAS): `executing → rejected | reconcile_required`.
+        """Terminal/error (CAS): `executing → rejected | reconcile_required`.
 
-        Exception/timeout sonrası kayıt `approved` kilidinde kalmaz; doğru
-        terminal veya reconcile durumu + execution hata kodu/mesajı yazılır.
+        After an exception/timeout, do not leave the record locked in `approved`;
+        write the correct terminal or reconcile state plus execution error code/message.
         """
         if status not in (PENDING_REJECTED, PENDING_RECONCILE_REQUIRED):
-            raise RasatError(ErrorCode.INVALID_REQUEST, f"geçersiz failure status: {status}")
+            raise RasatError(ErrorCode.INVALID_REQUEST, f"invalid failure status: {status}")
         now = int(time.time())
 
         def _w(conn):
@@ -804,27 +803,27 @@ class AlarmService:
             if cur.rowcount == 0:
                 row = conn.execute("SELECT status FROM pending_orders WHERE order_id=?", (order_id,)).fetchone()
                 if row is None:
-                    raise RasatError(ErrorCode.NOT_FOUND, f"bekleyen emir bulunamadı: {order_id}")
-                raise RasatError(ErrorCode.INVALID_REQUEST, f"{status} durumuna geçilemez (durum: {row['status']})")
+                    raise RasatError(ErrorCode.NOT_FOUND, f"pending order not found: {order_id}")
+                raise RasatError(ErrorCode.INVALID_REQUEST, f"cannot transition to {status} (current state: {row['status']})")
             return {"order_id": order_id, "status": status, "execution_error_code": error_code}
 
         return await self.db.write(_w)
 
     async def reconcile_pending_executions(self, stale_after_seconds: int = 300) -> dict:
-        """Daemon restart sonrası `executing`'de kalan onaylı emirleri kurtarır (T3).
+        """Recover approved orders left in `executing` after a daemon restart (T3).
 
-        Crash anında `executing`'e claim edilmiş ama emir sonucu işlenmeden daemon
-        düşmüş olabilir. Her kayıt için `orders` tablosunda
-        `idempotency_key = 'pending:' || order_id` eşleşmesi aranır:
+        A crash may occur after claiming `executing` but before processing the order
+        result. For each record, look for `idempotency_key = 'pending:' || order_id`
+        in the `orders` table:
 
-        - eşleşen emir kaydı varsa durumuna göre terminal/reconcile duruma çekilir:
+        - If a matching order record exists, transition by status:
           FILLED/paper → `complete_pending_execution`, REJECTED/CANCELED/EXPIRED →
-          `fail_pending_execution(rejected)`, diğerleri (NEW/PARTIALLY_FILLED/UNKNOWN)
+          `fail_pending_execution(rejected)`, others (NEW/PARTIALLY_FILLED/UNKNOWN)
           → `fail_pending_execution(reconcile_required)`.
-        - eşleşme yoksa ve `execution_started_at` eşikten eskiyse fail-closed
-          `reconcile_required`'a geçilir (emir borsada olabilir; körlemesine
-          yeniden gönderim yapılmaz). Taze kayıtlar dokunulmadan bırakılır — daemon
-          onları hâlâ işliyor olabilir (sonraki açılışta yeniden değerlendirilir).
+        - If no match exists and `execution_started_at` is older than the threshold,
+          transition fail closed to `reconcile_required` (the order may exist on the
+          exchange; do not blindly resubmit). Leave fresh records untouched; the
+          daemon may still be processing them (re-evaluate at the next startup).
         """
         now = int(time.time())
 
@@ -865,7 +864,7 @@ class AlarmService:
                         order_id,
                         status=PENDING_REJECTED,
                         error_code=ErrorCode.ORDER_REJECTED,
-                        error_message=f"restart reconcile: emir kesin sonlandı ({exec_status})",
+                        error_message=f"restart reconciliation: order definitively ended ({exec_status})",
                     )
                     failed += 1
                     details.append({"order_id": order_id, "action": "rejected", "status": exec_status})
@@ -875,7 +874,7 @@ class AlarmService:
                         order_id,
                         status=PENDING_RECONCILE_REQUIRED,
                         error_code=ErrorCode.ORDER_UNKNOWN,
-                        error_message="restart reconcile: emir durumu kesin değil",
+                        error_message="restart reconciliation: order status is not definitive",
                     )
                     failed += 1
                     details.append({"order_id": order_id, "action": "reconcile_required", "status": exec_status})
@@ -887,7 +886,7 @@ class AlarmService:
                     order_id,
                     status=PENDING_RECONCILE_REQUIRED,
                     error_code=ErrorCode.ORDER_UNKNOWN,
-                    error_message="restart reconcile: emir kaydı bulunamadı; fail-closed reconcile",
+                    error_message="restart reconciliation: order record not found; fail-closed reconciliation",
                 )
                 failed += 1
                 details.append({"order_id": order_id, "action": "reconcile_required_no_order"})

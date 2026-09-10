@@ -1,10 +1,10 @@
-"""2.4 — PA analiz orkestrasyonu + immutable kayıt yönetimi.
+"""2.4 — PA analysis orchestration and immutable-record management.
 
-`PAEngine` mumları okur, tüm PA zincirini (swing→likidite→OB/FVG + VWAP +
-session) hesaplar ve sonuçları `market_structure`/`liquidity_zones`/
-`order_blocks` tablolarına immutable desenle yazar: üzerine yazma yok —
-yeni sonuç eski açık kaydı `effective_to` ile kapatır, geçmiş korunur.
-`include_mitigated=true` geçmişi bu depolanmış tarihçeden üretir (uydurma değil).
+`PAEngine` reads candles, computes the full PA chain (swing→liquidity→OB/FVG +
+VWAP + session), and writes results to the `market_structure`/`liquidity_zones`/
+`order_blocks` tables with an immutable pattern: never overwrite; a new result
+closes the old open record with `effective_to` and preserves history.
+`include_mitigated=true` builds history from these stored records, not invented data.
 """
 
 from __future__ import annotations
@@ -27,10 +27,10 @@ logger = logging.getLogger("rasattrading.pa.analysis")
 
 MAX_VWAP_POINTS = 20
 
-# PA analizinde kullanılan varsayılan kapanmış mum penceresi. Screener
-# (`_build_context`) da aynı pencereyi kullanır; aksi halde yapı/sweep event
-# indeksleri (bu pencereye göre) screener context'inin mum sayısıyla hizasız
-# kalır ve gerçek son olaylar `since_bars` filtreleriyle kaçırılır (2.16 fix).
+# Default closed-candle window used by PA analysis. The screener (`_build_context`)
+# uses the same window; otherwise structure/sweep event indexes (relative to this
+# window) would be misaligned with the screener context candle count and recent
+# events could be missed by `since_bars` filters (2.16 fix).
 PA_LOOKBACK = 200
 
 IMMUTABLE_TABLES = ("market_structure", "liquidity_zones", "order_blocks")
@@ -45,16 +45,16 @@ async def _store_payload(
     effective_from: int,
     payload: dict,
 ) -> None:
-    """Immutable kayıt: üzerine yazma yok, geçmiş korunur (2.9 fix).
+    """Immutable record: never overwrite; preserve history (2.9 fix).
 
-    - Aynı (symbol, timeframe, effective_from) + aynı sürüm + aynı payload →
-      idempotent no-op; mevcut kayıt dokunulmaz.
-    - Aynı effective_from + farklı sürüm/payload → mevcut revision kapanır
-      (effective_to = effective_from, nokta aralık), yeni açık revision eklenir.
-      Her iki kayıt da tarihçede sorgulanabilir kalır.
-    - İleri (yeni bar): açık kayıt `effective_from - 1` ile kapanır, yeni açık eklenir.
-    - Geriye (backfill / geriye dönük as-of): açık kayıt KAPATILMAZ; tarihsel kapalı
-      kayıt eklenir — ters aralık (örn. 300..199) üretilmez.
+    - Same (symbol, timeframe, effective_from) + same version + same payload →
+      idempotent no-op; leave the existing record untouched.
+    - Same effective_from + different version/payload → close the existing revision
+      (effective_to = effective_from, point interval) and add a new open revision.
+      Both records remain queryable in history.
+    - Forward (new bar): close the open record at `effective_from - 1` and add a new open record.
+    - Backward (backfill / historical as-of): do not close the open record; add a
+      historical closed record, avoiding an inverted interval (e.g. 300..199).
     """
     payload_json = json.dumps(payload, ensure_ascii=False)
 
@@ -67,7 +67,7 @@ async def _store_payload(
         ).fetchone()
         if same_bar is not None:
             if same_bar["algo_version"] == algo_version and same_bar["payload"] == payload_json:
-                return  # idempotent — sessiz üzerine yazma yok
+                return  # Idempotent — never overwrite silently.
             if same_bar["effective_to"] is None:
                 conn.execute(f"UPDATE {table} SET effective_to=? WHERE id=?", (effective_from, same_bar["id"]))
                 conn.execute(
@@ -104,7 +104,7 @@ async def _store_payload(
                 (symbol, timeframe, algo_version, effective_from, payload_json, now),
             )
             return
-        # Geriye (backfill): açık kaydı kapatmadan tarihsel kapalı kayıt ekle.
+        # Backward (backfill): add a historical closed record without closing the open record.
         next_gt = conn.execute(
             f"SELECT MIN(effective_from) AS m FROM {table} WHERE symbol=? AND timeframe=? AND effective_from > ?",
             (symbol, timeframe, effective_from),
@@ -149,15 +149,15 @@ class PAEngine:
         self.db = db
         self.pipeline = pipeline
         self.config = config
-        self.alarm_service = None  # 2.6'da bağlanır (event-driven değerlendirme)
+        self.alarm_service = None  # Connected in 2.6 (event-driven evaluation).
 
     def _now(self) -> float:
-        """PA katmanının ortak `now` kaynağı (T2).
+        """Shared `now` source for the PA layer (T2).
 
-        Veri katmanı (`data/klines.py`) kapanış/freshness kararlarını Binance
-        server clock (`pipeline.clock.server_now()`) ile yapar. Host saati
-        kayarsa PA kararları da kaymasın diye buradan aynı server clock
-        kullanılır; pipeline/clock yoksa yerel saate düşülür.
+        The data layer (`data/klines.py`) makes close/freshness decisions with the
+        Binance server clock (`pipeline.clock.server_now()`). Use the same server
+        clock here so PA decisions do not drift with the host clock; fall back to
+        local time when pipeline/clock is unavailable.
         """
         clock = getattr(self.pipeline, "clock", None) if self.pipeline is not None else None
         if clock is not None:
@@ -166,7 +166,7 @@ class PAEngine:
                 return server_now
         return time.time()
 
-    # ---------- mum okuma ----------
+    # ---------- candle reading ----------
 
     async def _read_candles(self, symbol: str, timeframe: str, lookback: int, source: str = "spot") -> list[dict]:
         def _q(conn):
@@ -182,7 +182,7 @@ class PAEngine:
     async def _load_candles(self, symbol: str, timeframe: str, lookback: int) -> list[dict]:
         rows = await self._read_candles(symbol, timeframe, lookback)
         if not rows and self.pipeline is not None:
-            # Soğuk sembol → pipeline warm-up yapar (universe doğrulaması da burada)
+            # Cold symbol → pipeline performs warm-up (and universe validation here).
             await self.pipeline.get_candles(symbol, timeframe, limit=lookback)
             rows = await self._read_candles(symbol, timeframe, lookback)
         return rows
@@ -191,13 +191,13 @@ class PAEngine:
 
     async def analyze(self, symbol: str, timeframe: str, lookback: int = PA_LOOKBACK) -> dict[str, Any]:
         if timeframe not in TIMEFRAME_SECONDS:
-            raise RasatError(ErrorCode.INVALID_REQUEST, f"geçersiz timeframe: {timeframe}")
+            raise RasatError(ErrorCode.INVALID_REQUEST, f"invalid timeframe: {timeframe}")
         candles = await self._load_candles(symbol, timeframe, lookback)
         if not candles:
-            raise RasatError(ErrorCode.STALE_DATA, f"{symbol} {timeframe} için mum verisi yok")
+            raise RasatError(ErrorCode.STALE_DATA, f"no candle data for {symbol} {timeframe}")
         candles = filter_closed_candles(candles, timeframe, now=self._now())
         if len(candles) < 2 * SWING_LOOKBACK + 1:
-            raise RasatError(ErrorCode.STALE_DATA, f"{symbol} {timeframe} için yeterli kapanmış mum yok")
+            raise RasatError(ErrorCode.STALE_DATA, f"not enough closed candles for {symbol} {timeframe}")
 
         structure = detect_structure(candles)
         futures = await load_futures_context(self.db, symbol)
@@ -225,7 +225,7 @@ class PAEngine:
             await self.alarm_service.on_analysis_updated(symbol, timeframe, result)
         return result
 
-    # ---------- sorgular ----------
+    # ---------- queries ----------
 
     async def get_market_structure(self, symbol: str, timeframe: str, lookback: int = PA_LOOKBACK) -> dict[str, Any]:
         result = await self.analyze(symbol, timeframe, lookback)
@@ -320,12 +320,12 @@ class PAEngine:
             "sessions": result["sessions"],
         }
 
-    # ---------- tarihçe birleştirme ----------
+    # ---------- history merging ----------
 
     async def _merged_zones(
         self, table: str, symbol: str, timeframe: str, zone_key: str, list_key: str | None = None
     ) -> list[dict]:
-        """Depolanan tüm kayıtlardan bölgeleri zone_key'e göre birleştirir (en yeni durum kazanır)."""
+        """Merge zones from all stored records by zone_key (the newest state wins)."""
         history = await _read_history(self.db, table, symbol, timeframe)
         order: list[str] = []
         seen: dict[str, dict] = {}
@@ -345,17 +345,17 @@ class PAEngine:
 
     @staticmethod
     def freshness_for(timeframe: str, as_of: int | None, now: float | None = None) -> str:
-        """PA snapshot'ının tazelik etiketi (2.15 fix — semantik netleşti).
+        """Freshness label for a PA snapshot (2.15 fix — semantics clarified).
 
-        `fresh`, analizin timeframe'in **son kapanmış mumunu** içerdiği anlamına
-        gelir: `as_of` (analizdeki son kapanmış mumun `open_time`'ı), wall-clock'ta
-        son kapanmış mumun `open_time`'ından (`latest_closed`) küçük değilse.
-        Gerçek zaman (ticker) ile aynı anlık snapshot değildir — bar bazlı analiz
-        doğası gereği en fazla bir period geride kalır. Bir period'tan daha eskiye
-        dayanan analiz (son kapanmış mum eksikken) `stale` olur.
+        `fresh` means the analysis includes the timeframe's **last closed candle**:
+        `as_of` (the `open_time` of the analysis's last closed candle) is not less
+        than the last closed candle's `open_time` (`latest_closed`) on the wall clock.
+        This is not an instantaneous real-time snapshot like a ticker; bar-based
+        analysis is naturally at most one period behind. Analysis based on an older
+        period (with the last closed candle missing) is `stale`.
 
-        `now` verilmezse yerel saat kullanılır; veri katmanıyla tutarlılık için
-        örnek üzerinden `PAEngine.freshness()` (server clock, T2) tercih edilir.
+        If `now` is omitted, use local time; for consistency with the data layer,
+        prefer `PAEngine.freshness()` through the instance (server clock, T2).
         """
         if as_of is None:
             return FRESHNESS_STALE
@@ -366,5 +366,5 @@ class PAEngine:
         return FRESHNESS_FRESH if as_of >= latest_closed else FRESHNESS_STALE
 
     def freshness(self, timeframe: str, as_of: int | None) -> str:
-        """Örnek clock'una bağlı freshness: pipeline server clock'u, yoksa yerel saat (T2)."""
+        """Instance-clock freshness: pipeline server clock, or local time (T2)."""
         return self.freshness_for(timeframe, as_of, now=self._now())

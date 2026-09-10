@@ -1,10 +1,10 @@
-"""T02 — Pending approval state machine (CAS, T00 sözleşmesi) + approve preflight.
+"""T02 — Pending approval state machine (CAS, T00 contract) + approve preflight.
 
-- `approve_pending_order_handler` structured REJECTED/UNKNOWN sonucunu `executed`
-  yapmaz; exception sonrası kayıt `approved` kilidinde kalmaz.
-- Aynı pending order için iki eşzamanlı approve yalnızca tek execution claim üretir.
-- `executed_order_id` yalnızca kesin emir kimliğiyle doldurulur.
-- Missing/NaN risk_pct broker'dan ÖNCE INVALID_REQUEST döner.
+- `approve_pending_order_handler` does not treat a structured REJECTED/UNKNOWN result as `executed`
+  it does not execute; after an exception, the record does not remain locked in `approved`.
+- Two concurrent approvals for the same pending order produce only one execution claim.
+- `executed_order_id` is filled only with a confirmed order identity.
+- Missing/NaN risk_pct returns INVALID_REQUEST BEFORE the broker.
 """
 
 import asyncio
@@ -116,7 +116,7 @@ async def _insert_pending(
 
 
 async def _insert_executing_pending(db, *, account_id, execution_started_at=None, **overrides):
-    """Daemon çökmesi sonrası `executing`'de kalmış onaylı emir simülasyonu."""
+    """Simulate an approved order left in `executing` after a daemon crash."""
     oid = uuid.uuid4().hex
     now = int(time.time())
     started = execution_started_at if execution_started_at is not None else now
@@ -139,7 +139,7 @@ async def _insert_executing_pending(db, *, account_id, execution_started_at=None
 
 
 def _insert_order_for_pending(db, account_id, pending_order_id, *, status="FILLED", exchange_order_id="EX-REC"):
-    """orders tablosunda idempotency_key = 'pending:'||order_id eşleşmesi kurar."""
+    """Create the orders-table match idempotency_key = 'pending:'||order_id."""
 
     def _w(conn):
         now = int(time.time())
@@ -181,7 +181,7 @@ async def test_approve_success_marks_executed_with_order_id(t02_ctx):
     rec = await _pending_status(ctx["db"], oid)
     assert rec["status"] == "executed"
     assert rec["executed_order_id"] == data["executed_order_id"]
-    assert rec["executed_order_id"], "kesin başarıda executed_order_id dolu olmalı"
+    assert rec["executed_order_id"], "executed_order_id must be set on confirmed success"
     assert rec["execution_error_code"] is None
     assert len(await _order_rows(ctx["db"])) == 1
 
@@ -206,7 +206,7 @@ async def test_approve_structured_rejected_not_executed(t02_ctx):
 async def test_approve_structured_unknown_reconcile(t02_ctx):
     ctx = t02_ctx
     account_id = await _add_real_account(ctx)
-    ctx["broker"].place_errors_by_account[account_id] = RuntimeError("ağ hatası")
+    ctx["broker"].place_errors_by_account[account_id] = RuntimeError("network error")
     oid = await _insert_pending(ctx["db"], account_id=account_id)
 
     with pytest.raises(RasatError) as exc_info:
@@ -222,7 +222,7 @@ async def test_approve_structured_unknown_reconcile(t02_ctx):
 
 async def test_approve_exception_after_claim_not_stuck_in_approved(t02_ctx):
     ctx = t02_ctx
-    # Var olmayan hesap → execute_on_accounts exception (ACCOUNT_NOT_FOUND).
+    # Missing account → execute_on_accounts exception (ACCOUNT_NOT_FOUND).
     oid = await _insert_pending(ctx["db"], account_id="missing-acc")
 
     with pytest.raises(RasatError) as exc_info:
@@ -246,7 +246,7 @@ async def test_approve_missing_risk_pct_preflight_before_broker(t02_ctx):
     assert exc_info.value.code == ErrorCode.INVALID_REQUEST
 
     rec = await _pending_status(ctx["db"], oid)
-    assert rec["status"] == PENDING_AWAITING  # preflight claim'den önce keser
+    assert rec["status"] == PENDING_AWAITING  # Fails before the preflight claim.
     assert len(ctx["broker"].placed) == 0
     assert len(await _order_rows(ctx["db"])) == 0
 
@@ -302,7 +302,7 @@ async def test_concurrent_approve_single_execution_claim(t02_ctx):
 
     rec = await _pending_status(ctx["db"], oid)
     assert rec["status"] == "executed"
-    assert len(await _order_rows(ctx["db"])) == 1  # tek emir kaydı
+    assert len(await _order_rows(ctx["db"])) == 1  # One order record.
     assert len(ctx["broker"].placed) == 0  # paper → broker'a gitmez
 
 
@@ -346,10 +346,10 @@ async def test_order_spec_requires_risk_pct_and_finite_at_creation(t02_ctx):
 
 
 async def test_approve_unknown_status_keeps_reconcile_not_executed(t02_ctx):
-    """UNKNOWN structured sonuç kaydı reconcile_required'a taşır, executed yapmaz."""
+    """UNKNOWN structured result moves the record to reconcile_required, not executed."""
     ctx = t02_ctx
     account_id = await _add_real_account(ctx)
-    ctx["broker"].place_errors_by_account[account_id] = RuntimeError("ağ zaman aşımı")
+    ctx["broker"].place_errors_by_account[account_id] = RuntimeError("network timeout")
     oid = await _insert_pending(ctx["db"], account_id=account_id)
 
     with pytest.raises(RasatError):
@@ -360,11 +360,11 @@ async def test_approve_unknown_status_keeps_reconcile_not_executed(t02_ctx):
     assert rec["executed_order_id"] is None
 
 
-# ---------- broker status eşlemesi (yalnızca FILLED/paper kesin başarı) ----------
+# ---------- broker status mapping (only FILLED/paper is confirmed success) ----------
 
 
 async def test_approve_real_filled_uses_exchange_order_id(t02_ctx):
-    """Real hesapta FILLED kesin başarıdır; executed_order_id exchange id doldurur."""
+    """On a real account, FILLED is confirmed success; executed_order_id gets the exchange id."""
     ctx = t02_ctx
     account_id = await _add_real_account(ctx)
     oid = await _insert_pending(ctx["db"], account_id=account_id)
@@ -374,11 +374,11 @@ async def test_approve_real_filled_uses_exchange_order_id(t02_ctx):
     assert data["status"] == "executed"
     rec = await _pending_status(ctx["db"], oid)
     assert rec["status"] == "executed"
-    assert rec["executed_order_id"].startswith("EX")  # exchange emir kimliği
+    assert rec["executed_order_id"].startswith("EX")  # Exchange order identity.
 
 
 async def test_approve_broker_new_is_reconcile_not_executed(t02_ctx):
-    """NEW (bekleyen limit emri) kesin başarı DEĞİL → reconcile_required, id boş."""
+    """NEW (pending limit order) is NOT confirmed success → reconcile_required, empty id."""
     ctx = t02_ctx
     account_id = await _add_real_account(ctx)
     ctx["broker"].place_result = {"status": "NEW", "exchange_order_id": "EX-NEW-1"}
@@ -394,7 +394,7 @@ async def test_approve_broker_new_is_reconcile_not_executed(t02_ctx):
 
 
 async def test_approve_broker_partially_filled_is_reconcile(t02_ctx):
-    """PARTIALLY_FILLED non-terminal → reconcile_required, executed_order_id boş."""
+    """PARTIALLY_FILLED is non-terminal → reconcile_required, empty executed_order_id."""
     ctx = t02_ctx
     account_id = await _add_real_account(ctx)
     ctx["broker"].place_result = {"status": "PARTIALLY_FILLED", "exchange_order_id": "EX-PF-1"}
@@ -410,7 +410,7 @@ async def test_approve_broker_partially_filled_is_reconcile(t02_ctx):
 
 
 async def test_approve_broker_canceled_is_rejected(t02_ctx):
-    """CANCELED deterministic rejected → pending rejected, executed_order_id boş."""
+    """CANCELED deterministic rejected → pending rejected, empty executed_order_id."""
     ctx = t02_ctx
     account_id = await _add_real_account(ctx)
     ctx["broker"].place_result = {"status": "CANCELED", "exchange_order_id": "EX-C-1"}
@@ -426,7 +426,7 @@ async def test_approve_broker_canceled_is_rejected(t02_ctx):
 
 
 async def test_approve_broker_expired_is_rejected(t02_ctx):
-    """EXPIRED deterministic rejected → pending rejected, executed_order_id boş."""
+    """EXPIRED deterministic rejected → pending rejected, empty executed_order_id."""
     ctx = t02_ctx
     account_id = await _add_real_account(ctx)
     ctx["broker"].place_result = {"status": "EXPIRED", "exchange_order_id": "EX-E-1"}
@@ -443,12 +443,12 @@ async def test_approve_broker_expired_is_rejected(t02_ctx):
 
 
 # =====================================================================
-# T3: executing kurtarımı (daemon restart sonrası reconcile)
+# T3: recover executing state (reconcile after daemon restart)
 # =====================================================================
 
 
 async def test_reconcile_pending_execution_filled_completes(t02_ctx):
-    """orders kaydı FILLED → executing kaydı executed'a tamamlanır (id dolar)."""
+    """FILLED orders record completes the executing record as executed (id is filled)."""
     ctx = t02_ctx
     account_id = await _add_real_account(ctx)
     oid = await _insert_executing_pending(ctx["db"], account_id=account_id, execution_started_at=int(time.time()) - 600)
@@ -465,7 +465,7 @@ async def test_reconcile_pending_execution_filled_completes(t02_ctx):
 
 
 async def test_reconcile_pending_execution_paper_completes(t02_ctx):
-    """orders kaydı PAPER (paper simülasyonu) → kesin başarı, executed."""
+    """PAPER orders record → confirmed success, executed."""
     ctx = t02_ctx
     account_id = await _add_paper_account(ctx)
     oid = await _insert_executing_pending(ctx["db"], account_id=account_id, execution_started_at=int(time.time()) - 600)
@@ -479,7 +479,7 @@ async def test_reconcile_pending_execution_paper_completes(t02_ctx):
 
 
 async def test_reconcile_pending_execution_rejected_order_fails(t02_ctx):
-    """orders kaydı REJECTED → executing kaydı deterministic rejected."""
+    """REJECTED orders record → executing record becomes deterministic rejected."""
     ctx = t02_ctx
     account_id = await _add_real_account(ctx)
     oid = await _insert_executing_pending(ctx["db"], account_id=account_id, execution_started_at=int(time.time()) - 600)
@@ -494,7 +494,7 @@ async def test_reconcile_pending_execution_rejected_order_fails(t02_ctx):
 
 
 async def test_reconcile_pending_execution_unknown_order_reconciles(t02_ctx):
-    """orders kaydı UNKNOWN (ağ belirsizliği) → reconcile_required, executed_order_id boş."""
+    """UNKNOWN orders record (network uncertainty) → reconcile_required, empty executed_order_id."""
     ctx = t02_ctx
     account_id = await _add_real_account(ctx)
     oid = await _insert_executing_pending(ctx["db"], account_id=account_id, execution_started_at=int(time.time()) - 600)
@@ -508,7 +508,7 @@ async def test_reconcile_pending_execution_unknown_order_reconciles(t02_ctx):
 
 
 async def test_reconcile_pending_execution_no_order_stale_reconcile_required(t02_ctx):
-    """orders eşleşmesi yok + execution_started_at eski → fail-closed reconcile_required."""
+    """No orders match + old execution_started_at → fail-closed reconcile_required."""
     ctx = t02_ctx
     account_id = await _add_real_account(ctx)
     oid = await _insert_executing_pending(ctx["db"], account_id=account_id, execution_started_at=int(time.time()) - 600)
@@ -525,7 +525,7 @@ async def test_reconcile_pending_execution_no_order_stale_reconcile_required(t02
 
 
 async def test_reconcile_pending_execution_no_order_fresh_untouched(t02_ctx):
-    """orders eşleşmesi yok ama execution_started_at taze → dokunulmadan kalır."""
+    """No orders match but execution_started_at is fresh → leave unchanged."""
     ctx = t02_ctx
     account_id = await _add_real_account(ctx)
     oid = await _insert_executing_pending(ctx["db"], account_id=account_id, execution_started_at=int(time.time()))
@@ -539,7 +539,7 @@ async def test_reconcile_pending_execution_no_order_fresh_untouched(t02_ctx):
 
 
 async def test_reconcile_pending_execution_ignores_other_statuses(t02_ctx):
-    """executing dışındaki kayıtlara dokunmaz."""
+    """Do not touch records outside executing."""
     ctx = t02_ctx
     account_id = await _add_paper_account(ctx)
     awaiting = await _insert_pending(ctx["db"], account_id=account_id)
@@ -549,12 +549,12 @@ async def test_reconcile_pending_execution_ignores_other_statuses(t02_ctx):
 
 
 # =====================================================================
-# T3: market emir entry/stop_loss onay öncesi kurtarma
+# T3: recover market-order entry/stop_loss before approval
 # =====================================================================
 
 
 async def test_approve_market_missing_entry_fills_market_price(t02_ctx):
-    """Market emirde entry boşsa güncel piyasa fiyatıyla doldurulup onay başarılı olur."""
+    """If a market order has empty entry, fill it with current market price and approve successfully."""
     ctx = t02_ctx
     account_id = await _add_paper_account(ctx)
     oid = await _insert_pending(ctx["db"], account_id=account_id, entry=None)
@@ -564,12 +564,12 @@ async def test_approve_market_missing_entry_fills_market_price(t02_ctx):
     assert data["status"] == "executed"
     rec = await _pending_status(ctx["db"], oid)
     assert rec["status"] == "executed"
-    assert rec["entry"] == pytest.approx(100.0)  # FakeMarket BTCUSDT fiyatı
+    assert rec["entry"] == pytest.approx(100.0)  # FakeMarket BTCUSDT price.
     assert len(ctx["broker"].placed) == 0  # paper → broker'a gitmez
 
 
 async def test_approve_market_missing_entry_and_no_price_fails_closed_awaiting(t02_ctx):
-    """Market emirde entry eksik + fiyat alınamıyor → STALE_DATA; kayıt awaiting kalır."""
+    """Market order with missing entry and unavailable price → STALE_DATA; record remains awaiting."""
     ctx = t02_ctx
     account_id = await _add_paper_account(ctx)
     ctx["market"].stale = {"BTCUSDT"}
@@ -580,12 +580,12 @@ async def test_approve_market_missing_entry_and_no_price_fails_closed_awaiting(t
     assert exc_info.value.code == ErrorCode.STALE_DATA
 
     rec = await _pending_status(ctx["db"], oid)
-    assert rec["status"] == PENDING_AWAITING  # kalıcı rejected değil
+    assert rec["status"] == PENDING_AWAITING  # Not permanently rejected.
     assert len(await _order_rows(ctx["db"])) == 0
 
 
 async def test_approve_market_missing_stop_loss_rejects_before_broker(t02_ctx):
-    """Market emirde stop_loss eksik → INVALID_REQUEST, kayıt awaiting_approval'da kalır."""
+    """Market order with missing stop_loss → INVALID_REQUEST; record remains awaiting_approval."""
     ctx = t02_ctx
     account_id = await _add_paper_account(ctx)
     oid = await _insert_pending(ctx["db"], account_id=account_id, stop_loss=None)
@@ -601,12 +601,12 @@ async def test_approve_market_missing_stop_loss_rejects_before_broker(t02_ctx):
 
 
 # =====================================================================
-# T3: geçici (transient) hatalar rejected değil reconcile_required
+# T3: transient errors become reconcile_required, not rejected
 # =====================================================================
 
 
 async def test_approve_stale_data_structured_result_maps_reconcile(t02_ctx):
-    """Structured REJECTED + STALE_DATA kodu → kalıcı rejected DEĞİL, reconcile_required."""
+    """Structured REJECTED + STALE_DATA code → not permanently rejected, reconcile_required."""
     ctx = t02_ctx
     account_id = await _add_real_account(ctx)
     ctx["market"].stale = {"BTCUSDT"}  # execute_on_accounts → STALE_DATA structured REJECTED
@@ -623,7 +623,7 @@ async def test_approve_stale_data_structured_result_maps_reconcile(t02_ctx):
 
 
 async def test_approve_insufficient_balance_stays_rejected(t02_ctx):
-    """Kalıcı hata (INSUFFICIENT_BALANCE) hâlâ rejected'da kalır — retry yok."""
+    """Permanent error (INSUFFICIENT_BALANCE) remains rejected—no retry."""
     ctx = t02_ctx
     account_id = await _add_real_account(ctx, balance_usdt=0.0)
     oid = await _insert_pending(ctx["db"], account_id=account_id)

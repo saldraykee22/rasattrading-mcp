@@ -77,7 +77,7 @@ async def _add_real_account(em_ctx, label="main", base_holdings=None, tags=None)
     return created["account_id"]
 
 
-# ---------- PublicPriceSource (3.7: bağımsız fiyat kaynağı) ----------
+# ---------- PublicPriceSource (3.7: independent price source) ----------
 
 
 class _FakeResp:
@@ -137,7 +137,7 @@ async def test_public_price_source_network_error_maps_to_rasat():
     def handler(url, params):
         import aiohttp
 
-        raise aiohttp.ClientConnectionError("fiyat servisi çöktü")
+        raise aiohttp.ClientConnectionError("price service crashed")
 
     src = PublicPriceSource("https://api.binance.com", session=_FakeSession(handler))
     try:
@@ -150,7 +150,7 @@ async def test_public_price_source_network_error_maps_to_rasat():
 
 async def test_public_price_source_http_error_maps_to_rasat():
     def handler(url, params):
-        return _FakeResp(500, {"code": -1121, "msg": "sunucu hatası"})
+        return _FakeResp(500, {"code": -1121, "msg": "server error"})
 
     src = PublicPriceSource("https://api.binance.com", session=_FakeSession(handler))
     try:
@@ -191,7 +191,7 @@ def _exchange_info_resp():
 
 
 async def test_public_price_source_filters_from_exchange_info():
-    # 3.16: PublicPriceSource.filters imzasız exchangeInfo'dan filtreleri döner.
+    # 3.16: PublicPriceSource.filters returns filters from unsigned exchangeInfo.
     calls = []
 
     def handler(url, params):
@@ -211,7 +211,7 @@ async def test_public_price_source_filters_from_exchange_info():
 
 
 async def test_public_price_source_filters_cached():
-    # 3.16: exchangeInfo tek sefer çekilir, sonra cache'lenir.
+    # 3.16: fetch exchangeInfo once, then cache it.
     calls = []
 
     def handler(url, params):
@@ -228,7 +228,7 @@ async def test_public_price_source_filters_cached():
 
 
 async def test_public_price_source_unknown_symbol_filters_none():
-    # 3.16: bilinmeyen sembol → None (fail-closed, ham miktar yok).
+    # 3.16: unknown symbol → None (fail-closed, no raw quantity).
     def handler(url, params):
         return _exchange_info_resp()
 
@@ -240,7 +240,7 @@ async def test_public_price_source_unknown_symbol_filters_none():
 
 
 async def test_public_price_source_rejects_non_finite_price():
-    # 3.16/M2: nan/inf/0 fiyat asla kabul edilmez.
+    # 3.16/M2: never accept nan/inf/0 prices.
     for bad in ("nan", "inf", "0"):
         def handler(url, params, _bad=bad):
             return _FakeResp(200, {"symbol": "BTCUSDT", "price": _bad})
@@ -256,10 +256,10 @@ async def test_public_price_source_rejects_non_finite_price():
 
 class _FailingPriceSource:
     async def price(self, symbol):
-        raise RasatError(ErrorCode.INTERNAL_ERROR, "fiyat servisi çöktü")
+        raise RasatError(ErrorCode.INTERNAL_ERROR, "price service crashed")
 
     async def filters(self, symbol):
-        # Filtre servisi sağlam; yalnızca fiyat yolu test ediliyor (3.16 fail-closed değil).
+        # Filter service is healthy; only the price path is tested (not 3.16 fail-closed).
         return SymbolFilters(**{**FILTERS.__dict__, "symbol": symbol})
 
 
@@ -271,13 +271,13 @@ async def test_emergency_stop_price_failure_fails_loud(em_ctx):
         ctx["accounts"], ctx["broker"], ctx["log"], market_price=_FailingPriceSource(),
     )
     result = await runner.run(account_ids=[account_id], yes=True)
-    # fiyat servisi çöktü → ok:True dönülmez (fail-loud, 3.7)
+    # Price service crashed → must not return ok:True (fail-loud, 3.7).
     assert result["ok"] is False
     detail = result["results"][0]
     assert detail["ok"] is False
     assert len(detail["price_errors"]) == 2
     assert detail["sold"] == []
-    assert len(ctx["broker"].placed) == 0  # hiçbir şey satılmadı
+    assert len(ctx["broker"].placed) == 0  # Nothing was sold.
 
 
 async def test_emergency_stop_price_failure_empty_plan_not_ok(em_ctx):
@@ -288,7 +288,7 @@ async def test_emergency_stop_price_failure_empty_plan_not_ok(em_ctx):
         ctx["accounts"], ctx["broker"], ctx["log"], market_price=_FailingPriceSource(),
     )
     result = await runner.run(account_ids=[account_id], yes=True)
-    # plan boş + price hatası → ok:True dönmez
+    # Empty plan + price error → must not return ok:True.
     assert result["ok"] is False
     assert result["results"][0]["ok"] is False
     assert result["results"][0]["price_errors"]
@@ -296,16 +296,16 @@ async def test_emergency_stop_price_failure_empty_plan_not_ok(em_ctx):
 
 async def test_emergency_stop_nothing_to_sell_still_ok(em_ctx):
     ctx = em_ctx
-    account_id = await _add_real_account(ctx, base_holdings={})  # sadece USDT
+    account_id = await _add_real_account(ctx, base_holdings={})  # USDT only
     runner = ctx["runner"]
     result = await runner.run(account_ids=[account_id], yes=True)
-    # satılacak gerçekten hiçbir şey yok → ok:True (fiyat hatası değil)
+    # Nothing to sell in reality → ok:True (not a price error).
     assert result["ok"] is True
     detail = result["results"][0]
     assert detail["ok"] is True
     assert detail["sold"] == []
     assert detail["price_errors"] == []
-    # T03: plan boş → mevcut no-position semantiği korunur; pending/reconcile yok
+    # T03: empty plan → preserve no-position semantics; no pending/reconcile.
     assert detail["pending_count"] == 0
     assert detail["reconcile_required"] is False
     assert detail["cancel_errors"] == []
@@ -350,7 +350,7 @@ async def test_run_emergency_stop_uses_public_price_source_by_default(tmp_path, 
         config=cfg,
     )
     assert created_flag.get("created") is True
-    assert created_flag.get("closed") is True  # 3.16: kendi session'ını kapattı
+    assert created_flag.get("closed") is True  # 3.16: closed its own session.
     assert result["ok"] is True
     assert len(result["results"][0]["sold"]) == 1
 
@@ -375,7 +375,7 @@ def test_emergency_log_detects_tamper(tmp_path):
     log.append(actor="emergency_stop", action="emergency_sell", details={"key": "k1", "quantity": 1.0})
     log.append(actor="emergency_stop", action="emergency_sell", details={"key": "k2", "quantity": 2.0})
 
-    # ikinci satırı değiştir
+    # Change the second row.
     lines = log.path.read_text(encoding="utf-8").splitlines()
     modified = lines[1].replace('"quantity": 2.0', '"quantity": 999.0')
     log.path.write_text(lines[0] + "\n" + modified + "\n", encoding="utf-8")
@@ -390,7 +390,7 @@ async def test_emergency_stop_sells_and_cancels(em_ctx, monkeypatch):
     account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0, "ETH": 2.0})
     runner = ctx["runner"]
 
-    # onayı otomatik ver (yes=True)
+    # Automatically confirm (yes=True).
     result = await runner.run(account_ids=[account_id], yes=True)
     assert result["ok"] is True
     detail = result["results"][0]
@@ -398,22 +398,22 @@ async def test_emergency_stop_sells_and_cancels(em_ctx, monkeypatch):
     assert len(detail["sold"]) == 2
     statuses = {s["symbol"]: s["status"] for s in detail["sold"]}
     assert statuses == {"BTCUSDT": "FILLED", "ETHUSDT": "FILLED"}
-    # T03: tüm satışlar kesin FILLED → pending/reconcile/cancel error yok
+    # T03: all sales definitively FILLED → no pending/reconcile/cancel error.
     assert detail["pending_count"] == 0
     assert detail["pending"] == []
     assert detail["reconcile_required"] is False
     assert detail["cancel_errors"] == []
-    # açık emirler iptal edildi
-    assert len(ctx["broker"].cancelled_all) == 1  # BTCUSDT açık emri
-    # log yazıldı (3.15: key miktar+nonce içerir, sembol prefix'i ile doğrula)
+    # Open orders were canceled.
+    assert len(ctx["broker"].cancelled_all) == 1  # BTCUSDT open order.
+    # Log was written (3.15: key contains quantity+nonce; verify with symbol prefix).
     assert ctx["runner"]._latest_sell_details(account_id, "BTCUSDT") is not None
     assert ctx["log"].verify() == []
 
 
 async def test_emergency_stop_distinct_cid_per_symbol(em_ctx):
-    # T4: aynı run'da birden fazla base asset (BTC+ETH) satılırken her SELL emri
-    # FARKLI clientOrderId taşımalı — aksi halde Binance ikinci emri reddeder
-    # (pozisyon korumasız kalır) veya reconcile yanlış sembolde arar.
+    # T4: when selling multiple base assets (BTC+ETH) in one run, each SELL order
+    # must carry a DIFFERENT clientOrderId—otherwise Binance rejects the second
+    # order (position remains unprotected) or reconciliation searches the wrong symbol.
     ctx = em_ctx
     account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0, "ETH": 2.0})
     runner = ctx["runner"]
@@ -426,11 +426,11 @@ async def test_emergency_stop_distinct_cid_per_symbol(em_ctx):
     sells = [p for p in ctx["broker"].placed if p["side"] == "SELL"]
     assert len(sells) == 2
     cids = [p["client_order_id"] for p in sells]
-    assert len(set(cids)) == 2  # aynı run içinde iki sembol → iki farklı cid
+    assert len(set(cids)) == 2  # Two symbols in one run → two different cids.
     for p in sells:
-        # cid, sembolü taşır (reconcile/query doğru sembolle eşleşir)
+        # cid carries the symbol (reconcile/query matches the right symbol).
         assert p["symbol"][:8] in p["client_order_id"]
-        # Binance clientOrderId sınırı (36 char) aşılmaz
+        # Binance clientOrderId limit (36 chars) is not exceeded.
         assert len(p["client_order_id"]) <= 36
 
 
@@ -443,15 +443,15 @@ async def test_emergency_stop_no_double_sell(em_ctx):
     assert first["ok"] is True
     placed_after_first = len(ctx["broker"].placed)
 
-    # ikinci çalıştırma: bakiye artık 0 (fake satışı uygular) + log idempotency
+    # Second run: balance is now 0 (fake applies the sale) + log idempotency.
     second = await runner.run(account_ids=[account_id], yes=True)
     assert second["ok"] is True
-    assert len(ctx["broker"].placed) == placed_after_first  # çift satış yok
+    assert len(ctx["broker"].placed) == placed_after_first  # No duplicate sale.
 
 
 async def test_emergency_stop_rebuy_after_done_sells_again(em_ctx):
-    # 3.15: bir "done" cycle'dan sonra yeni bakiye (rebuy) SKIPPED_DONE ile
-    # atlanmamalı — gerçekten yeni SELL üretmeli.
+    # 3.15: after a "done" cycle, new balance (rebuy) must not be SKIPPED_DONE and
+    # Must not be skipped—it must create a genuinely new SELL.
     ctx = em_ctx
     account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
     runner = ctx["runner"]
@@ -460,7 +460,7 @@ async def test_emergency_stop_rebuy_after_done_sells_again(em_ctx):
     assert first["ok"] is True
     assert len(ctx["broker"].placed) == 1
 
-    # yeniden 2.0 BTC alındı → ikinci çağrı YENİ SELL üretmeli
+    # 2.0 BTC bought again → second call must create a NEW SELL.
     ctx["broker"].balances[account_id]["BTC"] = 2.0
     second = await runner.run(account_ids=[account_id], yes=True)
     assert second["ok"] is True
@@ -471,9 +471,9 @@ async def test_emergency_stop_rebuy_after_done_sells_again(em_ctx):
 
 
 async def test_emergency_stop_nonterminal_sell_reconciled_not_done(em_ctx):
-    # 3.15: broker NEW dönerse bu "done" değildir; sonraki çalıştırma broker'a
-    # sorar (reconcile-before-resend), körlemesine çift SELL göndermez.
-    # T03: NEW non-terminaldir → ok=False ve pending/reconcile görünür.
+    # 3.15: broker NEW is not "done"; the next run queries the broker
+    # (reconcile-before-resend) and does not blindly send a duplicate SELL.
+    # T03: NEW is non-terminal → ok=False and pending/reconcile are visible.
     ctx = em_ctx
     account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
     runner = ctx["runner"]
@@ -496,8 +496,8 @@ async def test_emergency_stop_nonterminal_sell_reconciled_not_done(em_ctx):
 
     second = await runner.run(account_ids=[account_id], yes=True)
     second_detail = second["results"][0]
-    assert len(ctx["broker"].placed) == 1  # çift satış yok
-    assert second_detail["sold"][0]["status"] == "NEW"  # işlemde olarak raporlanır
+    assert len(ctx["broker"].placed) == 1  # No duplicate sale.
+    assert second_detail["sold"][0]["status"] == "NEW"  # Reported as in progress.
     assert second["ok"] is False
     assert second_detail["ok"] is False
     assert second_detail["pending_count"] == 1
@@ -505,7 +505,7 @@ async def test_emergency_stop_nonterminal_sell_reconciled_not_done(em_ctx):
 
 
 async def test_emergency_stop_partially_filled_sell_not_ok(em_ctx):
-    # T03 kabul: PARTIALLY_FILLED → ok=False ve pending/non-terminal görünür.
+    # T03 acceptance: PARTIALLY_FILLED → ok=False and pending/non-terminal visible.
     ctx = em_ctx
     account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
     runner = ctx["runner"]
@@ -524,7 +524,7 @@ async def test_emergency_stop_partially_filled_sell_not_ok(em_ctx):
 
 
 async def test_emergency_stop_unknown_sell_not_ok(em_ctx):
-    # T03 kabul: UNKNOWN → ok=False ve reconcile görünür.
+    # T03 acceptance: UNKNOWN → ok=False and reconciliation visible.
     ctx = em_ctx
     account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
     runner = ctx["runner"]
@@ -542,12 +542,12 @@ async def test_emergency_stop_unknown_sell_not_ok(em_ctx):
 
 
 async def test_emergency_stop_cancel_error_not_ok(em_ctx):
-    # T03: iptal hatası ok'u bozar ve cancel_errors alanında raporlanır;
-    # satış yine de denenir (kalan pozisyonlar kapanmaya devam eder).
+    # T03: cancellation error makes ok false and is reported in cancel_errors;
+    # selling is still attempted (remaining positions continue closing).
     ctx = em_ctx
     account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
     runner = ctx["runner"]
-    ctx["broker"].cancel_all_errors["BTCUSDT"] = RasatError(ErrorCode.INTERNAL_ERROR, "iptal servisi çöktü")
+    ctx["broker"].cancel_all_errors["BTCUSDT"] = RasatError(ErrorCode.INTERNAL_ERROR, "cancellation service crashed")
     result = await runner.run(account_ids=[account_id], yes=True)
     detail = result["results"][0]
     assert result["ok"] is False
@@ -555,12 +555,12 @@ async def test_emergency_stop_cancel_error_not_ok(em_ctx):
     assert len(detail["cancel_errors"]) == 1
     assert detail["cancel_errors"][0]["symbol"] == "BTCUSDT"
     assert detail["cancelled_orders"] == 0
-    assert len(detail["sold"]) == 1  # satış yine de denenir
+    assert len(detail["sold"]) == 1  # Selling is still attempted.
     assert detail["sold"][0]["status"] == "FILLED"
 
 
 async def test_emergency_stop_missing_filters_fails_closed(em_ctx):
-    # 3.16: filtre bilgisi yoksa ham miktar gönderilmez — fail-closed.
+    # 3.16: do not send raw quantity when filter data is missing—fail-closed.
     class _NoFiltersSource:
         async def price(self, symbol):
             return 100.0
@@ -579,11 +579,11 @@ async def test_emergency_stop_missing_filters_fails_closed(em_ctx):
     assert detail["ok"] is False
     assert len(detail["filter_errors"]) == 1
     assert detail["sold"] == []
-    assert len(ctx["broker"].placed) == 0  # ham bakiye gönderilmedi
+    assert len(ctx["broker"].placed) == 0  # Raw balance was not sent.
 
 
 async def test_emergency_stop_rounds_to_step(em_ctx):
-    # 3.16: miktar LOT_SIZE step'e göre yuvarlanmalı (1.7 → 1.5).
+    # 3.16: quantity must be rounded to LOT_SIZE step (1.7 → 1.5).
     class _StepFilterSource:
         async def price(self, symbol):
             return 100.0
@@ -607,7 +607,7 @@ async def test_emergency_stop_rounds_to_step(em_ctx):
 
 
 async def test_emergency_stop_below_min_notional_fails_closed(em_ctx):
-    # 3.16: MIN_NOTIONAL altında kalan satış plana girmez (fail-closed).
+    # 3.16: a sale below MIN_NOTIONAL is not added to the plan (fail-closed).
     class _MinNotionalSource:
         async def price(self, symbol):
             return 100.0
@@ -638,7 +638,7 @@ async def test_emergency_stop_requires_confirmation(em_ctx, monkeypatch):
     account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
     runner = ctx["runner"]
 
-    # onay yoksa abort
+    # Abort without confirmation.
     monkeypatch.setattr("builtins.input", lambda *a, **k: "n")
     result = await runner.run(account_ids=[account_id], yes=False)
     assert result["ok"] is False
@@ -647,14 +647,14 @@ async def test_emergency_stop_requires_confirmation(em_ctx, monkeypatch):
 
 
 async def test_emergency_stop_closed_stdin_fails_closed(em_ctx, monkeypatch):
-    # T4: stdin kapalıyken (headless/CI) input() EOFError fırlatır — iç hata
-    # sızdırılmaz; sabit "confirmation required, use --yes" hatası döner.
+    # T4: when stdin is closed (headless/CI), input() raises EOFError—internal
+    # error is not exposed; return fixed "confirmation required, use --yes" error.
     ctx = em_ctx
     account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
     runner = ctx["runner"]
 
     def _raise_eof(*a, **k):
-        raise EOFError("stdin kapalı")
+        raise EOFError("stdin closed")
 
     monkeypatch.setattr("builtins.input", _raise_eof)
     result = await runner.run(account_ids=[account_id], yes=False)
@@ -664,11 +664,11 @@ async def test_emergency_stop_closed_stdin_fails_closed(em_ctx, monkeypatch):
     assert detail["error"]["code"] == "CONFIRMATION_REQUIRED"
     assert detail["error"]["message"] == "confirmation required, use --yes for non-interactive"
     assert "EOFError" not in detail["error"]["message"]
-    assert len(ctx["broker"].placed) == 0  # hiçbir şey gönderilmedi
+    assert len(ctx["broker"].placed) == 0  # Nothing was sent.
 
 
 async def test_emergency_stop_closed_stdin_flag_reported(em_ctx, monkeypatch):
-    # T4: sys.stdin.closed=True ön-kontrolü de aynı fail-closed hatayı döner.
+    # T4: sys.stdin.closed=True pre-check returns the same fail-closed error.
     ctx = em_ctx
     account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
     runner = ctx["runner"]
@@ -711,14 +711,14 @@ async def test_reconcile_emergency_log_into_audit(em_ctx):
     account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
     await ctx["runner"].run(account_ids=[account_id], yes=True)
 
-    # daemon açılışı: log'u audit_log'a mutabakat et
+    # Daemon startup: reconcile log into audit_log.
     audit = AuditLog(ctx["db"])
     result = await reconcile_emergency_log(ctx["db"], audit, ctx["log"])
     assert result["reconciled"] >= 2  # cancel + sell(ler)
     assert result["log_broken"] == []
     assert await audit.verify() == []
 
-    # idempotent: ikinci reconcile hiçbir şey yazmaz
+    # Idempotent: second reconciliation writes nothing.
     again = await reconcile_emergency_log(ctx["db"], audit, ctx["log"])
     assert again["reconciled"] == 0
 

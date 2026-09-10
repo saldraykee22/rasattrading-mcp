@@ -1,17 +1,17 @@
-"""Risk politikası yardımcıları (ticket 3.2).
+"""Risk-policy helpers (ticket 3.2).
 
-Tolerans ilkesi (kullanıcı kararı):
-- Yalnızca RR/stop-mesafesi gibi "yumuşak" sinyal eşikleri tolerans bandıyla
-  değerlendirilir (`within_tolerance`). Bu, katı eşitlik yüzünden iyi bir setup'ın
-  reddedilmesini önler.
-- `max_notional_per_order` / `max_aggregate_exposure` güvenlik tavanlarına asla
-  pozitif tolerans uygulanmaz (`enforce_policy_caps`): nihai değer her zaman
-  `<= cap` olmalıdır. Cap üzerine esneklik ancak açık, audit'lenen bir override
-  (3.2 `risk_override`) ile yapılır.
+Tolerance principle (user decision):
+- Use a tolerance band (`within_tolerance`) only for "soft" signal thresholds
+  such as RR/stop distance. This prevents a good setup from being rejected due
+  to strict equality.
+- Never apply positive tolerance to the safety ceilings
+  `max_notional_per_order` / `max_aggregate_exposure` (`enforce_policy_caps`):
+  the final value must always be `<= cap`. Flexibility above a cap requires an
+  explicit, audited override (3.2 `risk_override`).
 
-Temel doğruluk kontrolleri (bakiye/stale/stop-yönü/sembol-geçerliliği) bu modülün
-KAPSAMI DIŞINDADIR — 3.3 ticket'ına aittir ve override'dan bağımsız olarak her
-emirde zorunlu kalır.
+Core correctness checks (balance/stale/stop direction/symbol validity) are OUTSIDE
+this module's SCOPE — they belong to ticket 3.3 and remain mandatory for every
+order independently of overrides.
 """
 
 from __future__ import annotations
@@ -23,24 +23,23 @@ from .numeric import require_finite
 
 logger = logging.getLogger("rasattrading.risk")
 
-#: Soft eşikler için varsayılan tolerans bandı (RR/stop-mesafesi; cap değil).
+#: Default tolerance band for soft thresholds (RR/stop distance; not caps).
 DEFAULT_TOLERANCE_PCT = 0.02
 
 
 def within_tolerance(value: float, target: float, tolerance_pct: float = DEFAULT_TOLERANCE_PCT) -> bool:
-    """`value` hedefe tolerans bandı içinde yakınsa True.
+    """Return True when `value` is within the tolerance band of the target.
 
-    Sadece sinyal kalitesi eşikleri için kullanılmalıdır. `tolerance_pct`
-    görecelidir (target'ın yüzdesi). Örnek: RR hedef 2.0, tolerans %2
-    -> 1.96 ve üzeri kabul.
+    Use only for signal-quality thresholds. `tolerance_pct` is relative (a
+    percentage of target). Example: RR target 2.0 with 2% tolerance accepts 1.96+.
     """
-    # T01: non-numeric/None tolerance karşılaştırmaya girmeden önce finite'lanır —
-    # aksi halde "abc" gibi değerler TypeError ile dışarı kaçabilirdi.
+    # T01: finite-validate non-numeric/None tolerance before comparison;
+    # otherwise values such as "abc" could escape as TypeError.
     value = require_finite(value, "value")
     target = require_finite(target, "target")
     tolerance_pct = require_finite(tolerance_pct, "tolerance_pct")
     if tolerance_pct < 0:
-        raise RasatError(ErrorCode.INVALID_REQUEST, "tolerance_pct negatif olamaz")
+        raise RasatError(ErrorCode.INVALID_REQUEST, "tolerance_pct cannot be negative")
     if target == 0:
         return value == 0
     band = abs(target) * tolerance_pct
@@ -54,26 +53,25 @@ def enforce_policy_caps(
     policy: dict,
     aggregate_exposure: float | None = None,
 ) -> None:
-    """Kullanıcı-tanımlı risk politikasını KATI biçimde uygular.
+    """Apply the user-defined risk policy STRICTLY.
 
-    `notional` (yuvarlama sonrası nihai emir tutarı) ve isteğe bağlı
-    `aggregate_exposure` cap'leri aşıldığında `RISK_LIMIT_EXCEEDED` fırlatır.
-    Sembol `allowed_symbols`'da değilse `SYMBOL_NOT_ALLOWED`. Tolerans YOK:
-    nihai değer her zaman `<= cap` olmalıdır.
+    Raise `RISK_LIMIT_EXCEEDED` when `notional` (final order amount after rounding)
+    or optional `aggregate_exposure` exceeds a cap. Raise `SYMBOL_NOT_ALLOWED` when
+    the symbol is not in `allowed_symbols`. NO tolerance: the final value must always be `<= cap`.
 
-    `policy` bir dict'tir: {max_notional_per_order?, max_aggregate_exposure?,
-    allowed_symbols?}. `None`/boş = sınırsız/serbest.
+    `policy` is a dict: {max_notional_per_order?, max_aggregate_exposure?,
+    allowed_symbols?}. `None`/empty = unlimited/free.
     """
     if not isinstance(symbol, str) or not symbol:
-        raise RasatError(ErrorCode.INVALID_REQUEST, "symbol zorunlu (string)")
+        raise RasatError(ErrorCode.INVALID_REQUEST, "symbol is required (string)")
     notional = require_finite(notional, "notional")
     if notional <= 0:
-        raise RasatError(ErrorCode.INVALID_REQUEST, "notional pozitif bir sayı olmalı")
+        raise RasatError(ErrorCode.INVALID_REQUEST, "notional must be a positive number")
 
     allowed = policy.get("allowed_symbols")
     if allowed:
         if symbol not in allowed:
-            raise RasatError(ErrorCode.SYMBOL_NOT_ALLOWED, f"sembol risk politikasında yok: {symbol}")
+            raise RasatError(ErrorCode.SYMBOL_NOT_ALLOWED, f"symbol is not allowed by risk policy: {symbol}")
 
     cap = policy.get("max_notional_per_order")
     if cap is not None:
@@ -81,7 +79,7 @@ def enforce_policy_caps(
         if notional > cap:
             raise RasatError(
                 ErrorCode.RISK_LIMIT_EXCEEDED,
-                f"emir tutarı cap'i aşıyor: {notional} > {cap} (max_notional_per_order, tolerans uygulanmaz)",
+                f"order notional exceeds cap: {notional} > {cap} (max_notional_per_order, no tolerance)",
             )
 
     if aggregate_exposure is not None:
@@ -92,5 +90,5 @@ def enforce_policy_caps(
             if aggregate_exposure > agg_cap:
                 raise RasatError(
                     ErrorCode.RISK_LIMIT_EXCEEDED,
-                    f"toplam exposure cap'i aşıyor: {aggregate_exposure} > {agg_cap} (max_aggregate_exposure, tolerans uygulanmaz)",
+                    f"aggregate exposure exceeds cap: {aggregate_exposure} > {agg_cap} (max_aggregate_exposure, no tolerance)",
                 )

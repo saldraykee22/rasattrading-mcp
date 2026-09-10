@@ -21,7 +21,7 @@ def cfg(tmp_path):
 
 
 async def _start_daemon_app(cfg):
-    """Gerçek daemon app'ini geçici porta bağlar; (runner, port) döner."""
+    """Bind the real daemon app to a temporary port; return (runner, port)."""
     from aiohttp import web
 
     readiness = Readiness()
@@ -51,7 +51,7 @@ async def test_mcp_handshake_list_tools_and_call(cfg):
         client = DaemonClient(Config(data_dir=cfg.data_dir, port=port), TOKEN)
         server = build_adapter_server(client)
 
-        # tool listesi registry'den yansıyor mu?
+        # Does the tool list reflect the registry?
         tools = build_mcp_tools()
         names = {t.name for t in tools}
         assert names == set(REGISTRY.names())
@@ -77,12 +77,12 @@ async def test_mcp_handshake_list_tools_and_call(cfg):
 
 
 async def test_initialization_options_buildable_for_run(cfg):
-    """mcp SDK >=1.29 Server.run stdio yolu icin gerekli options uretilebiliyor.
+    """mcp SDK >=1.29 can produce the options required for the Server.run stdio path.
 
-    `run_adapter` stdio_server + Server.run yolunu kullanir; SDK 1.29'da
-    InitializationOptions (capabilities dahil) zorunlu hale geldi ve bu yol
-    hicbir unit testte sarmalanmadigi icin canli stdio testinde patlamisti.
-    Bu test, options kurulumunun yapilabilir oldugunu sabitler.
+    `run_adapter` uses the stdio_server + Server.run path; in SDK 1.29,
+    InitializationOptions (including capabilities) became required, and this path
+    failed in the live stdio test because no unit test covered it.
+    This test locks in that the options can be constructed.
     """
     from rasattrading_mcp.adapter.main import build_initialization_options
 

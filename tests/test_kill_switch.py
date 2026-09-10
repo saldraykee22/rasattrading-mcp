@@ -89,7 +89,7 @@ async def _add_real_account(ex_ctx, label="main", balance_usdt=10000.0, base_hol
 
 
 async def _plant_open_order(ex_ctx, account_id, idempotency_key):
-    """place_result=NEW ile açık (borsada duran) bir emir yerleştir."""
+    """Place an open exchange order with place_result=NEW."""
     ctx = ex_ctx
     ctx["broker"].place_result = {"status": "NEW"}
     service = ctx["service"]
@@ -97,7 +97,7 @@ async def _plant_open_order(ex_ctx, account_id, idempotency_key):
         account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="LIMIT",
         quantity=0.5, price=80, idempotency_key=idempotency_key,
     )
-    ctx["broker"].place_result = None  # sonraki sell'ler default FILLED dönsün
+    ctx["broker"].place_result = None  # Subsequent sells should default to FILLED.
     return placed
 
 
@@ -106,19 +106,19 @@ async def test_close_all_positions_cancel_failure_not_marked_canceled(ex_ctx):
     account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
     placed = await _plant_open_order(ctx, account_id, "open-fail")
     cid = to_client_order_id("open-fail")
-    ctx["broker"].cancel_errors[cid] = RasatError(ErrorCode.TIMEOUT, "iptal ağ hatası")
-    ctx["broker"].open_orders = []  # borsada başka yetim emir yok (T01 exchange scope)
+    ctx["broker"].cancel_errors[cid] = RasatError(ErrorCode.TIMEOUT, "cancel network error")
+    ctx["broker"].open_orders = []  # No other exchange orphan (T01 exchange scope).
 
     service = ctx["service"]
     result = await service.close_all_positions(account_id=account_id, actor="test")
     detail = result["results"][0]
-    # iptal başarısız → hesap kapandı denmez; hata raporlanır
+    # Cancellation failed → do not report the account as closed; report the error.
     assert detail["closed"] is False
     assert len(detail["cancel_errors"]) == 1
     assert detail["cancel_errors"][0]["error"]["code"] == ErrorCode.TIMEOUT
     assert "BTCUSDT" not in detail["cancelled"]
 
-    # yerel durum CANCELED değil → UNKNOWN + hata kodu
+    # Local state is not CANCELED → UNKNOWN + error code.
     def _q(conn):
         return dict(conn.execute("SELECT * FROM orders WHERE order_id = ?", (placed["order_id"],)).fetchone())
 
@@ -126,14 +126,14 @@ async def test_close_all_positions_cancel_failure_not_marked_canceled(ex_ctx):
     assert row["status"] != "CANCELED"
     assert row["status"] == "UNKNOWN"
     assert row["error_code"] == ErrorCode.TIMEOUT
-    assert len(ctx["broker"].cancelled) == 0  # borsaya iptal kaydı düşmedi
+    assert len(ctx["broker"].cancelled) == 0  # No cancellation reached the exchange.
 
 
 async def test_close_all_positions_cancel_success_marks_canceled(ex_ctx):
     ctx = ex_ctx
     account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
     placed = await _plant_open_order(ctx, account_id, "open-ok")
-    ctx["broker"].open_orders = []  # borsada başka yetim emir yok (T01 exchange scope)
+    ctx["broker"].open_orders = []  # No other exchange orphan (T01 exchange scope).
 
     service = ctx["service"]
     result = await service.close_all_positions(account_id=account_id, actor="test")
@@ -163,7 +163,7 @@ async def test_close_all_positions_single_account_sells_holdings(ex_ctx):
     sold = {s["symbol"]: s for s in detail["sold"]}
     assert sold["BTCUSDT"]["status"] == "FILLED"
     assert sold["ETHUSDT"]["status"] == "FILLED"
-    assert len(ctx["broker"].placed) == 2  # iki sembol satıldı
+    assert len(ctx["broker"].placed) == 2  # Two symbols were sold.
 
 
 async def test_close_all_positions_idempotent_no_double_sell(ex_ctx):
@@ -172,11 +172,11 @@ async def test_close_all_positions_idempotent_no_double_sell(ex_ctx):
     service = ctx["service"]
 
     first = await service.close_all_positions(account_id=account_id)
-    # bakiye artık 0 BTC (fake broker satışı uygular) → ikinci çağrı satış üretmez
+    # Balance is now 0 BTC (fake broker applies the sale) → second call sends no sale.
     second = await service.close_all_positions(account_id=account_id)
     assert second["closed"] == 1
     assert len(ctx["broker"].placed) == 1
-    # aynı (account, symbol) için idempotency key çift satış üretmez
+    # The same (account, symbol) idempotency key does not create a duplicate sale.
     third = await service.close_all_positions(account_id=account_id)
     assert len(ctx["broker"].placed) == 1
 
@@ -190,19 +190,19 @@ async def test_close_all_positions_sells_rebought_position(ex_ctx):
     assert first["results"][0]["closed"] is True
     assert len(ctx["broker"].placed) == 1  # ilk close: 1 SELL
 
-    # 3.11: close sonrası yeniden BTC alındı → ikinci close YENİ SELL üretmeli
+    # 3.11: BTC was bought again after close → second close must create a NEW SELL.
     ctx["broker"].balances[account_id]["BTC"] = 2.0
     second = await service.close_all_positions(account_id=account_id, actor="test")
     assert second["results"][0]["closed"] is True
-    assert len(ctx["broker"].placed) == 2  # 0 değil — yeni pozisyon satıldı
+    assert len(ctx["broker"].placed) == 2  # Not 0—the new position was sold.
     sold = {s["symbol"]: s for s in second["results"][0]["sold"]}
     assert sold["BTCUSDT"]["quantity"] == pytest.approx(2.0)
     assert sold["BTCUSDT"]["status"] == "FILLED"
 
 
 async def test_close_all_positions_same_qty_rebuy_sells_again(ex_ctx):
-    # B1/3.14: birebir AYNI miktarın yeniden alımı bile yeni SELL üretmeli —
-    # eski FILLED dedup'unun bıraktığı kenar durumu (3.11 kabul kriteri).
+    # B1/3.14: even buying back the EXACT same quantity must create a new SELL—
+    # an edge case left by the old FILLED deduplication (3.11 acceptance criterion).
     ctx = ex_ctx
     account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
     service = ctx["service"]
@@ -211,19 +211,19 @@ async def test_close_all_positions_same_qty_rebuy_sells_again(ex_ctx):
     assert first["results"][0]["closed"] is True
     assert len(ctx["broker"].placed) == 1
 
-    # tam aynı miktar (1.0) yeniden alındı
+    # Exactly the same quantity (1.0) was bought again.
     ctx["broker"].balances[account_id]["BTC"] = 1.0
     second = await service.close_all_positions(account_id=account_id, actor="test")
     assert second["results"][0]["closed"] is True
-    assert len(ctx["broker"].placed) == 2  # eski FILLED'a takılıp atlamadı
+    assert len(ctx["broker"].placed) == 2  # It did not skip on the old FILLED record.
     sold = {s["symbol"]: s for s in second["results"][0]["sold"]}
     assert sold["BTCUSDT"]["quantity"] == pytest.approx(1.0)
     assert sold["BTCUSDT"]["status"] == "FILLED"
 
 
 async def test_close_all_positions_rejected_retry_no_unique_error(ex_ctx):
-    # H5/3.14: REJECTED ile biten close'un aynı miktar retry'i UNIQUE constraint
-    # hatasına düşmeden yeni SELL üretmeli.
+    # H5/3.14: retrying the same quantity after a REJECTED close must create a
+    # new SELL without a UNIQUE constraint error.
     ctx = ex_ctx
     account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
     service = ctx["service"]
@@ -233,10 +233,10 @@ async def test_close_all_positions_rejected_retry_no_unique_error(ex_ctx):
     assert first["results"][0]["closed"] is False
     assert len(ctx["broker"].placed) == 1
 
-    # retry: broker artık kabul ediyor
+    # Retry: the broker now accepts it.
     ctx["broker"].place_result = None
     second = await service.close_all_positions(account_id=account_id, actor="test")
-    assert second["results"][0]["closed"] is True  # UNIQUE hatası yok
+    assert second["results"][0]["closed"] is True  # No UNIQUE error.
     assert len(ctx["broker"].placed) == 2
     assert second["results"][0]["sold"][0]["status"] == "FILLED"
 
@@ -245,19 +245,20 @@ async def test_close_all_positions_all_partial_success(ex_ctx):
     ctx = ex_ctx
     ok_id = await _add_real_account(ctx, label="ok", base_holdings={"BTC": 1.0}, tags=["kill"])
     bad_id = await _add_real_account(ctx, label="bad", base_holdings={"BTC": 1.0}, tags=["kill"])
-    # bad hesabın satışı ağ hatası versin ve Binance'te de bulunamasın → UNKNOWN.
-    # (3.14 idem key run nonce'ı taşıdığından cid önceden bilinmez; hesap bazlı hata.)
-    ctx["broker"].place_errors_by_account[bad_id] = RasatError(ErrorCode.TIMEOUT, "ağ hatası")
+    # Make the bad account's sale fail with a network error and remain absent from
+    # Binance → UNKNOWN. (3.14's run nonce means the cid is not known in advance;
+    # this is an account-level error.)
+    ctx["broker"].place_errors_by_account[bad_id] = RasatError(ErrorCode.TIMEOUT, "network error")
     ctx["broker"].query_results_by_account[bad_id] = None
 
     service = ctx["service"]
     result = await service.close_all_positions(account_id="all", actor="test")
     assert result["count"] == 2
     by_account = {r["account_id"]: r for r in result["results"]}
-    # 3.19: satış UNKNOWN olduğu için bad hesap closed denmez — yalnızca FILLED kapalıdır
+    # 3.19: the bad account is not closed because its sale is UNKNOWN—only FILLED is closed.
     assert by_account[ok_id]["closed"] is True
     assert by_account[bad_id]["closed"] is False
-    # kısmi başarı raporu: ok_id BTC sattı (FILLED), bad_id satamadı (UNKNOWN)
+    # Partial success report: ok_id sold BTC (FILLED), bad_id could not sell (UNKNOWN).
     ok_sold = {s["symbol"]: s for s in by_account[ok_id]["sold"]}
     bad_sold = {s["symbol"]: s for s in by_account[bad_id]["sold"]}
     assert ok_sold["BTCUSDT"]["status"] == "FILLED"
@@ -280,7 +281,7 @@ async def test_reconcile_open_orders_resolves_orphan_new(ex_ctx):
     account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
     service = ctx["service"]
 
-    # DB'de NEW'de bir emir bırak (crash senaryosu); Binance'te FILLED olduğunu simüle et
+    # Leave an order as NEW in the DB (crash scenario); simulate FILLED on Binance.
     cid = to_client_order_id("orphan-new")
     ctx["broker"].place_result = {"status": "NEW"}
     placed = await service.place_order(
@@ -302,9 +303,9 @@ async def test_reconcile_open_orders_resolves_orphan_new(ex_ctx):
     row = await ctx["db"].read(_q)
     assert row["status"] == "FILLED"
     assert row["exchange_order_id"] == "EX-ORPHAN"
-    # exposure artık NEW emirle şişmez
+    # Exposure is no longer inflated by the NEW order.
     exposure = await service.get_total_exposure()
-    assert exposure["by_symbol"].get("BTCUSDT", 0.0) == pytest.approx(1.0 * 100.0)  # sadece base holding
+    assert exposure["by_symbol"].get("BTCUSDT", 0.0) == pytest.approx(1.0 * 100.0)  # base holding only
 
 
 async def test_reconcile_open_orders_orphan_new_not_on_exchange(ex_ctx):
@@ -312,7 +313,7 @@ async def test_reconcile_open_orders_orphan_new_not_on_exchange(ex_ctx):
     account_id = await _add_real_account(ctx)
     service = ctx["service"]
 
-    # Crash: DB'ye NEW yazıldı ama broker'a hiç gitmedi → Binance'te yok
+    # Crash: NEW was written to the DB but never reached the broker → absent on Binance.
     cid = to_client_order_id("orphan-crash")
 
     def _insert(conn):
@@ -349,14 +350,14 @@ async def test_reconcile_open_orders_skips_paper_accounts(ex_ctx):
         account_id=paper["account_id"], symbol="BTCUSDT", side="BUY", order_type="LIMIT",
         quantity=0.5, price=80, idempotency_key="paper-new",
     )
-    # paper hesap reconcile edilmez (borsada gerçek emir yok)
+    # Paper accounts are not reconciled (there is no real exchange order).
     result = await service.reconcile_open_orders()
     assert result["scanned"] == 0
 
 
 async def test_reconcile_open_orders_same_status_partial_fill_syncs(ex_ctx):
-    # 3.18: durum aynı (PARTIALLY_FILLED) kalsa bile executed_qty/avg_price
-    # ilerlemişse reconcile bunları güncellemeli — status eşit diye skip yok.
+    # 3.18: even if status remains the same (PARTIALLY_FILLED), reconcile must
+    # update advanced executed_qty/avg_price—do not skip because status matches.
     ctx = ex_ctx
     account_id = await _add_real_account(ctx)
     service = ctx["service"]
@@ -373,7 +374,7 @@ async def test_reconcile_open_orders_same_status_partial_fill_syncs(ex_ctx):
 
     order_id = await ctx["db"].write(_insert)
 
-    # broker: aynı PARTIALLY_FILLED ama executed_qty 0.5→1.0, avg 100→101 ilerledi
+    # Broker: same PARTIALLY_FILLED, but executed_qty advanced 0.5→1.0 and avg 100→101.
     ctx["broker"].query_results[cid] = OrderResult(
         status="PARTIALLY_FILLED", exchange_order_id="EX-PF",
         executed_qty=1.0, avg_price=101.0,
@@ -381,7 +382,7 @@ async def test_reconcile_open_orders_same_status_partial_fill_syncs(ex_ctx):
 
     result = await service.reconcile_open_orders()
     assert result["scanned"] >= 1
-    assert result["unchanged"] == 0  # status eşit olsa da fill alanları değişti
+    assert result["unchanged"] == 0  # Fill fields changed even though status matched.
     assert result["reconciled"] >= 1
 
     def _q(conn):
@@ -395,7 +396,7 @@ async def test_reconcile_open_orders_same_status_partial_fill_syncs(ex_ctx):
 
 
 async def test_reconcile_open_orders_same_fields_counts_unchanged(ex_ctx):
-    # 3.18: tüm alanlar gerçekten aynıysa unchanged sayılır (gereksiz yazma yok).
+    # 3.18: count as unchanged only when all fields really match (no unnecessary write).
     ctx = ex_ctx
     account_id = await _add_real_account(ctx)
     service = ctx["service"]
@@ -446,7 +447,7 @@ async def test_disable_real_trading_blocks_new_orders(ex_ctx):
         account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="MARKET",
         quantity=1.0, idempotency_key="blocked",
     )
-    # paper moduna düştü → simüle edilir, broker'a gitmez
+    # Fell back to paper mode → simulated, does not call the broker.
     assert result["status"] == "paper"
     assert len(ctx["broker"].placed) == 0
 

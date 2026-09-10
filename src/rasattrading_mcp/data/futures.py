@@ -1,14 +1,16 @@
-"""Futures bağlam verisi (salt-okunur): funding rate, open interest.
+"""Read-only futures context data: funding rate and open interest.
 
-REST periyodik çekim. Her kayıt Binance'in `event_time`'ı ve daemon'un `fetched_at`'iyle
-ayrı ayrı saklanır — ikisi arasındaki fark gecikmeyi gösterir. `freshness` alanı
-fresh|stale|unknown olabilir; `unknown` sembol girdisi likidite skoruna katılmaz.
+Fetched periodically through REST. Each record stores Binance's `event_time` and
+the daemon's `fetched_at` separately; their difference shows the delay.
+`freshness` can be fresh|stale|unknown; an `unknown` symbol entry is excluded from
+the liquidity score.
 
-Liquidation REST ile çekilmez: `/fapi/v1/forceOrders` imzalı USER_DATA endpoint'idir
-(piyasa geneli değil, yalnızca o hesabın likidasyonları) ve imzasız çağrı hep 401
-dönerdi. Piyasa geneli likidasyonlar public `!forceOrder@arr` WebSocket stream'i ile
-alınır — bkz. `data/liquidation_ws.py`. Poller'ın `_last_status["liquidation"]`'ı
-artık pipeline tarafından WS client durumundan (`connected`/`disconnected`) türetilir.
+Liquidations are not fetched through REST: `/fapi/v1/forceOrders` is a signed
+USER_DATA endpoint (it returns only that account's liquidations, not market-wide
+data), and unsigned calls always returned 401. Market-wide liquidations are
+received through the public `!forceOrder@arr` WebSocket stream; see
+`data/liquidation_ws.py`. The poller's `_last_status["liquidation"]` is now derived
+by the pipeline from the WS client's (`connected`/`disconnected`) state.
 """
 
 from __future__ import annotations
@@ -38,11 +40,11 @@ class FuturesContextPoller:
         self._futures_sync_at: float = 0.0
 
     async def _futures_symbol_set(self) -> set[str]:
-        """fapi exchangeInfo'dan TRADING USDT çifti kümesi (TTL'li).
+        """Return the set of TRADING USDT pairs from fapi exchangeInfo (with TTL).
 
-        Spot evrenindeki her sembol futures'ta yoktur (tokenized hisse senetleri,
-        spot-only çiftler). OI poll'ü yalnızca bu kümedeki sembollere istek atar —
-        aksi halde her turda ~100+ gereksiz 400 hatası + log spam üretir.
+        Not every symbol in the spot universe exists in futures (tokenized stocks,
+        spot-only pairs). The OI poll requests only this set; otherwise every pass
+        would produce 100+ unnecessary 400 errors and log spam.
         """
         now = time.time()
         if self._futures_symbols is None or now - self._futures_sync_at >= self._config.futures_universe_ttl_seconds:
@@ -54,7 +56,7 @@ class FuturesContextPoller:
             }
             self._futures_symbols = symbols
             self._futures_sync_at = now
-            logger.info("futures sembol evreni senkronize: %d çift", len(symbols))
+            logger.info("futures symbol universe synchronized: %d pairs", len(symbols))
         return self._futures_symbols
 
     async def poll_funding(self) -> int:
@@ -106,18 +108,18 @@ class FuturesContextPoller:
                 if exc.code == ErrorCode.RATE_LIMITED:
                     self._last_status["open_interest"] = "rate_limited"
                     clean = False
-                    break  # bütçe dolu — bu turu bırak, sonraki turda dene
+                    break  # Budget exhausted; stop this pass and retry on the next one.
                 if exc.code == ErrorCode.INVALID_REQUEST:
-                    # fapi'de olmayan sembol (400): kümeden düşür, her turda tekrarlama
+                    # Symbol unavailable in fapi (400): remove it from the set and do not repeat every pass.
                     if self._futures_symbols is not None and symbol in self._futures_symbols:
                         self._futures_symbols.discard(symbol)
-                        logger.info("fapi'de olmayan sembol OI kümesinden düşürüldü: %s", symbol)
+                        logger.info("removed symbol unavailable in fapi from OI set: %s", symbol)
                     continue
-                logger.warning("openInterest başarısız %s: %s", symbol, exc.message)
+                logger.warning("openInterest failed for %s: %s", symbol, exc.message)
                 self._last_status["open_interest"] = "error"
                 clean = False
-        # "ok" yalnızca döngü hatasız/kesintisiz tamamlandığında yazılır (T2);
-        # aksi halde rate_limited/error gibi gerçek durum korunur.
+        # Write "ok" only when the loop completes without interruption (T2);
+        # otherwise preserve the real state such as rate_limited/error.
         if clean:
             self._last_status["open_interest"] = "ok"
         return total
@@ -126,7 +128,7 @@ class FuturesContextPoller:
         if not rows:
             return
         fetched_at = int(time.time())
-        # row formatı: (symbol, type, value, event_time, extra)
+        # Row format: (symbol, type, value, event_time, extra).
         import json
 
         def _write(conn) -> None:
@@ -144,11 +146,11 @@ class FuturesContextPoller:
         await self._db.write(_write)
 
     async def age_stale_rows(self, now: float | None = None) -> int:
-        """`fresh` satırları yaşlandırır: `futures_stale_after_seconds` süredir
-        yenilenmeyenler `stale` olur.
+        """Age `fresh` rows: rows not refreshed for `futures_stale_after_seconds`
+        become `stale`.
 
-        Poll başarısız olsa bile çalışır — eski futures verisi süresiz `fresh`
-        kalamaz (2.10 fix). Dönen değer yaşlandırılan satır sayısıdır.
+        This runs even when polling fails; old futures data cannot remain `fresh`
+        indefinitely (2.10 fix). Return the number of aged rows.
         """
         now = now if now is not None else time.time()
         cutoff = int(now) - int(self._config.futures_stale_after_seconds)
@@ -162,46 +164,46 @@ class FuturesContextPoller:
 
         aged = await self._db.write(_w)
         if aged:
-            logger.info("futures_context yaşlandırıldı: %d satır", aged)
+            logger.info("aged futures_context: %d rows", aged)
         return aged
 
     async def run_loop(self, stop: asyncio.Event) -> None:
-        """Funding + OI poll'ü her `liquidation_poll_seconds`'ta çalıştırır.
+        """Run the funding and OI poll every `liquidation_poll_seconds`.
 
-        Liquidation bu döngüden ayrıdır — `data/liquidation_ws.py` WebSocket akışı
-        tarafından beslenir (`_last_status["liquidation"]`'ı pipeline, WS client
-        durumundan set eder).
+        Liquidations are separate from this loop and are fed by the WebSocket
+        stream in `data/liquidation_ws.py` (the pipeline sets
+        `_last_status["liquidation"]` from the WS client state).
         """
         while not stop.is_set():
             try:
                 try:
                     await self.age_stale_rows()
                 except Exception:  # noqa: BLE001
-                    logger.exception("futures aging hatası")
+                    logger.exception("futures aging failed")
                 try:
                     await self.poll_funding()
                 except RasatError as exc:
-                    logger.warning("funding poll başarısız: %s", exc.message)
+                    logger.warning("funding poll failed: %s", exc.message)
                     self._last_status["funding"] = "error"
                 try:
                     await self.poll_open_interest()
                 except RasatError as exc:
-                    logger.warning("OI poll başarısız: %s", exc.message)
+                    logger.warning("OI poll failed: %s", exc.message)
                     self._last_status["open_interest"] = "error"
             except asyncio.CancelledError:
                 return
             except Exception:  # noqa: BLE001
-                logger.exception("futures poll döngüsü hatası")
+                logger.exception("futures poll loop failed")
             try:
                 await asyncio.wait_for(stop.wait(), timeout=self._config.liquidation_poll_seconds)
             except asyncio.TimeoutError:
                 pass
 
     def set_liquidation_status(self, status: str) -> None:
-        """Pipeline, WS client durumunu (`connected`/`disconnected`) buraya yazar.
+        """The pipeline writes the WS client state (`connected`/`disconnected`) here.
 
-        REST liquidation poll kaldırıldığı için durum artık `data/liquidation_ws.py`
-        tarafından beslenen public WebSocket stream'inden türetilir.
+        Since REST liquidation polling was removed, the state is derived from the
+        public WebSocket stream provided by `data/liquidation_ws.py`.
         """
         self._last_status["liquidation"] = status
 

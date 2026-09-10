@@ -1,4 +1,4 @@
-"""2.2 — Likidite bölgeleri + futures context testleri."""
+"""2.2 — Liquidity zones + futures context tests."""
 
 import pytest
 
@@ -17,7 +17,7 @@ def mk(rows):
     ]
 
 
-# İki eşit high (101.00 / 101.04) → sonra sweep (102)
+# Two equal highs (101.00 / 101.04) → then sweep (102).
 EQ_HI_SWEPT = [
     (100, 100.5, 99.5, 100),
     (100, 100.5, 99.5, 100),
@@ -26,13 +26,13 @@ EQ_HI_SWEPT = [
     (100, 101, 99.5, 100.5),      # swing high 101.00
     (100.5, 100.5, 100, 100.5),
     (100.5, 100.5, 100, 100.5),
-    (100, 101.04, 99.5, 100.5),   # swing high 101.04 (eşit high)
+    (100, 101.04, 99.5, 100.5),   # swing high 101.04 (equal high).
     (100.5, 100.5, 100, 100.5),
     (100.5, 100.5, 100, 100.5),
     (100.5, 102, 100.5, 101.5),   # sweep: 102 > 101.04
 ]
 
-# Aynı yapı ama sweep yok (fiyat bölgeyi aşmaz)
+# Same structure but no sweep (price does not cross the zone).
 EQ_HI_UNSWEPT = EQ_HI_SWEPT[:-1]
 
 
@@ -76,7 +76,7 @@ def test_equal_lows_zone():
         (99.5, 100.5, 98, 99.5),    # swing low 98
         (99.5, 100, 98.5, 99.5),
         (99.5, 100.5, 99, 100),
-        (100, 100.5, 98.04, 100.5), # swing low 98.04 (eşit low)
+        (100, 100.5, 98.04, 100.5), # swing low 98.04 (equal low).
         (100, 100.5, 99, 100.5),
         (99.5, 100, 98.5, 99.5),
         (99.5, 100.5, 97.9, 99.5),  # sweep: 97.9 < 98.0
@@ -97,13 +97,13 @@ def test_isolated_high_no_zone():
         (100, 100.5, 99.5, 100),
         (99, 100, 98, 99.5),        # swing low 98
         (99.5, 100.5, 99, 100),
-        (100, 101, 99.5, 100.5),    # tek swing high 101 (eşi yok)
+        (100, 101, 99.5, 100.5),    # single swing high 101 (no equal).
         (100, 100, 99.5, 100),
         (100, 100, 99.5, 100),
         (100, 100.5, 99.5, 100),
         (100, 100.5, 99.5, 100),
         (100, 100.5, 99.5, 100),
-        (100.5, 101.2, 100, 100.5),  # yakın ama pivot değil (aralık dışı)
+        (100.5, 101.2, 100, 100.5),  # close but not a pivot (outside range).
     ]
     result = _zones(rows)
     assert [z for z in result["zones"] if z["kind"] == "equal_highs"] == []
@@ -138,7 +138,7 @@ def test_liquidity_score_stale_not_included():
     assert oi["status"] == "stale"
     assert oi["points"] == 0
     assert sc["components"]["funding_rate"]["status"] == "unknown"
-    # Eksik veri gizlenmez: sadece equal_levels katkısı var
+    # Missing data is not hidden: only equal_levels contributes.
     assert sc["score"] == 0.0
 
 
@@ -184,7 +184,7 @@ async def test_load_futures_context_latest_per_type(db):
 
     await db.write(_seed)
     data = await load_futures_context(db, "BTCUSDT")
-    assert data["funding_rate"]["event_time"] == 200  # en son kayıt
+    assert data["funding_rate"]["event_time"] == 200  # Latest record.
     assert data["funding_rate"]["value"] == 0.0002
     assert data["open_interest"]["value"] == 500.0
     assert data["liquidation"]["freshness"] == "stale"  # durum korunur

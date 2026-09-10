@@ -40,7 +40,7 @@ async def test_rate_limit_budget_acquires_and_waits():
     await budget.acquire(5)
     await budget.acquire(5)  # 10/10 dolu
     t0 = time.monotonic()
-    await budget.acquire(2)  # pencere sıfırlanana kadar beklemeli
+    await budget.acquire(2)  # Must wait until the window resets.
     waited = time.monotonic() - t0
     assert waited >= 0.2
     assert budget.total_waits >= 1
@@ -89,11 +89,12 @@ async def test_binance_rest_401_maps_to_unauthorized():
 
 
 async def test_signed_broker_signature_verifies_against_sent_query():
-    """İmza, gönderilen query string'in birebir aynısı üzerinden doğrulanmalı.
+    """Verify the signature against the exact query string that was sent.
 
-    Binance imzayı alınan ham query sırasına göre hesaplar; istemci aiohttp'e
-    params= dict bırakıp sorted() string'i imzalarsa sıra farkı -1022 üretir
-    (canlı API'de yakalanan bug, f8fcd2b sonrası gerçek hesap doğrulaması).
+    Binance calculates the signature from the raw query order it receives; if
+    the client leaves params as a dict for aiohttp but signs a sorted() string,
+    the order mismatch produces -1022 (a bug caught on the live API and real
+    account verification after f8fcd2b).
     """
     import hashlib
     import hmac
@@ -109,7 +110,7 @@ async def test_signed_broker_signature_verifies_against_sent_query():
 
     def _verify(request) -> tuple[bool, dict]:
         qs = request.query_string
-        params = dict(request.query)  # parse edilmiş
+        params = dict(request.query)  # Parsed.
         signature = params.pop("signature", None)
         if not signature:
             return False, {"code": -1022, "msg": "Signature for this request is not valid."}
@@ -185,11 +186,11 @@ async def test_signed_broker_signature_verifies_against_sent_query():
 
 
 async def test_broker_get_balance_detail_includes_locked():
-    """3.21: get_balance_detail free + locked'ı ayrı taşır; get_balance yalnızca free.
+    """3.21: get_balance_detail carries free + locked separately; get_balance only returns free.
 
-    Kullanıcının gerçek hesap testinde açık emirlerde kilitli (locked) miktarlar
-    ve elde tutulan base asset değeri görünmüyordu — bakiye sorgusu locked'ı
-    atıyordu. Broker detayı artık her iki miktarı da döndürür.
+    In the user's real-account test, amounts locked in open orders and the value
+    of held base assets were missing—the balance query discarded locked amounts.
+    Broker details now return both amounts.
     """
     import hashlib
     import hmac
@@ -259,13 +260,13 @@ async def test_universe_sync_filters(cfg, db):
     fake = FakeRest(
         ["BTCUSDT", "ETHUSDT"],
         extra_exchange_entries=[
-            {"symbol": "XXXUSD", "status": "TRADING", "quoteAsset": "USD"},  # USDT değil
-            {"symbol": "DELETEDUSDT", "status": "BREAK", "quoteAsset": "USDT"},  # TRADING değil
+            {"symbol": "XXXUSD", "status": "TRADING", "quoteAsset": "USD"},  # Not USDT.
+            {"symbol": "DELETEDUSDT", "status": "BREAK", "quoteAsset": "USDT"},  # Not TRADING.
         ],
     )
     uni = UniverseService(fake, cfg)
     n = await uni.sync()
-    assert n == 2  # sadece USDT + TRADING
+    assert n == 2  # USDT + TRADING only
     assert uni.contains("BTCUSDT")
     assert not uni.contains("XXXUSD")
     assert not uni.contains("DELETEDUSDT")
@@ -278,7 +279,7 @@ async def test_universe_ensure_contains_unknown(cfg, db):
     uni = UniverseService(fake, cfg)
     await uni.sync()
     assert await uni.ensure_contains("BTCUSDT") is True
-    # bilinmeyen sembol → evren taze ise resync yok → False
+    # Unknown symbol → no resync when universe is fresh → False.
     assert await uni.ensure_contains("NOPEUSDT") is False
 
 
@@ -297,7 +298,7 @@ MINI_PAYLOAD_COMBINED = json.dumps(
 
 
 def test_parse_miniticker():
-    """Gerçek miniTicker öğesi P (price change %) taşımaz — o/c'den hesaplanmalı."""
+    """A real miniTicker item does not carry P (price change %)—calculate it from o/c."""
     updates = parse_miniticker_arr(MINI_PAYLOAD)
     assert len(updates) == 1
     assert updates[0].symbol == "BTCUSDT"
@@ -307,7 +308,7 @@ def test_parse_miniticker():
 
 
 def test_parse_miniticker_with_p_field():
-    """24hr ticker stream'inden gelen P alanı da kabul edilir."""
+    """Accept the P field from the 24hr ticker stream too."""
     payload = json.dumps(
         [{"e": "24hrTicker", "s": "BTCUSDT", "c": "100.5", "o": "99.0", "h": "101.0", "l": "98.0",
           "v": "1000", "q": "100000", "P": "1.52", "E": 1700000000000}]
@@ -317,7 +318,7 @@ def test_parse_miniticker_with_p_field():
 
 
 def test_parse_miniticker_combined_stream_envelope():
-    """Binance combined stream sarmalı ({stream, data}) ayrıştırılmalı (smoke test bulgusu)."""
+    """Parse Binance's combined stream wrapper ({stream, data}) (smoke-test finding)."""
     updates = parse_miniticker_arr(MINI_PAYLOAD_COMBINED)
     assert len(updates) == 1
     assert updates[0].symbol == "BTCUSDT"
@@ -336,7 +337,7 @@ def test_ticker_cache_freshness():
     assert cache.status == "connected"
     assert cache.freshness_for("BTCUSDT") == FRESHNESS_FRESH
 
-    cache.mark_stale("ws kapandı")
+    cache.mark_stale("ws closed")
     assert cache.freshness_for("BTCUSDT") == FRESHNESS_STALE
     assert cache.get("BTCUSDT")["freshness"] == FRESHNESS_STALE
 
@@ -348,7 +349,7 @@ async def test_miniticker_ws_reconnect_marks_stale():
     frame = [dict(s="BTCUSDT", c="100.5", o="99", h="101", l="98", v="100", q="10000", P="1.5", E=0)]
 
     async def handler(ws):
-        # Gerçek Binance gibi combined-stream sarmalı gönder
+        # Send a combined-stream wrapper like real Binance.
         await ws.send(json.dumps({"stream": "!miniTicker@arr", "data": frame}))
         await asyncio.sleep(30)
 
@@ -365,7 +366,7 @@ async def test_miniticker_ws_reconnect_marks_stale():
         assert cache.status == "connected"
         assert cache.get("BTCUSDT") is not None
 
-        # Bağlantıyı kes → WS kopar → veri stale işaretlenmeli
+        # Cut the connection → WS disconnects → data must be marked stale.
         server.close()
         await server.wait_closed()
         for _ in range(100):
@@ -386,7 +387,7 @@ async def test_miniticker_ws_reconnect_marks_stale():
 # ---------- klines ----------
 
 async def test_parse_klines():
-    # Binance ham `open_time` milisaniyedir; tek birim standardı için saniyeye normalize edilir.
+    # Binance raw `open_time` is milliseconds; normalize to seconds for one unit standard.
     raw = [[1700000000000, "1", "2", "0", "1.5", "10", 1700000100000, "100", 5, "0", "0", "0"]]
     rows = parse_klines(raw)
     assert rows[0]["open_time"] == 1700000000
@@ -395,7 +396,7 @@ async def test_parse_klines():
 
 
 async def test_parse_klines_seconds_passthrough():
-    # Zaten saniye olan fixture verisi aynen korunur (FakeRest gibi test verisi).
+    # Fixture data already in seconds is preserved as-is (test data such as FakeRest).
     raw = [[1700000000, "1", "2", "0", "1.5", "10", 1700000100, "100", 5, "0", "0", "0"]]
     rows = parse_klines(raw)
     assert rows[0]["open_time"] == 1700000000
@@ -429,7 +430,7 @@ async def test_get_candles_ondemand_priority_and_store(cfg, db):
         rows = await service.get_candles("BTCUSDT", "15m", 300)
         assert len(rows) == 300
         assert rows[-1]["close"] == 100.5
-        # Öncelik: backfill (prio 10) önce kuyruğa girse de on-demand (prio 0) önce işlenir
+        # Priority: on-demand (prio 0) is processed before backfill (prio 10) even if queued later.
         first_kline_call = next(c for c in fake.calls if c[0] == "/api/v3/klines")
         assert first_kline_call[1] == {"symbol": "BTCUSDT", "interval": "15m", "limit": 300}
     finally:
@@ -445,7 +446,7 @@ async def test_get_candles_warm_no_refetch(cfg, db):
         await service.get_candles("BTCUSDT", "1h", 100)
         kline_calls = [c for c in fake.calls if c[0] == "/api/v3/klines" and c[1].get("symbol") == "BTCUSDT"]
         n_before = len(kline_calls)
-        await service.get_candles("BTCUSDT", "1h", 100)  # warm → yeni fetch yok
+        await service.get_candles("BTCUSDT", "1h", 100)  # Warm → no new fetch.
         kline_calls = [c for c in fake.calls if c[0] == "/api/v3/klines" and c[1].get("symbol") == "BTCUSDT"]
         assert len(kline_calls) == n_before
     finally:
@@ -493,11 +494,11 @@ async def test_get_candles_fetch_error_raises_stale(cfg, db):
 
 
 async def test_store_drops_forming_bar(cfg, db):
-    """Kapalı mum kuralı (1.6): oluşmakta olan (kapanmamış) bar `candles`'a yazılmaz.
+    """Closed-candle rule (1.6): a forming (unclosed) bar is not written to `candles`.
 
-    Binance `/klines` son bar olarak hâlâ oluşmakta olan barı döndürür; kısmi
-    hacimle saklanırsa kapanınca `MAX(open_time)==last_closed` olduğu için
-    catchup tetiklenmez ve son "kapalı" mum kısmi hacimle kalır (90 vs 400-870).
+    Binance `/klines` returns a still-forming bar as the last bar; if stored with
+    partial volume, `MAX(open_time)==last_closed` after it closes, so catch-up is
+    not triggered and the last "closed" candle remains partial (90 vs 400-870).
     """
     from tests.helpers import FakeRest
 
@@ -514,15 +515,15 @@ async def test_store_drops_forming_bar(cfg, db):
 
     period = TIMEFRAME_SECONDS["1h"]
     latest_closed = int(time.time() // period) * period - period
-    forming = latest_closed + period  # şu an oluşmakta olan bar
+    forming = latest_closed + period  # Currently forming bar.
 
     fake = _FormingRest(["BTCUSDT"])
     universe, service = await _make_klines(cfg, db, fake)
     try:
         rows = await service.get_candles("BTCUSDT", "1h", 10)
-        # forming bar dönmez — son bar kapanmış olan olmalı
+        # Forming bar is not returned—the last bar must be closed.
         assert all(r["open_time"] <= latest_closed for r in rows)
-        assert rows[-1]["volume"] == 1000.0  # kısmi hacim (90) saklanmadı
+        assert rows[-1]["volume"] == 1000.0  # Partial volume (90) was not stored.
 
         def _q(conn):
             row = conn.execute(
@@ -538,11 +539,11 @@ async def test_store_drops_forming_bar(cfg, db):
 
 
 async def test_scheduler_catchup_does_not_store_forming_bar(cfg, db):
-    """1.6 yarış durumu: scheduler kapanış tetiklemesi forming bar'ı saklamamalı.
+    """1.6 race condition: scheduler close trigger must not store a forming bar.
 
-    Kapanış tetiklendiğinde Binance'ten limit'lik kline gelir; en son bar hâlâ
-    oluşmakta olabilir. `_store` onu atmalı — aksi halde o bar kapanınca
-    `_needs_catchup` yanlışlıkla "güncel" sanır ve tam hacim hiç çekilmez.
+    When close is triggered, Binance returns a limit-sized kline set; the last bar
+    may still be forming. `_store` must discard it—otherwise, when it closes,
+    `_needs_catchup` incorrectly considers it current and never fetches full volume.
     """
     from tests.helpers import FakeRest
 
@@ -552,9 +553,9 @@ async def test_scheduler_catchup_does_not_store_forming_bar(cfg, db):
     fake = FakeRest(["BTCUSDT"])
     universe, service = await _make_klines(cfg, db, fake)
     try:
-        # Scheduler kapalı mum yakalama: hedef open_time = latest_closed
+        # Scheduler closed-candle capture: target open_time = latest_closed.
         await service._enqueue_closed_bar_pass("1h", latest_closed)
-        # worker'ların bitmesini bekle
+        # Wait for workers to finish.
         for _ in range(200):
             if service._queue.qsize() == 0 and not service._in_flight:
                 break
@@ -632,12 +633,12 @@ def test_parse_force_order():
     assert e.side == "SELL"
     assert e.price == 90000.0
     assert e.qty == 0.5
-    # `E` ms'dir; tek birim standardı gereği saniyeye iner
+    # `E` is milliseconds; convert to seconds for one unit standard.
     assert e.event_time == 1700000000
 
 
 def test_parse_force_order_combined_stream_envelope():
-    """Binance combined stream sarmalı ({stream, data}) ayrıştırılmalı."""
+    """Parse Binance's combined stream wrapper ({stream, data})."""
     events = parse_force_order_arr(FORCE_ORDER_PAYLOAD_COMBINED)
     assert len(events) == 1
     assert events[0].symbol == "BTCUSDT"
@@ -647,13 +648,13 @@ def test_parse_force_order_combined_stream_envelope():
 def test_parse_force_order_garbage_and_bad_fields():
     assert parse_force_order_arr("not json") == []
     assert parse_force_order_arr(json.dumps({"stream": "x"})) == []
-    # eksik/bozuk alan → event atlanır (hata yükseltilmez)
+    # Missing/malformed field → skip event (do not raise an error).
     assert parse_force_order_arr(json.dumps({"o": {"s": "BTCUSDT"}})) == []
     assert parse_force_order_arr(json.dumps({"e": "forceOrder", "o": {"s": "BTCUSDT", "p": "x"}})) == []
 
 
 async def test_liquidation_ws_writes_db_and_marks_stale(cfg, db):
-    """Gerçek WS sunucusundan gelen event DB'ye yazılmalı; kopuk bağlantı `disconnected` yapmalı."""
+    """Write an event from the real WS server to the DB; a broken connection must set `disconnected`."""
     import websockets
 
     frame = json.loads(FORCE_ORDER_PAYLOAD)
@@ -690,7 +691,7 @@ async def test_liquidation_ws_writes_db_and_marks_stale(cfg, db):
         assert extra["side"] == "SELL"
         assert client.events_written == 1
 
-        # Bağlantıyı kes → WS kopar → durum `disconnected`
+        # Cut the connection → WS disconnects → state `disconnected`.
         server.close()
         await server.wait_closed()
         for _ in range(100):
@@ -732,7 +733,7 @@ async def test_pipeline_status_and_ticker(cfg, db):
 
 
 async def test_pipeline_status_derives_liquidation_from_ws(cfg, db):
-    """Liquidation durumu REST poll'dan değil, WS client'tan türetilir."""
+    """Derive liquidation state from the WS client, not REST polling."""
     from tests.helpers import FakeRest
 
     fake = FakeRest(["BTCUSDT"])
@@ -744,4 +745,3 @@ async def test_pipeline_status_derives_liquidation_from_ws(cfg, db):
 
     pipeline.liquidation_ws.mark_connected()
     assert pipeline.status()["futures"]["liquidation"] == "connected"
-

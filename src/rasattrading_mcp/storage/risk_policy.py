@@ -1,21 +1,23 @@
-"""Risk politikası + tek kullanımlık override (ticket 3.2).
+"""Risk policy and one-time override (ticket 3.2).
 
 State machine (override): ``reserved -> applied | reconciled``.
 
-- ``reserved``  : oluşturuldu, sıradaki emir tarafından tüketilebilir.
-- ``applied``   : bir emir tarafından tüketildi (``consumed_by_idem`` kaydedilir).
-- ``reconciled``: artık geçerli değil (süresi doldu / policy versiyonu değişti).
+- ``reserved``  : created and available for consumption by the next order.
+- ``applied``   : consumed by an order (``consumed_by_idem`` is recorded).
+- ``reconciled``: no longer valid (expired or the policy version changed).
 
-Sözleşmeler (mimari plan Bölüm 5.2):
-- ``create_override`` (account_id, idempotency_key) üzerinde idempotenttir: aynı
-  anahtarla retry aynı override'ı döner, ikinci bir override üretmez.
-- ``consume_override`` tek yazma kuyruğunda (transaction seviyesinde) koşullu
-  ``UPDATE ... WHERE state='reserved'`` yapar; iki eşzamanlı emir aynı override'ı
-  tüketemez — ilki kazanır, ikincisi boş döner.
-- Override yalnızca kullanıcı-tanımlı risk politikası cap'lerini bir emir için
-  atlar. Temel doğruluk kontrolleri (3.3) bu modülün dışında kalır ve asla atlanmaz.
-- ``max_notional_per_order`` / ``max_aggregate_exposure`` cap'lerine tolerans
-  uygulanmaz; enforcement 3.4'te ``risk.enforce_policy_caps`` ile yapılır.
+Contracts (architecture plan section 5.2):
+- ``create_override`` is idempotent on (account_id, idempotency_key): a retry
+  with the same key returns the same override and does not create a second one.
+- ``consume_override`` performs a conditional
+  ``UPDATE ... WHERE state='reserved'`` in the single write queue (transaction
+  level); two concurrent orders cannot consume the same override—the first wins
+  and the second gets an empty result.
+- An override bypasses only user-defined risk-policy caps for one order. Basic
+  correctness checks (3.3) remain outside this module and are never skipped.
+- No tolerance is applied to the ``max_notional_per_order`` /
+  ``max_aggregate_exposure`` caps; enforcement is performed by
+  ``risk.enforce_policy_caps`` in 3.4.
 """
 
 from __future__ import annotations
@@ -40,7 +42,7 @@ STATE_RECONCILED = "reconciled"
 
 SCOPE_NEXT_ORDER = "next_order"
 
-#: Override'ların varsayılan ömrü (sn). Süresi dolunca `reconcile_overrides` onları kapatır.
+#: Default override lifetime (seconds). `reconcile_overrides` closes expired overrides.
 DEFAULT_OVERRIDE_TTL_SECONDS = 24 * 3600
 
 _RISK_POLICY_FIELDS = (
@@ -94,16 +96,16 @@ def _validate_optional_amount(value: Any, field: str) -> float | None:
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise RasatError(ErrorCode.INVALID_REQUEST, f"{field} pozitif sayı olmalı")
+        raise RasatError(ErrorCode.INVALID_REQUEST, f"{field} must be a positive number")
     amount = require_finite(value, field)
     if amount <= 0:
-        raise RasatError(ErrorCode.INVALID_REQUEST, f"{field} sıfırdan büyük olmalı")
+        raise RasatError(ErrorCode.INVALID_REQUEST, f"{field} must be greater than zero")
     return amount
 
 
 def _validate_clear_flag(value: Any, field: str) -> bool:
     if not isinstance(value, bool):
-        raise RasatError(ErrorCode.INVALID_REQUEST, f"{field} boolean olmalı")
+        raise RasatError(ErrorCode.INVALID_REQUEST, f"{field} must be a boolean")
     return value
 
 
@@ -111,15 +113,15 @@ def _validate_symbols(value: Any) -> list[str]:
     if value is None:
         return []
     if not isinstance(value, list):
-        raise RasatError(ErrorCode.INVALID_REQUEST, "allowed_symbols string listesi olmalı")
+        raise RasatError(ErrorCode.INVALID_REQUEST, "allowed_symbols must be a list of strings")
     for entry in value:
         if not isinstance(entry, str) or not entry.strip():
-            raise RasatError(ErrorCode.INVALID_REQUEST, "allowed_symbols yalnızca boş olmayan string içermeli")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "allowed_symbols must contain only non-empty strings")
     return _parse_symbols(value)
 
 
 class RiskPolicyService:
-    """Risk politikası + override yönetimi (tek yazma kuyruğu üzerinden)."""
+    """Manage risk policies and overrides through the single write queue."""
 
     def __init__(self, db: Database, audit: AuditLog | None = None) -> None:
         self.db = db
@@ -153,12 +155,12 @@ class RiskPolicyService:
 
     async def get_policy(self, account_id: Any) -> dict[str, Any]:
         if not isinstance(account_id, str) or not account_id.strip():
-            raise RasatError(ErrorCode.INVALID_REQUEST, "account_id zorunlu (string)")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "account_id is required (string)")
         account_id = account_id.strip()
 
         def _get(conn: sqlite3.Connection) -> dict[str, Any]:
             if conn.execute("SELECT 1 FROM accounts WHERE account_id = ?", (account_id,)).fetchone() is None:
-                raise RasatError(ErrorCode.ACCOUNT_NOT_FOUND, f"account bulunamadı: {account_id}")
+                raise RasatError(ErrorCode.ACCOUNT_NOT_FOUND, f"account not found: {account_id}")
             row = conn.execute(
                 "SELECT " + ", ".join(_RISK_POLICY_FIELDS) + " FROM risk_policy WHERE account_id = ?",
                 (account_id,),
@@ -180,7 +182,7 @@ class RiskPolicyService:
         actor: str = "mcp-agent",
     ) -> dict[str, Any]:
         if not isinstance(account_id, str) or not account_id.strip():
-            raise RasatError(ErrorCode.INVALID_REQUEST, "account_id zorunlu (string)")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "account_id is required (string)")
         account_id = account_id.strip()
         max_notional = _validate_optional_amount(max_notional_per_order, "max_notional_per_order")
         max_aggregate = _validate_optional_amount(max_aggregate_exposure, "max_aggregate_exposure")
@@ -191,7 +193,7 @@ class RiskPolicyService:
 
         def _upsert(conn: sqlite3.Connection) -> dict[str, Any]:
             if conn.execute("SELECT 1 FROM accounts WHERE account_id = ?", (account_id,)).fetchone() is None:
-                raise RasatError(ErrorCode.ACCOUNT_NOT_FOUND, f"account bulunamadı: {account_id}")
+                raise RasatError(ErrorCode.ACCOUNT_NOT_FOUND, f"account not found: {account_id}")
             row = conn.execute(
                 "SELECT " + ", ".join(_RISK_POLICY_FIELDS) + " FROM risk_policy WHERE account_id = ?",
                 (account_id,),
@@ -322,38 +324,38 @@ class RiskPolicyService:
         expires_at: Any = None,
         ttl_seconds: float = DEFAULT_OVERRIDE_TTL_SECONDS,
     ) -> dict[str, Any]:
-        """Tek kullanımlık override rezerve eder (idempotent).
+        """Reserve a one-time override (idempotent).
 
-        - Aynı (account_id, idempotency_key) ile tekrar çağrı AYNI override'ı döner;
-          ikinci bir override üretilmez.
-        - `idempotency_key` verilmezse üretilir (yine de çağrı tarafından
-          korunabilmesi için dönüşte raporlanır).
-        - `expires_at` verilmezse now + ttl_seconds.
+        - A repeat call with the same (account_id, idempotency_key) returns the
+          SAME override; a second override is not created.
+        - If `idempotency_key` is omitted, one is generated and returned so the
+          caller can still retain it.
+        - If `expires_at` is omitted, use now + ttl_seconds.
         """
         if not isinstance(account_id, str) or not account_id.strip():
-            raise RasatError(ErrorCode.INVALID_REQUEST, "account_id zorunlu (string)")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "account_id is required (string)")
         account_id = account_id.strip()
         if not isinstance(reason, str) or not reason.strip():
-            raise RasatError(ErrorCode.INVALID_REQUEST, "reason zorunlu (string)")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "reason is required (string)")
         reason = reason.strip()
         if scope != SCOPE_NEXT_ORDER:
-            raise RasatError(ErrorCode.INVALID_REQUEST, "v1 yalnızca scope='next_order' destekler")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "v1 supports only scope='next_order'")
         if idempotency_key is None:
             idempotency_key = uuid.uuid4().hex
         if not isinstance(idempotency_key, str) or not idempotency_key.strip():
-            raise RasatError(ErrorCode.INVALID_REQUEST, "idempotency_key geçerli bir string olmalı")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "idempotency_key must be a valid string")
         idempotency_key = idempotency_key.strip()
         now = int(time.time())
         if expires_at is None:
             expires_at = now + int(ttl_seconds)
         if not isinstance(expires_at, (int, float)) or int(expires_at) <= now:
-            raise RasatError(ErrorCode.INVALID_REQUEST, "expires_at gelecekte bir unix zamanı olmalı")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "expires_at must be a future Unix timestamp")
         expires_at = int(expires_at)
 
         def _create(conn: sqlite3.Connection) -> dict[str, Any]:
             if conn.execute("SELECT 1 FROM accounts WHERE account_id = ?", (account_id,)).fetchone() is None:
-                raise RasatError(ErrorCode.ACCOUNT_NOT_FOUND, f"account bulunamadı: {account_id}")
-            # Idempotent retry: aynı anahtar varsa mevcut override'ı döndür.
+                raise RasatError(ErrorCode.ACCOUNT_NOT_FOUND, f"account not found: {account_id}")
+            # Idempotent retry: return the existing override when the key exists.
             existing = conn.execute(
                 "SELECT " + ", ".join(_OVERRIDE_FIELDS)
                 + " FROM risk_override WHERE account_id = ? AND idempotency_key = ?",
@@ -420,7 +422,7 @@ class RiskPolicyService:
         except sqlite3.IntegrityError:
             raise RasatError(
                 ErrorCode.INVALID_REQUEST,
-                "aynı (account_id, idempotency_key) kombinasyonu zaten var",
+                "the (account_id, idempotency_key) combination already exists",
             ) from None
 
     async def consume_override(
@@ -431,22 +433,23 @@ class RiskPolicyService:
         consumed_by_idem: str,
         now: int | None = None,
     ) -> dict[str, Any] | None:
-        """Tek kullanımlık override'ı transaction seviyesinde tüketir.
+        """Consume a one-time override at the transaction level.
 
-        Uygun (reserved + süresi dolmamış + policy_version eşleşen) bir override
-        varsa onu ``applied`` yapıp döner; yoksa ``None`` döner (cap enforcement
-        devam eder). Tek yazma kuyruğu sayesinde eşzamanlı iki emir aynı
-        override'ı tüketemez: koşullu UPDATE yalnızca `state='reserved'` satırını
-        eşleştirir, ikinci çağrı hiç satır güncellemeden `None` alır.
+        If a suitable override (reserved, unexpired, and matching the policy
+        version) exists, mark it ``applied`` and return it; otherwise return
+        ``None`` and continue cap enforcement. The single write queue prevents
+        two concurrent orders from consuming the same override: the conditional
+        UPDATE matches only the `state='reserved'` row, so the second call gets
+        ``None`` without updating any row.
 
-        3.4 sıralaması: temel doğruluk kontrollerini ÖNCE çalıştır, sonra bu
-        metodu çağır, sonra emri gönder — override yalnızca cap'leri atlar,
-        doğruluk kontrollerini asla atlamaz.
+        3.4 ordering: run basic correctness checks FIRST, then call this method,
+        then send the order—an override bypasses caps only and never bypasses
+        correctness checks.
         """
         if not isinstance(account_id, str) or not account_id.strip():
-            raise RasatError(ErrorCode.INVALID_REQUEST, "account_id zorunlu (string)")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "account_id is required (string)")
         if not isinstance(consumed_by_idem, str) or not consumed_by_idem.strip():
-            raise RasatError(ErrorCode.INVALID_REQUEST, "consumed_by_idem zorunlu (string)")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "consumed_by_idem is required (string)")
         account_id = account_id.strip()
         now = int(time.time()) if now is None else int(now)
 
@@ -488,10 +491,10 @@ class RiskPolicyService:
         return await self.db.write(_consume)
 
     async def get_active_override(self, account_id: Any, *, policy_version: int, now: int | None = None) -> dict | None:
-        """Salt-okunur kontrol: tüketilebilir bir override var mı? (tüketmez)."""
+        """Read-only check for a consumable override (does not consume it)."""
 
         if not isinstance(account_id, str) or not account_id.strip():
-            raise RasatError(ErrorCode.INVALID_REQUEST, "account_id zorunlu (string)")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "account_id is required (string)")
         account_id = account_id.strip()
         now = int(time.time()) if now is None else int(now)
 
@@ -517,7 +520,7 @@ class RiskPolicyService:
         actor: str,
         reason: str,
     ) -> None:
-        """Reserved override'ların policy_version eşleşmeyenlerini kapatır."""
+        """Close reserved overrides whose policy_version does not match."""
         rows = conn.execute(
             "SELECT override_id FROM risk_override WHERE account_id = ? AND state = ? AND policy_version != ?",
             (account_id, STATE_RESERVED, keep_version),
@@ -537,7 +540,7 @@ class RiskPolicyService:
                 )
 
     async def reconcile_overrides(self, *, now: int | None = None) -> int:
-        """Süresi dolan reserved override'ları `reconciled`'a kapatır (daemon açılışı)."""
+        """Close expired reserved overrides as `reconciled` (daemon startup)."""
 
         now = int(time.time()) if now is None else int(now)
 

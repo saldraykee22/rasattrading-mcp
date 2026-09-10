@@ -1,10 +1,10 @@
-"""2.20 FIX — STOP_LOSS_LIMIT (spot stop koruması) desteği.
+"""2.20 FIX — STOP_LOSS_LIMIT (spot stop protection) support.
 
-Kullanıcı akışı: gerçek ALICE pozisyonu açıldı (market BUY) ama borsa tarafında
-koruyucu emir yoktu; sistem yalnızca MARKET/LIMIT gönderebiliyordu. Bu fix:
-- `BinanceOrderBroker.place_order` STOP_LOSS_LIMIT + stopPrice gönderir,
-- `OrderService.place_order` stop_price'ı doğrular, kaydeder, broker'a taşır,
-- orders kaydı stop_price sütunu taşır (migration 9).
+User flow: a real ALICE position was opened (market BUY) but had no protective
+exchange order; the system could send only MARKET/LIMIT. This fix:
+- `BinanceOrderBroker.place_order` sends STOP_LOSS_LIMIT + stopPrice,
+- `OrderService.place_order` validates, records, and passes stop_price to broker,
+- orders record carries stop_price column (migration 9).
 """
 
 import time
@@ -36,7 +36,7 @@ async def db(cfg):
 
 
 async def test_broker_stop_loss_limit_params():
-    """STOP_LOSS_LIMIT: stopPrice + price + GTC gönderilir, stop yoksa reddedilir."""
+    """STOP_LOSS_LIMIT: send stopPrice + price + GTC; reject when stop is missing."""
     import hashlib
     import hmac
 
@@ -107,7 +107,7 @@ async def test_broker_stop_loss_limit_params():
         finally:
             await broker.close()
 
-    # stop_price eksik → reddedilmeli
+    # Missing stop_price must be rejected.
     broker2 = BinanceOrderBroker("http://127.0.0.1:1", creds, budget=RateLimitBudget(6000))
     from rasattrading_mcp.errors import ErrorCode, RasatError
 
@@ -121,7 +121,7 @@ async def test_broker_stop_loss_limit_params():
 
 
 async def test_order_service_place_stop_persists_stop_price(cfg, db):
-    """Stop emri order kaydına stop_price ile yazılır ve broker'a taşınır."""
+    """Stop order is written to order record with stop_price and passed to broker."""
     class _FakeAccounts:
         async def get_account(self, account_id):
             return {"account_id": account_id, "trading_lock": "paper", "market": "spot"}
@@ -179,7 +179,7 @@ async def test_order_service_place_stop_persists_stop_price(cfg, db):
     )
     assert result["stop_price"] == 0.1225
     assert result["price"] == 0.1220
-    # paper hesap broker'a gitmez (doğru davranış) — kayıt ve audit izi yeterli
+    # Paper account does not call broker (correct behavior)—record and audit trail are sufficient.
     assert broker.placed == []
 
     def _q(conn):

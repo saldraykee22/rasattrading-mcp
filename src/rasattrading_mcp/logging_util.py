@@ -1,6 +1,6 @@
-"""Loglama yardımcıları.
+"""Logging helpers.
 
-Adapter stdio protokolünü bozmamak için stdout'a ASLA yazmaz; sadece stderr ve/veya dosyaya.
+Never write to stdout, so the adapter's stdio protocol is preserved; write only to stderr and/or a file.
 """
 
 from __future__ import annotations

@@ -1,15 +1,17 @@
-"""Tüm piyasa likidasyon akışı (`!forceOrder@arr`) websocket'i.
+"""Market-wide liquidation stream (`!forceOrder@arr`) WebSocket.
 
-`/fapi/v1/forceOrders` imzalı USER_DATA endpoint'idir — yalnızca o API anahtarının
-hesabının likidasyonlarını döndürür, piyasa genelini DEĞİL. Piyasa geneli likidasyonlar
-için Binance'in PUBLIC futures WebSocket stream'i `wss://fstream.binance.com/ws/!forceOrder@arr`
-kullanılır (imza gerekmez, tüm sembollerdeki likidasyon emirlerini yayınlar).
+`/fapi/v1/forceOrders` is a signed USER_DATA endpoint; it returns only the
+liquidations for the account associated with that API key, NOT market-wide data.
+For market-wide liquidations, use Binance's PUBLIC futures WebSocket stream
+`wss://fstream.binance.com/ws/!forceOrder@arr` (no signature required; it broadcasts
+liquidation orders for all symbols).
 
-Her event doğrudan `futures_context` tablosuna `type='liquidation'` olarak yazılır
-(`FuturesContextPoller._store` ile aynı INSERT deseni; `value = price*qty`, `extra`
-side/price/qty içerir). WS kopması/gecikme durumunda durum `disconnected` işaretlenir —
-sessizce eski veri `fresh` gibi dönmez. Reconnect exponential backoff ile,
-watchdog kopuk bağlantıyı kapatır (miniticker.py deseni).
+Each event is written directly to the `futures_context` table as
+`type='liquidation'` (the same INSERT pattern as `FuturesContextPoller._store`,
+with `value = price*qty` and `extra` containing side/price/qty). On WS disconnect
+or delay, mark the state `disconnected`; do not silently return old data as
+`fresh`. Reconnect with exponential backoff, and let the watchdog close stalled
+connections (the miniticker.py pattern).
 """
 
 from __future__ import annotations
@@ -37,13 +39,13 @@ class LiquidationEvent:
 
 
 def parse_force_order_arr(raw: str | bytes) -> list[LiquidationEvent]:
-    """`!forceOrder@arr` payload'unu LiquidationEvent listesine çevirir.
+    """Convert an `!forceOrder@arr` payload to a list of LiquidationEvent objects.
 
-    Binance futures forceOrder event'i `{"e":"forceOrder","E":<eventTime>,"o":{...}}`
-    biçimindedir (o alanı sembol/side/fiyat/miktarı taşır). Combined stream
-    (`/stream?streams=!forceOrder@arr`) her mesajı `{"stream":..., "data":...}`
-    sarmalıyla gönderir — iki form da, ayrıca savunmacı olarak liste formu da
-    kabul edilir. Eksik/bozuk alan içeren event'ler atlanır.
+    A Binance futures forceOrder event has the form
+    `{"e":"forceOrder","E":<eventTime>,"o":{...}}` (`o` carries symbol/side/price/quantity).
+    The combined stream (`/stream?streams=!forceOrder@arr`) wraps each message as
+    `{"stream":..., "data":...}`; accept both forms and, defensively, a list form.
+    Skip events with missing or malformed fields.
     """
     data = None
     try:
@@ -64,8 +66,8 @@ def parse_force_order_arr(raw: str | bytes) -> list[LiquidationEvent]:
             order = item.get("o")
             if not isinstance(order, dict):
                 continue
-            # `E` (event time) ms'dir; yoksa `T` (trade time) düşülür — ikisi de
-            # tek birim standardı gereği `to_epoch_seconds` ile saniyeye iner.
+            # `E` (event time) is in ms; fall back to `T` (trade time) if absent.
+            # Both are converted to seconds by `to_epoch_seconds` for one standard unit.
             event_time = to_epoch_seconds(item.get("E") or order.get("T") or 0)
             events.append(
                 LiquidationEvent(
@@ -82,12 +84,12 @@ def parse_force_order_arr(raw: str | bytes) -> list[LiquidationEvent]:
 
 
 class LiquidationWSClient:
-    """forceOrder WS bağlantısı: reconnect backoff + stale watchdog + DB'ye doğrudan yazma.
+    """forceOrder WS connection: reconnect backoff, stale watchdog, and direct DB writes.
 
-    `stale_after` varsayılanı miniTicker'dan büyüktür: `!forceOrder@arr` düşük
-    frekanslıdır (sessiz dönemlerde dakikalarca event gelmeyebilir), bu yüzden
-    kısa bir timeout gerçek canlı bağlantıyı da yanlışlıkla `stale` yapardı.
-    Kopuk bağlantı zaten `ping_interval/ping_timeout` (20s) ile hızlıca yakalanır.
+    The default `stale_after` is longer than miniTicker's: `!forceOrder@arr` is
+    low-frequency (no events may arrive for minutes during quiet periods), so a
+    short timeout would incorrectly mark a live connection as `stale`. A broken
+    connection is already detected quickly by `ping_interval/ping_timeout` (20s).
     """
 
     def __init__(self, url: str, db, stale_after: float = 300.0) -> None:
@@ -136,9 +138,9 @@ class LiquidationWSClient:
         }
 
     async def _store(self, rows: list[tuple]) -> None:
-        """`futures_context`'e `type='liquidation'` satırları yazar (poller deseni).
+        """Write `type='liquidation'` rows to `futures_context` (poller pattern).
 
-        row formatı: (symbol, "liquidation", value=price*qty, event_time, extra).
+        Row format: (symbol, "liquidation", value=price*qty, event_time, extra).
         """
         if not rows:
             return
@@ -159,7 +161,7 @@ class LiquidationWSClient:
         await self._db.write(_write)
 
     async def _handle_raw(self, raw: str | bytes) -> None:
-        """Bir WS mesajını ayrıştırıp DB'ye yazar. DB hatası bağlantıyı düşürmez."""
+        """Parse one WS message and write it to the DB. DB errors do not drop the connection."""
         events = parse_force_order_arr(raw)
         if events:
             rows = [
@@ -176,7 +178,7 @@ class LiquidationWSClient:
                 await self._store(rows)
                 self._events_written += len(rows)
             except Exception:  # noqa: BLE001
-                logger.exception("liquidation DB yazma hatası")
+                logger.exception("liquidation DB write failed")
         self._last_message_at = time.time()
         self.mark_connected()
 
@@ -185,7 +187,7 @@ class LiquidationWSClient:
         while not stop.is_set():
             try:
                 async with websockets.connect(self._url, ping_interval=20, ping_timeout=20, max_size=16 * 1024 * 1024) as ws:
-                    logger.info("forceOrder WS bağlandı")
+                    logger.info("forceOrder WS connected")
                     self.mark_connected()
                     backoff = 1.0
                     async for raw in ws:
@@ -193,15 +195,15 @@ class LiquidationWSClient:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
-                self.mark_stale(f"ws hatası: {exc}")
-                logger.warning("forceOrder WS kapandı: %s (backoff=%ss)", exc, round(backoff, 1))
+                self.mark_stale(f"WS error: {exc}")
+                logger.warning("forceOrder WS disconnected: %s (backoff=%ss)", exc, round(backoff, 1))
             if stop.is_set():
                 break
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60.0)
 
     async def run(self, stop: asyncio.Event) -> None:
-        """Bağlantı + watchdog: mesaj akışı durursa bağlantı iptal edilip yeniden kurulur."""
+        """Connection plus watchdog: cancel and rebuild the connection when the message stream stops."""
         check_interval = max(self._stale_after / 2, 5.0)
         while not stop.is_set():
             conn_task = asyncio.create_task(self._connect_loop(stop))
@@ -209,7 +211,7 @@ class LiquidationWSClient:
                 while not conn_task.done():
                     await asyncio.sleep(check_interval)
                     if self.status == "connected" and not self.is_fresh():
-                        self.mark_stale("mesaj akışı durdu — reconnect")
+                        self.mark_stale("message stream stopped — reconnect")
                         conn_task.cancel()
             except asyncio.CancelledError:
                 conn_task.cancel()

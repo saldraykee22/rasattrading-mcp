@@ -1,11 +1,11 @@
-"""SQLite bağlantı yönetimi: WAL + tek yazma kuyruğu + paralel okuyucular.
+"""SQLite connection management: WAL, a single write queue, and parallel readers.
 
-Eşzamanlılık modeli:
-- TÜM yazmalar daemon içindeki tek bir yazıcı görevi üzerinden geçer (sıralı commit).
-- Yazıcı bağlantısı TEK bir thread'te yaşar (max_workers=1 executor) — SQLite bağlantıları
-  thread-affine olduğu için yazma operasyonları hep aynı thread'te çalışır.
-- Okumalar WAL sayesinde yazmalarla paraleldir; her okuma kendi bağlantısını açar,
-  açar-kullanır-kapatır (aynı thread call içinde), varsayılan executor pool'unda koşar.
+Concurrency model:
+- ALL writes go through one writer task in the daemon (serialized commits).
+- The writer connection lives on ONE thread (max_workers=1 executor); SQLite
+  connections are thread-affine, so writes always run on the same thread.
+- WAL lets reads run alongside writes; each read opens/uses/closes its own
+  connection in one thread call on the default executor pool.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ _READER_CONNECT_TIMEOUT = 30
 
 
 class Database:
-    """Tek yazıcı (serialized, tek thread) + paralel okuma sunan SQLite sarmalayıcı."""
+    """SQLite wrapper with one serialized writer thread and parallel reads."""
 
     def __init__(self, path: Path, busy_timeout_ms: int = 30_000) -> None:
         self.path = path
@@ -38,10 +38,10 @@ class Database:
         self._writer_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dbwriter")
         self._closed = asyncio.Event()
 
-    # ---------- bağlantılar ----------
+    # ---------- connections ----------
 
     def connect(self) -> sqlite3.Connection:
-        """Yeni bir SQLite bağlantısı (WAL, FK, busy_timeout)."""
+        """Create a new SQLite connection (WAL, FK, busy_timeout)."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(self.path), timeout=_READER_CONNECT_TIMEOUT)
         conn.row_factory = sqlite3.Row
@@ -51,7 +51,7 @@ class Database:
         conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
-    # ---------- yazma kuyruğu ----------
+    # ---------- write queue ----------
 
     async def start(self) -> None:
         self._closed.clear()
@@ -59,7 +59,7 @@ class Database:
 
     async def _writer_loop(self) -> None:
         loop = asyncio.get_running_loop()
-        # Bağlantı, yazma operasyonlarıyla AYNI thread'te (tek thread'lik executor) açılır
+        # Open the connection on the SAME thread as write operations (single-thread executor).
         conn = await loop.run_in_executor(self._writer_executor, self.connect)
         try:
             while True:
@@ -84,21 +84,21 @@ class Database:
 
     @staticmethod
     def _run_write(conn: sqlite3.Connection, fn: WriteFn) -> Any:
-        with conn:  # tek transaction
+        with conn:  # one transaction
             return fn(conn)
 
     async def write(self, fn: WriteFn) -> Any:
-        """fn'i yazma kuyruğuna koyar, sıralı commit edilir, sonucu döner."""
+        """Queue fn for writing, commit serially, and return its result."""
         if self._closed.is_set():
-            raise RuntimeError("database kapatıldı")
+            raise RuntimeError("database is closed")
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         await self._queue.put((fn, fut))
         return await fut
 
-    # ---------- okuma ----------
+    # ---------- reads ----------
 
     async def read(self, fn: ReadFn) -> Any:
-        """Kısa ömürlü bir okuma bağlantısı açar (WAL sayesinde yazma ile çakışmaz)."""
+        """Open a short-lived read connection (WAL prevents write conflicts)."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._read_impl, fn)
 
@@ -109,7 +109,7 @@ class Database:
         finally:
             conn.close()
 
-    # ---------- kapanış ----------
+    # ---------- shutdown ----------
 
     async def stop(self) -> None:
         if self._closed.is_set():

@@ -111,14 +111,14 @@ async def test_rpc_invalid_body(cfg, client):
 
 
 async def test_rpc_missing_required_param_still_400_with_service(cfg):
-    """Alarm servisi mevcutken eksik parametre 400 döner (canlı daemon senaryosu).
+    """With alert service available, missing parameter returns 400 (live daemon scenario).
 
-    Handler'lar `params["x"]` deseniyle okur; eksik anahtar KeyError üretip
-    generic except'e düşüyordu → 500. İstemci hatasıdır, doğru kod 400'tür.
+    Handlers read with `params["x"]`; a missing key raised KeyError and fell into
+    generic except → 500. This is a client error; correct status is 400.
     """
     class _StubAlarmService:
         async def create_alert(self, symbol, timeframe, condition, **kwargs):
-            raise AssertionError("handler eksik parametreyi servise ulaştırmamalı")
+            raise AssertionError("handler must not pass the missing parameter to the service")
 
     readiness = Readiness()
     for s in ["starting", "migrating", "warming_up", "ready"]:
@@ -144,11 +144,11 @@ async def test_rpc_missing_required_param_still_400_with_service(cfg):
             body = await resp.json()
             assert body["ok"] is False
             assert body["error"]["code"] == "INVALID_REQUEST"
-            assert "eksik zorunlu parametre" in body["error"]["message"]
+            assert "missing required parameter" in body["error"]["message"]
 
 
 async def test_not_ready_fails_closed_for_regular_tool(cfg):
-    # normal bir tool ready olmadan reddedilmeli (NOT_READY fail-closed)
+    # A regular tool must be rejected before the server is ready (NOT_READY fail-closed).
     REGISTRY.register(
         ToolSpec(name="test_requires_ready", description="", input_schema={"type": "object", "properties": {}})
     )

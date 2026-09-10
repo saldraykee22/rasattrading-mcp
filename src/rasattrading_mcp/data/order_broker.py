@@ -1,15 +1,15 @@
-"""Emir broker'ı (ticket 3.4): Binance signed order/balance + soyut arayüz.
+"""Order broker (ticket 3.4): Binance signed orders/balances plus an abstract interface.
 
-`OrderBroker` bir Protocol'dür; testler `FakeOrderBroker` kullanır, üretim
-`BinanceOrderBroker` ile çalışır.
+`OrderBroker` is a Protocol; tests use `FakeOrderBroker`, while production uses
+`BinanceOrderBroker`.
 
-- `place_order` → emir gönderir (clientOrderId ile), gerçek Binance state'i döner.
-- `query_order` → reconcile-before-retry için tekil emri `clientOrderId` ile sorgular.
-- `query_oco` → OCO listesini `listClientOrderId` ile sorgular.
-- `cancel_oco` → OCO listesini `listClientOrderId` ile iptal eder (kill switch).
-- `get_balance` → daemon'ın kendi taze bakiye snapshot'ı (agent rakamlarına güvenilmez).
+- `place_order` → submit an order (with clientOrderId) and return the real Binance state.
+- `query_order` → query one order by `clientOrderId` for reconcile-before-retry.
+- `query_oco` → query an OCO list by `listClientOrderId`.
+- `cancel_oco` → cancel an OCO list by `listClientOrderId` (kill switch).
+- `get_balance` → the daemon's own fresh balance snapshot (do not trust agent figures).
 
-Status değerleri Binance'in gerçek state machine'ini yansıtır:
+Status values mirror Binance's real state machine:
 NEW | PARTIALLY_FILLED | FILLED | CANCELED | REJECTED | EXPIRED | UNKNOWN.
 """
 
@@ -41,7 +41,7 @@ CredentialsProvider = Callable[[str], Awaitable[tuple[str, str]]]
 
 @dataclass(frozen=True)
 class OrderResult:
-    """Broker'dan dönen emir durumu (canonical, Binance'e birebir değil)."""
+    """Order status returned by the broker (canonical, not an exact Binance copy)."""
 
     status: str
     exchange_order_id: str | None = None
@@ -108,10 +108,10 @@ class OrderBroker(Protocol):
 
 
 def to_client_order_id(idempotency_key: str) -> str:
-    """idempotency_key'den güvenli, deterministic bir Binance clientOrderId üretir.
+    """Generate a safe, deterministic Binance clientOrderId from an idempotency_key.
 
-    Binance clientOrderId: max 36 char, [A-Za-z0-9._-]. Deterministic olduğu için
-    aynı idempotency_key retry'i aynı clientOrderId'ye bağlanır → reconcile çalışır.
+    Binance clientOrderId: max 36 chars, [A-Za-z0-9._-]. Because it is deterministic,
+    retries with the same idempotency_key use the same clientOrderId → reconciliation works.
     """
     allowed = "".join(ch for ch in idempotency_key if ch.isalnum() or ch in "._-")
     if not allowed:
@@ -123,7 +123,7 @@ def to_client_order_id(idempotency_key: str) -> str:
 
 
 class BinanceOrderBroker:
-    """Binance spot signed REST client (HMAC-SHA256). Test dışında üretim kullanımı."""
+    """Binance spot signed REST client (HMAC-SHA256). Use in production only outside tests."""
 
     def __init__(
         self,
@@ -142,10 +142,10 @@ class BinanceOrderBroker:
         self._own_session = session is None
         self._recv_window_ms = recv_window_ms
         self._timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-        #: T1-koord: imzalı istek timestamp'i için BinanceClock (server-time
-        #: offset'li). Verilirse `_signed_request_url` `clock.server_now()` kullanır;
-        #: verilmezse (veya clock fail-closed → None) eski `time.time()` fallback'i
-        #: korunur — geriye uyumluluk.
+        #: T1 coordination: BinanceClock with a server-time offset for signed-request
+        #: timestamps. If supplied, `_signed_request_url` uses `clock.server_now()`;
+        #: otherwise (or when the clock fails closed → None), retain the old
+        #: `time.time()` fallback for backward compatibility.
         self._clock = clock
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -154,11 +154,11 @@ class BinanceOrderBroker:
         return self._session
 
     def _now_ms(self) -> int:
-        """İmzalı istek timestamp'i (ms).
+        """Timestamp for a signed request (ms).
 
-        `clock` verilmişse ve `server_now()` güvenilir sunucu zamanı döndürüyorsa
-        onu kullan (host saat kaymasına karşı -1021/1022 koruması); clock yoksa
-        veya fail-closed (None) ise eski yerel `time.time()` fallback'i.
+        If `clock` is supplied and `server_now()` returns reliable server time,
+        use it (protects against host-clock drift and -1021/1022); if no clock is
+        available or it fails closed (None), use the old local `time.time()` fallback.
         """
         if self._clock is not None:
             server_now = self._clock.server_now()
@@ -167,12 +167,12 @@ class BinanceOrderBroker:
         return int(time.time() * 1000)
 
     async def _signed_request_url(self, account_id: str, path: str, params: dict) -> tuple[str, str]:
-        """İmzalı isteğin (api_key, tam URL) çiftini üretir.
+        """Build the (api_key, full URL) pair for a signed request.
 
-        İmza, yarl'ın üreteceği query string'in BİREBİR aynısı üzerinden
-        hesaplanır (Binance, gönderilen ham query sırasına göre doğrular).
-        aiohttp'e params= dict'i bırakılırsa yarl kendi ekleme sırasını kullanır
-        ve sorted() imzalı string'le uyuşmaz — canlı API'de -1022 üretir.
+        Compute the signature over exactly the query string yarl will generate
+        (Binance verifies the raw query in the order sent). If the params dict is
+        passed to aiohttp, yarl chooses its own insertion order, which does not
+        match the sorted signed string and produces -1022 on the live API.
         """
         api_key, api_secret = await self._credentials(account_id)
         base = dict(params)
@@ -197,7 +197,7 @@ class BinanceOrderBroker:
                 if used and used.isdigit() and self._budget is not None:
                     self._budget.note_used(int(used))
                 if resp.status in (401, 403):
-                    raise RasatError(ErrorCode.UNAUTHORIZED, f"Binance {resp.status} — geçersiz API key ({path})")
+                    raise RasatError(ErrorCode.UNAUTHORIZED, f"Binance {resp.status} — invalid API key ({path})")
                 if resp.status >= 400:
                     try:
                         body = await resp.json()
@@ -210,9 +210,9 @@ class BinanceOrderBroker:
         except (aiohttp.ClientError, asyncio.TimeoutError, RasatError) as exc:
             if isinstance(exc, RasatError):
                 raise
-            # T01: asyncio.TimeoutError çıplak kaçmaz — canonical TIMEOUT'a map edilir.
-            # OrderService bu kodla tek reconcile yoluna girer; kör retry üretilmez.
-            raise RasatError(ErrorCode.TIMEOUT, f"Binance istek zaman aşımı/hatası ({path}): {exc}") from exc
+            # T01: do not let asyncio.TimeoutError escape; map it to canonical TIMEOUT.
+            # OrderService enters the single reconciliation path for this code; no blind retry.
+            raise RasatError(ErrorCode.TIMEOUT, f"Binance request timed out/failed ({path}): {exc}") from exc
 
     @staticmethod
     def _order_result(data: dict) -> OrderResult:
@@ -255,15 +255,15 @@ class BinanceOrderBroker:
         }
         if order_type.upper() == "LIMIT":
             if price is None:
-                raise RasatError(ErrorCode.INVALID_REQUEST, "limit emirde price zorunlu")
+                raise RasatError(ErrorCode.INVALID_REQUEST, "price is required for a limit order")
             params["price"] = str(price)
             params["timeInForce"] = "GTC"
         elif order_type.upper() == "STOP_LOSS_LIMIT":
-            # Spot stop koruması: stopPrice'a ulaşınca LIMIT satış tetiklenir.
+            # Spot stop protection: reaching stopPrice triggers the LIMIT sale.
             if stop_price is None:
-                raise RasatError(ErrorCode.INVALID_REQUEST, "stop emirde stop_price zorunlu")
+                raise RasatError(ErrorCode.INVALID_REQUEST, "stop_price is required for a stop order")
             if price is None:
-                raise RasatError(ErrorCode.INVALID_REQUEST, "stop emirde price zorunlu")
+                raise RasatError(ErrorCode.INVALID_REQUEST, "price is required for a stop order")
             params["stopPrice"] = str(stop_price)
             params["price"] = str(price)
             params["timeInForce"] = "GTC"
@@ -284,18 +284,18 @@ class BinanceOrderBroker:
         stop_limit_price: float,
         client_order_id: str,
     ) -> OrderResult:
-        """Spot OCO emri (`/api/v3/orderList/oco`): LIMIT_MAKER + STOP_LOSS_LIMIT tek istekte.
+        """Spot OCO order (`/api/v3/orderList/oco`): LIMIT_MAKER + STOP_LOSS_LIMIT in one request.
 
-        Biri dolunca diğeri borsada otomatik iptal olur (true OCO garantisi).
-        SELL (long kapatma): `above` = kâr hedefi (LIMIT_MAKER, fiyatın üstü),
-        `below` = stop (STOP_LOSS_LIMIT, fiyatın altı).
-        BUY (short kapatma): `above` = stop, `below` = kâr hedefi.
+        When one fills, the exchange automatically cancels the other (true OCO guarantee).
+        SELL (close long): `above` = profit target (LIMIT_MAKER, above the price),
+        `below` = stop (STOP_LOSS_LIMIT, below the price).
+        BUY (close short): `above` = stop, `below` = profit target.
 
-        Binance `/orderList/oco` zorunlu `aboveType`/`belowType` taşır (2026-04+);
-        eski düz `price`/`stopPrice`/`stopLimitPrice` biçimi "Mandatory parameter
-        'aboveType' was not sent" ile reddedilir — canlı doğrulandı (07.08).
-        `price` = kâr hedefi (limit), `stop_price` = stop tetikleme,
-        `stop_limit_price` = stop tetiklenince satılacak limit fiyatı.
+        Binance `/orderList/oco` requires `aboveType`/`belowType` (2026-04+);
+        the old flat `price`/`stopPrice`/`stopLimitPrice` form is rejected with
+        "Mandatory parameter 'aboveType' was not sent" — verified live (07.08).
+        `price` = profit-target limit, `stop_price` = stop trigger,
+        `stop_limit_price` = limit price sold when the stop triggers.
         """
         params: dict[str, Any] = {
             "symbol": symbol,
@@ -318,7 +318,7 @@ class BinanceOrderBroker:
             params["belowPrice"] = str(stop_limit_price)
             params["belowTimeInForce"] = "GTC"
         data = await self._request("POST", "/api/v3/orderList/oco", account_id, params)
-        # OCO yanıtı orderListId taşır (orderId değil) — listeyi iz olarak sakla.
+        # OCO responses carry orderListId (not orderId); store the list as the trace.
         return OrderResult(
             status="NEW",
             exchange_order_id=str(data.get("orderListId")) if data.get("orderListId") is not None else None,
@@ -336,19 +336,19 @@ class BinanceOrderBroker:
                 {"symbol": symbol, "origClientOrderId": client_order_id},
             )
         except RasatError as exc:
-            # -2013 emir yok → None (yeniden gönderim güvenli)
+            # -2013 order not found → None (safe to resubmit).
             if exc.code == ErrorCode.ORDER_REJECTED and exc.details and exc.details.get("binance_code") == -2013:
                 return None
             raise
         return self._order_result(data)
 
     async def query_oco(self, *, account_id: str, list_client_order_id: str) -> OrderResult | None:
-        """OCO'yu `listClientOrderId` ile sorgular (`GET /api/v3/orderList`).
+        """Query the OCO by `listClientOrderId` (`GET /api/v3/orderList`).
 
-        `query_order`'dan farklı: OCO'nun bacakları Binance'in kendi ürettiği
-        clientOrderId'leri taşır, bizim `listClientOrderId`'imiz yalnızca
-        orderList seviyesinde sorgulanabilir — tekil `/api/v3/order` ile
-        bulunamaz (bu yüzden eskiden hep UNKNOWN'a düşüyordu).
+        Unlike `query_order`, OCO legs carry clientOrderIds generated by Binance;
+        our `listClientOrderId` can only be queried at the order-list level and
+        cannot be found through individual `/api/v3/order` (which previously
+        caused everything to become UNKNOWN).
         """
         try:
             data = await self._request(
@@ -362,9 +362,9 @@ class BinanceOrderBroker:
                 return None
             raise
         list_status = str(data.get("listOrderStatus") or "").upper()
-        # EXECUTING = OCO hâlâ borsada aktif/canlı (koruma yerinde) → NEW.
-        # ALL_DONE = bacaklardan biri doldu/iptal oldu, liste tamamlandı → terminal.
-        # Diğer/bilinmeyen değerler UNKNOWN'a düşer (körlemesine "canlı" varsayılmaz).
+        # EXECUTING = OCO is still active/alive on the exchange (protection in place) → NEW.
+        # ALL_DONE = one leg filled/canceled and the list completed → terminal.
+        # Other/unknown values become UNKNOWN (never blindly assume "alive").
         if list_status == "EXECUTING":
             status = "NEW"
         elif list_status == "ALL_DONE":
@@ -386,7 +386,7 @@ class BinanceOrderBroker:
                 {"symbol": symbol, "origClientOrderId": client_order_id},
             )
         except RasatError as exc:
-            # -2011 emir zaten iptal/dolmuş → None
+            # -2011 order already canceled/filled → None.
             if exc.code == ErrorCode.ORDER_REJECTED and exc.details and exc.details.get("binance_code") == -2011:
                 return None
             raise
@@ -395,13 +395,13 @@ class BinanceOrderBroker:
     async def cancel_oco(
         self, *, account_id: str, symbol: str, list_client_order_id: str
     ) -> OrderResult | None:
-        """OCO listesini `listClientOrderId` ile iptal eder (`DELETE /api/v3/orderList`).
+        """Cancel the OCO list by `listClientOrderId` (`DELETE /api/v3/orderList`).
 
-        OCO bacakları Binance'in kendi ürettiği clientOrderId'leri taşıdığı için
-        tekil `cancel_order` ile iptal edilemez — kill switch OCO satırlarında
-        `query_oco` ile eşleşen `listClientOrderId` üzerinden iptal etmelidir.
-        Yanıt `listOrderStatus` taşır: ALL_DONE → CANCELED, EXECUTING → NEW,
-        bilinmeyen → UNKNOWN (körlemesine "iptal edildi" varsayılmaz).
+        Because OCO legs carry clientOrderIds generated by Binance, they cannot be
+        canceled with individual `cancel_order`; the kill switch must cancel OCO
+        rows by the `listClientOrderId` matched through `query_oco`.
+        The response carries `listOrderStatus`: ALL_DONE → CANCELED, EXECUTING → NEW,
+        unknown → UNKNOWN (never blindly assume "canceled").
         """
         try:
             data = await self._request(
@@ -411,7 +411,7 @@ class BinanceOrderBroker:
                 {"symbol": symbol, "listClientOrderId": list_client_order_id},
             )
         except RasatError as exc:
-            # -2011 liste zaten iptal/dolmuş → None
+            # -2011 list already canceled/filled → None.
             if exc.code == ErrorCode.ORDER_REJECTED and exc.details and exc.details.get("binance_code") == -2011:
                 return None
             raise
@@ -429,7 +429,7 @@ class BinanceOrderBroker:
         )
 
     async def get_all_open_orders(self, *, account_id: str) -> list[dict]:
-        """Spot'taki tüm açık emirleri döner (sembol bazlı değil, global)."""
+        """Return all open spot orders (global, not symbol-specific)."""
         data = await self._request("GET", "/api/v3/openOrders", account_id, {})
         if not isinstance(data, list):
             return []
@@ -446,7 +446,7 @@ class BinanceOrderBroker:
         ]
 
     async def cancel_all_open_orders(self, *, account_id: str, symbol: str) -> int:
-        """Bir semboldeki tüm açık emirleri iptal eder; iptal edilen sayıyı döner."""
+        """Cancel all open orders for a symbol and return the number canceled."""
         try:
             data = await self._request(
                 "DELETE",
@@ -455,7 +455,7 @@ class BinanceOrderBroker:
                 {"symbol": symbol},
             )
         except RasatError as exc:
-            # -2011 açık emir yok → 0
+            # -2011 no open orders → 0.
             if exc.code == ErrorCode.ORDER_REJECTED and exc.details and exc.details.get("binance_code") == -2011:
                 return 0
             raise
@@ -466,7 +466,7 @@ class BinanceOrderBroker:
         return {asset: b["free"] for asset, b in detail.items() if b["free"]}
 
     async def get_balance_detail(self, *, account_id: str) -> dict[str, dict[str, float]]:
-        """free + locked içeren tam bakiye; `locked` açık emirlerde kilitli (3.21)."""
+        """Full balance including free + locked; `locked` is held by open orders (3.21)."""
         data = await self._request("GET", "/api/v3/account", account_id, {})
         balances: dict[str, dict[str, float]] = {}
         for b in data.get("balances", []):

@@ -1,4 +1,4 @@
-"""Veri toplama pipeline'ı: universe + miniTicker WS + kline scheduler + futures poll + liquidation WS + retention."""
+"""Data-collection pipeline: universe + miniTicker WS + kline scheduler + futures poll + liquidation WS + retention."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ RETENTION_INTERVAL_SECONDS = 6 * 3600
 
 
 class DataPipeline:
-    """Tüm veri toplama bileşenlerini başlatır/durdurur ve sağlık durumu sunar."""
+    """Start/stop all data-collection components and expose health status."""
 
     def __init__(
         self,
@@ -54,15 +54,15 @@ class DataPipeline:
 
     async def start(self) -> None:
         self.started_at = time.time()
-        # Sembol evreni önce — her şey buna bağlı. Başarısızlık durumu aşağıda görünür kalır.
+        # Symbol universe first — everything depends on it. Preserve failure status below.
         try:
             await self.universe.sync()
         except Exception:  # noqa: BLE001
-            logger.warning("ilk universe senkronizasyonu başarısız — arka planda tekrar denenir")
-        # Server clock: kapanış/freshness kararlarının dayanağı. İlk senkron başarısızsa
-        # kline saklama fail-closed olur (stale) — arka plan döngüsü tekrar dener.
+            logger.warning("initial universe synchronization failed — retrying in the background")
+        # Server clock: basis for close/freshness decisions. If the initial sync fails,
+        # kline storage fails closed (stale); the background loop retries.
         if not await self.clock.sync():
-            logger.warning("ilk server clock senkronu başarısız — kline verisi fail-closed stale kalır")
+            logger.warning("initial server clock synchronization failed — kline data remains stale fail closed")
         self.clock.start()
 
         self._tasks.append(asyncio.create_task(self.miniticker.run(self._stop)))
@@ -83,7 +83,7 @@ class DataPipeline:
                 await prune_candles(self.db, self.config.candles_retention_days)
                 await prune_futures_context(self.db)
             except Exception:  # noqa: BLE001
-                logger.exception("retention budama hatası")
+                logger.exception("retention pruning failed")
 
     async def stop(self) -> None:
         self._stop.set()
@@ -95,7 +95,7 @@ class DataPipeline:
         await self.rest.close()
         await self.futures_rest.close()
 
-    # ---------- okuma (handler'lar için) ----------
+    # ---------- reads (for handlers) ----------
 
     def get_ticker(self, symbol: str) -> dict | None:
         return self.ticker_cache.get(symbol)
@@ -116,8 +116,9 @@ class DataPipeline:
         return self.klines.freshness_for(symbol, timeframe, rows)
 
     def status(self) -> dict:
-        # Liquidation REST poll kaldırıldı — durum WS client'tan (connected/disconnected)
-        # türetilir ve poller'ın `_last_status["liquidation"]`'ına okuma anında yazılır.
+        # REST liquidation polling was removed; derive state from the WS client
+        # (connected/disconnected) and write it to the poller's `_last_status["liquidation"]`
+        # when reading.
         self.futures.set_liquidation_status(self.liquidation_ws.status)
         return {
             "universe": self.universe.status_dict(),

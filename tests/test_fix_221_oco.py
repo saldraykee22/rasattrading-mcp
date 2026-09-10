@@ -1,22 +1,23 @@
-"""2.21 FIX — Spot OCO emri: TP (LIMIT) + SL (STOP_LOSS_LIMIT) tek emir listesinde.
+"""2.21 FIX — Spot OCO order: TP (LIMIT) + SL (STOP_LOSS_LIMIT) in one order list.
 
-Canlı gözlem: aynı pozisyon için ayrı ayrı SL ve TP emri kurulamıyordu — ilk
-emir bakiyeyi kilitliyor, ikincisi INSUFFICIENT_BALANCE alıyordu. Gerçek çözüm
-Binance `/api/v3/orderList/oco`: biri dolunca diğeri borsada otomatik iptal.
+Live observation: separate SL and TP orders could not be placed for the same
+position—the first locked the balance and the second returned
+INSUFFICIENT_BALANCE. The real solution is Binance `/api/v3/orderList/oco`:
+when one fills, the exchange automatically cancels the other.
 
-Bu fix:
+This fix:
 - `BinanceOrderBroker.place_oco` → orderList/oco (price=TP, stopPrice, stopLimitPrice),
-- `OrderService.place_oco_order` → doğrulama + kayıt (order_type=OCO, üç fiyat) + broker,
-- order kaydı stop_limit_price sütunu taşır (migration 10),
-- `place_oco_order` tool'u.
+- `OrderService.place_oco_order` → validation + record (order_type=OCO, three prices) + broker,
+- the order record carries the stop_limit_price column (migration 10),
+- the `place_oco_order` tool.
 
 T1 (OCO order broker):
-- `_handle_existing` OCO kaydını `query_oco` ile reconcile eder (tekil `query_order`
-  hep -2013 döner) — idem-retry OCO'yu UNKNOWN'a yanlış düşürmez.
-- `BinanceOrderBroker.cancel_oco` → `DELETE /api/v3/orderList`; kill switch OCO
-  satırlarını `cancel_oco` ile iptal eder.
-- `reconcile_open_orders` UNKNOWN kayıtları da tarar (açılışta yeniden doğrulanır).
-- `find_unprotected_positions` hesap erişim hatalarını `errors`/`complete` ile raporlar.
+- `_handle_existing` reconciles an OCO record with `query_oco` (individual `query_order`
+  always returns -2013)—an idem retry does not incorrectly move the OCO to UNKNOWN.
+- `BinanceOrderBroker.cancel_oco` → `DELETE /api/v3/orderList`; the kill switch
+  cancels OCO rows with `cancel_oco`.
+- `reconcile_open_orders` also scans UNKNOWN records (verified again at startup).
+- `find_unprotected_positions` reports account access errors through `errors`/`complete`.
 """
 
 import pytest
@@ -50,7 +51,7 @@ async def db(cfg):
 
 
 async def test_broker_oco_sends_orderlist_params():
-    """place_oco → /api/v3/orderList/oco: aboveType/belowType + fiyatlar + GTC."""
+    """place_oco → /api/v3/orderList/oco: aboveType/belowType + prices + GTC."""
     import hashlib
     import hmac
 
@@ -116,7 +117,7 @@ async def test_broker_oco_sends_orderlist_params():
             assert received["path"] == "/api/v3/orderList/oco"
             assert received["params"]["side"] == "SELL"
             assert float(received["params"]["quantity"]) == 1464.09
-            # SELL: above = kâr hedefi (LIMIT_MAKER), below = stop (STOP_LOSS_LIMIT)
+            # SELL: above = profit target (LIMIT_MAKER), below = stop (STOP_LOSS_LIMIT)
             assert received["params"]["aboveType"] == "LIMIT_MAKER"
             assert float(received["params"]["abovePrice"]) == 0.1378
             assert received["params"]["belowType"] == "STOP_LOSS_LIMIT"
@@ -124,7 +125,7 @@ async def test_broker_oco_sends_orderlist_params():
             assert float(received["params"]["belowPrice"]) == 0.1220
             assert received["params"]["belowTimeInForce"] == "GTC"
             assert received["params"]["listClientOrderId"] == "oco-1"
-            # eski biçim gönderilmemeli (Binance reddediyor)
+            # The old format must not be sent (Binance rejects it).
             assert "price" not in received["params"]
             assert "stopPrice" not in received["params"]
             assert "stopLimitPrice" not in received["params"]
@@ -134,7 +135,7 @@ async def test_broker_oco_sends_orderlist_params():
 
 
 async def test_broker_oco_buy_swaps_above_below():
-    """BUY OCO: above=STOP_LOSS_LIMIT, below=LIMIT_MAKER (kısa kapatma yönü)."""
+    """BUY OCO: above=STOP_LOSS_LIMIT, below=LIMIT_MAKER (short-closing direction)."""
     import hashlib
     import hmac
 
@@ -186,11 +187,11 @@ async def test_broker_oco_buy_swaps_above_below():
 
 
 async def test_oco_validation_rejects_bad_stop_geometry(db, cfg):
-    """stop_limit_price >= stop_price veya yön hatası → INVALID_REQUEST."""
+    """stop_limit_price >= stop_price or an invalid direction → INVALID_REQUEST."""
 
     class _FakeAccounts:
         async def get_account(self, account_id):
-            raise AssertionError("doğrulama servise ulaşmadan reddetmeli")
+            raise AssertionError("validation must reject before reaching the service")
 
     service = OrderService(db, accounts=_FakeAccounts(), market=None, broker=None, risk=None, audit=None)
     with pytest.raises(RasatError) as exc:
@@ -203,7 +204,7 @@ async def test_oco_validation_rejects_bad_stop_geometry(db, cfg):
 
 
 async def test_order_service_oco_persists_all_prices(cfg, db):
-    """OCO kaydı: order_type=OCO, price=TP, stop_price, stop_limit_price saklanır."""
+    """OCO record stores order_type=OCO, price=TP, stop_price, and stop_limit_price."""
 
     class _FakeAccounts:
         async def get_account(self, account_id):
@@ -251,7 +252,8 @@ async def test_order_service_oco_persists_all_prices(cfg, db):
     assert result["price"] == 0.1378
     assert result["stop_price"] == 0.1225
     assert result["stop_limit_price"] == 0.1220
-    # paper hesap broker'a gitmez (doğru davranış); broker passthrough'u test 1'de doğrulandı
+    # Paper accounts do not call the broker (correct behavior); broker passthrough
+    # was verified in test 1.
     assert broker.placed == []
 
     def _q(conn):
@@ -286,7 +288,7 @@ _OCO_FILTERS = SymbolFilters(
 
 
 class _OcoMarket:
-    """MarketFeed taklidi: ALICEUSDT fiyatı + filtreleri (real OCO akışı için)."""
+    """MarketFeed double: ALICEUSDT price + filters (for the real OCO flow)."""
 
     def __init__(self) -> None:
         self.price_map = {"ALICEUSDT": 0.1240}
@@ -319,20 +321,21 @@ async def _real_oco_ctx(db: Database) -> dict:
 
 
 async def test_oco_idem_retry_reconciles_via_query_oco(cfg, db):
-    """T1-1: OCO idem-retry `query_oco` ile reconcile edilir (tekil `query_order` değil).
+    """T1-1: OCO idem retry is reconciled with `query_oco` (not individual `query_order`).
 
-    Zaman aşımından sonra UNKNOWN'a düşen OCO, aynı key ile retry'de borsada
-    FILLED görünüyorsa `query_oco` üzerinden doğru duruma çekilir. `query_order`
-    OCO bacaklarını bulamadığı için (Binance kendi cid üretir) hiç çağrılmamalı.
+    An OCO that becomes UNKNOWN after a timeout is moved to the correct state
+    through `query_oco` when a retry with the same key finds it FILLED on the
+    exchange. `query_order` must never be called because Binance creates its own
+    cids for OCO legs and cannot find them.
     """
     ctx = await _real_oco_ctx(db)
     service = ctx["service"]
     broker = ctx["broker"]
     cid = to_client_order_id("oco-retry-1")
-    # ilk deneme: ağ zaman aşımı → UNKNOWN (borsada doğrulanamadı)
-    broker.place_errors[cid] = RasatError(ErrorCode.TIMEOUT, "OCO gönderimi zaman aşımı")
+    # First attempt: network timeout → UNKNOWN (not verified on the exchange).
+    broker.place_errors[cid] = RasatError(ErrorCode.TIMEOUT, "OCO submission timed out")
     broker.oco_query_results[cid] = None
-    broker.query_results[cid] = None  # query_order kullanılırsa da bulunamaz
+    broker.query_results[cid] = None  # It would not be found if query_order were used.
 
     first = await service.place_oco_order(
         account_id=ctx["account_id"], symbol="ALICEUSDT", side="SELL",
@@ -341,9 +344,9 @@ async def test_oco_idem_retry_reconciles_via_query_oco(cfg, db):
     )
     assert first["status"] == "UNKNOWN"
     assert len(broker.place_errors) == 1
-    assert broker.oco_queries  # timeout reconcile query_oco ile yapıldı
+    assert broker.oco_queries  # Timeout reconciliation used query_oco.
 
-    # retry: aynı key → UNKNOWN kayıt yeniden sorgulanır; artık borsada FILLED
+    # Retry: query the UNKNOWN record again with the same key; now FILLED on the exchange.
     broker.place_errors.pop(cid)
     broker.oco_query_results[cid] = OrderResult(
         status="FILLED", exchange_order_id="OL-99", executed_qty=100.0, avg_price=0.13,
@@ -356,10 +359,10 @@ async def test_oco_idem_retry_reconciles_via_query_oco(cfg, db):
     )
     assert second["status"] == "FILLED"
     assert second["exchange_order_id"] == "OL-99"
-    assert len(broker.placed) == 1  # körlemesine tekrar gönderim yok
-    # kritik: query_order HİÇ çağrılmadı (OCO bacaklarını bulamazdı)
+    assert len(broker.placed) == 1  # No blind resubmission.
+    # Critical: query_order was never called (it could not find OCO legs).
     assert broker.queries == []
-    # ve query_oco retry reconcile'ını yaptı
+    # query_oco performed retry reconciliation.
     assert any(q["list_client_order_id"] == cid for q in broker.oco_queries)
 
     def _q(conn):
@@ -371,7 +374,7 @@ async def test_oco_idem_retry_reconciles_via_query_oco(cfg, db):
 
 
 async def test_oco_unknown_retry_requeries_and_discovers_filled(cfg, db):
-    """T1-1b: stored UNKNOWN OCO, retry'de `query_oco` ile FILLED'e çekilir."""
+    """T1-1b: stored UNKNOWN OCO is moved to FILLED via `query_oco` on retry."""
     ctx = await _real_oco_ctx(db)
     service = ctx["service"]
     broker = ctx["broker"]
@@ -388,7 +391,7 @@ async def test_oco_unknown_retry_requeries_and_discovers_filled(cfg, db):
         return order["order_id"]
 
     order_id = await db.write(_insert)
-    broker.query_results[cid] = None  # query_order kullanılırsa bulunamaz
+    broker.query_results[cid] = None  # It would not be found if query_order were used.
     broker.oco_query_results[cid] = OrderResult(
         status="FILLED", exchange_order_id="OL-FILL", executed_qty=100.0, avg_price=0.13,
     )
@@ -400,8 +403,8 @@ async def test_oco_unknown_retry_requeries_and_discovers_filled(cfg, db):
     )
     assert result["status"] == "FILLED"
     assert result["exchange_order_id"] == "OL-FILL"
-    assert broker.queries == []  # query_order kullanılmadı
-    assert len(broker.placed) == 0  # çift emir gönderilmedi
+    assert broker.queries == []  # query_order was not used.
+    assert len(broker.placed) == 0  # No duplicate order was sent.
 
     def _q(conn):
         return dict(conn.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,)).fetchone())
@@ -412,12 +415,12 @@ async def test_oco_unknown_retry_requeries_and_discovers_filled(cfg, db):
 
 
 async def test_kill_switch_cancels_oco_via_cancel_oco(cfg, db):
-    """T1-2: kill switch OCO satırını `cancel_oco` ile iptal eder (tekil `cancel_order` değil)."""
+    """T1-2: kill switch cancels an OCO row with `cancel_oco` (not individual `cancel_order`)."""
     ctx = await _real_oco_ctx(db)
     service = ctx["service"]
     broker = ctx["broker"]
     cid = to_client_order_id("oco-kill-1")
-    broker.open_orders = []  # borsada başka yetim emir yok (test izolasyonu)
+    broker.open_orders = []  # No other orphan exchange order (test isolation).
 
     def _insert(conn):
         order = service._insert_order(
@@ -435,7 +438,7 @@ async def test_kill_switch_cancels_oco_via_cancel_oco(cfg, db):
     detail = result["results"][0]
     assert detail["closed"] is True
     assert "ALICEUSDT" in detail["cancelled"]
-    # OCO iptali cancel_oco ile yapıldı; tekil cancel_order kullanılmadı
+    # OCO cancellation used cancel_oco; individual cancel_order was not used.
     assert broker.cancelled_oco == [
         {"account_id": ctx["account_id"], "symbol": "ALICEUSDT", "list_client_order_id": cid}
     ]
@@ -449,7 +452,7 @@ async def test_kill_switch_cancels_oco_via_cancel_oco(cfg, db):
 
 
 async def test_kill_switch_oco_cancel_unknown_when_not_found(cfg, db):
-    """T1-2b: OCO iptali -2011 (borsada yok) ise `query_oco` ile doğrulanır."""
+    """T1-2b: when OCO cancellation returns -2011 (not on the exchange), verify with `query_oco`."""
     ctx = await _real_oco_ctx(db)
     service = ctx["service"]
     broker = ctx["broker"]
@@ -467,13 +470,13 @@ async def test_kill_switch_oco_cancel_unknown_when_not_found(cfg, db):
         return order["order_id"]
 
     order_id = await db.write(_insert)
-    # cancel_oco borsada bulamıyor (-2011 → None); sorgu query_oco ile yapılmalı
+    # cancel_oco cannot find it on the exchange (-2011 → None); query with query_oco.
     broker.cancel_oco_results = {cid: None}
     broker.oco_query_results[cid] = OrderResult(status="NEW", exchange_order_id="OL-LIVE", executed_qty=0.0, avg_price=0.0)
 
     result = await service.close_all_positions(account_id=ctx["account_id"], actor="test")
     detail = result["results"][0]
-    # iptal belirsiz → hesap kapandı denmez; local satır UNKNOWN
+    # Cancellation is uncertain → do not report the account as closed; local row is UNKNOWN.
     assert detail["closed"] is False
     assert len(detail["cancel_errors"]) == 1
 
@@ -482,13 +485,13 @@ async def test_kill_switch_oco_cancel_unknown_when_not_found(cfg, db):
 
     row = await db.read(_q)
     assert row["status"] == "UNKNOWN"
-    # doğrulama query_oco ile yapıldı (tekil query_order değil)
+    # Verification used query_oco (not individual query_order).
     assert any(q["list_client_order_id"] == cid for q in broker.oco_queries)
     assert broker.queries == []
 
 
 async def test_reconcile_open_orders_scans_unknown_records(cfg, db):
-    """T1-3: `reconcile_open_orders` UNKNOWN kayıtları da tarar (OCO + tekil)."""
+    """T1-3: `reconcile_open_orders` also scans UNKNOWN records (OCO + individual)."""
     ctx = await _real_oco_ctx(db)
     service = ctx["service"]
     broker = ctx["broker"]
@@ -520,7 +523,7 @@ async def test_reconcile_open_orders_scans_unknown_records(cfg, db):
     )
 
     result = await service.reconcile_open_orders()
-    assert result["scanned"] >= 2  # UNKNOWN kayıtlar da tarandı
+    assert result["scanned"] >= 2  # UNKNOWN records were also scanned.
     assert result["reconciled"] >= 2
 
     def _q(conn):
@@ -537,7 +540,7 @@ async def test_reconcile_open_orders_scans_unknown_records(cfg, db):
 
 
 async def test_find_unprotected_positions_reports_account_errors(cfg, db):
-    """T1-4: hesap erişim hatası sessizce yutulmaz — `errors` + `complete=false`."""
+    """T1-4: account access errors are not silently swallowed—`errors` + `complete=false`."""
     accounts = AccountService(db, secret_store=SecretStore(), audit=AuditLog(db))
     risk = RiskPolicyService(db, audit=AuditLog(db))
 
@@ -561,10 +564,10 @@ async def test_find_unprotected_positions_reports_account_errors(cfg, db):
     await accounts.enable_real_trading(bad_id, actor="test")
     broker.balances[ok_id] = {"USDT": 10000.0, "BTC": 1.0}
     broker.balances[bad_id] = {"USDT": 10000.0, "BTC": 1.0}
-    broker.fail_detail[bad_id] = RasatError(ErrorCode.TIMEOUT, "bakiye erişim hatası")
+    broker.fail_detail[bad_id] = RasatError(ErrorCode.TIMEOUT, "balance access error")
 
     result = await service.find_unprotected_positions()
-    # iyi hesap hâlâ taranır; kötü hesap hata olarak taşınır
+    # The good account is still scanned; the bad account is returned as an error.
     assert any(u["account_id"] == ok_id for u in result["unprotected"])
     assert result["complete"] is False
     assert any(e["account_id"] == bad_id for e in result["errors"])
@@ -576,7 +579,7 @@ async def test_find_unprotected_positions_reports_account_errors(cfg, db):
 
 
 async def test_broker_signed_timestamp_uses_clock_server_now():
-    """clock verilirse imzalı istek timestamp'i `clock.server_now()`'dan gelir (host saatine değil)."""
+    """When clock is provided, signed-request timestamp comes from `clock.server_now()` (not host time)."""
     import hashlib
     import hmac
     import time
@@ -627,15 +630,15 @@ async def test_broker_signed_timestamp_uses_clock_server_now():
             expected_ms = int((time.time() + 300.0) * 1000)
             await broker.query_order(account_id="a1", symbol="ALICEUSDT", client_order_id="oco-1")
             got = int(received["params"]["timestamp"])
-            assert abs(got - expected_ms) < 5000  # clock.server_now() (offset uygulanmış)
-            # host saatinden (offset'siz) net ayrılmalı — 300s fark test edilebilir
+            assert abs(got - expected_ms) < 5000  # clock.server_now() (offset applied)
+            # Must differ clearly from host time (without offset)—a 300s gap is testable.
             assert got > int(time.time() * 1000) + 250_000
         finally:
             await broker.close()
 
 
 async def test_broker_signed_timestamp_falls_back_to_local_when_clock_unavailable():
-    """clock fail-closed (server_now → None) ise eski `time.time()` fallback'i korunur."""
+    """When the clock fails closed (server_now → None), preserve the old `time.time()` fallback."""
     import hashlib
     import hmac
     import time
@@ -675,6 +678,6 @@ async def test_broker_signed_timestamp_falls_back_to_local_when_clock_unavailabl
             await broker.query_order(account_id="a1", symbol="ALICEUSDT", client_order_id="oco-1")
             got = int(received["params"]["timestamp"])
             after = int(time.time() * 1000)
-            assert before <= got <= after  # yerel saat fallback'i (offset uygulanmadı)
+            assert before <= got <= after  # Local-time fallback (offset not applied).
         finally:
             await broker.close()

@@ -1,8 +1,8 @@
-"""Sembol evreni senkronizasyonu.
+"""Symbol-universe synchronization.
 
-Binance spot `exchangeInfo` → `status=TRADING` + `quoteAsset=USDT` olan tüm çiftler.
-Periyodik yeniden senkronizasyonla yeni listelenen/delist edilen semboller takip edilir.
-Senkronizasyon başarısızsa son bilinen evren korunur, durum `stale`/`error` işaretlenir.
+Binance spot `exchangeInfo` → all pairs with `status=TRADING` and `quoteAsset=USDT`.
+Periodic resynchronization tracks newly listed and delisted symbols. If
+synchronization fails, preserve the last known universe and mark the state `stale`/`error`.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ class UniverseService:
         self._last_error: str | None = None
 
     async def sync(self) -> int:
-        """exchangeInfo çekip USDT/TRADING evrenini ve sembol filtrelerini günceller."""
+        """Fetch exchangeInfo and update the USDT/TRADING universe and symbol filters."""
         try:
             data = await self._rest.get("/api/v3/exchangeInfo", weight=20)
             entries = {s["symbol"]: s for s in data.get("symbols", [])}
@@ -43,12 +43,12 @@ class UniverseService:
             self._last_sync = time.time()
             self._status = "ok"
             self._last_error = None
-            logger.info("sembol evreni senkronize: %d USDT çifti", len(self._symbols))
+            logger.info("symbol universe synchronized: %d USDT pairs", len(self._symbols))
             return len(self._symbols)
         except Exception as exc:  # noqa: BLE001
             self._status = "error" if not self._symbols else "stale"
             self._last_error = str(exc)
-            logger.warning("exchangeInfo alınamadı (%s) — evren %d sembol korunuyor", exc, len(self._symbols))
+            logger.warning("could not fetch exchangeInfo (%s) — preserving universe of %d symbols", exc, len(self._symbols))
             raise
 
     def contains(self, symbol: str) -> bool:
@@ -58,7 +58,7 @@ class UniverseService:
         return list(self._symbols)
 
     def symbol_info(self, symbol: str) -> dict | None:
-        """exchangeInfo'nun ham sembol kaydı (filtreler dahil); bilinmiyorsa None."""
+        """Raw exchangeInfo symbol record (including filters); None if unknown."""
         return self._info.get(symbol)
 
     @property
@@ -73,7 +73,7 @@ class UniverseService:
         return self._last_error
 
     async def ensure_contains(self, symbol: str) -> bool:
-        """Sembol evrende mi? Bilinmiyorsa evreni tazeler. Bulunamazsa False."""
+        """Check whether a symbol is in the universe; refresh it if unknown, returning False if absent."""
         if symbol in self._symbols:
             return True
         if time.time() - self._last_sync > self._refresh_seconds:

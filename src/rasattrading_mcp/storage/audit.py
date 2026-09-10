@@ -1,8 +1,8 @@
-"""Append-only, hash-chain'li audit log.
+"""Append-only audit log with a hash chain.
 
-Her satır bir önceki satırın hash'ini taşır. Bir satır silinir/değiştirilirse zincir
-kırılır ve `verify` bunu tespit eder. Sırlar (key/secret/token) asla loglanmaz —
-`_redact` ile details'taki hassas anahtarlar temizlenir.
+Each row carries the previous row's hash. If a row is deleted or changed, the chain
+breaks and `verify` detects it. Never log secrets (key/secret/token); `_redact`
+cleans sensitive keys from details.
 """
 
 from __future__ import annotations
@@ -50,13 +50,13 @@ def hash_entry(prev_hash: str, seq: int, actor: str, action: str, details_json: 
 
 
 class AuditLog:
-    """Yazma kuyruğu üzerinden sıralı append; okuma ile doğrulama."""
+    """Serialized append through the write queue; verification through reads."""
 
     def __init__(self, db: Database) -> None:
         self._db = db
 
     async def append(self, actor: str, action: str, details: dict | None = None) -> int:
-        """Bir satır ekler; satırın seq'ini döner."""
+        """Append a row and return its sequence number."""
         return await self._db.write(
             lambda conn: self.append_in_connection(conn, actor=actor, action=action, details=details)
         )
@@ -102,7 +102,7 @@ class AuditLog:
         return await self._db.read(_tail)
 
     async def verify(self) -> list[dict]:
-        """Zincir bütünlüğünü doğrular; kırık satırları döner (boş = sağlam)."""
+        """Verify chain integrity and return broken rows (empty = intact)."""
 
         def _verify(conn: sqlite3.Connection) -> list[dict]:
             rows = conn.execute(
@@ -115,14 +115,14 @@ class AuditLog:
                 seq = int(row["seq"])
                 expected_prev = prev_hash
                 if seq != prev_seq + 1:
-                    broken.append({"seq": seq, "reason": f"seq atlama/silinme (beklenen {prev_seq + 1})"})
+                    broken.append({"seq": seq, "reason": f"sequence gap/deletion (expected {prev_seq + 1})"})
                 if str(row["prev_hash"]) != expected_prev:
-                    broken.append({"seq": seq, "reason": "zincir kopması (prev_hash uyuşmuyor)"})
+                    broken.append({"seq": seq, "reason": "chain break (prev_hash mismatch)"})
                 details_json = str(row["details"])
                 created_at = int(row["created_at"])
                 expected = hash_entry(expected_prev, seq, str(row["actor"]), str(row["action"]), details_json, created_at)
                 if str(row["hash"]) != expected:
-                    broken.append({"seq": seq, "reason": "hash uyuşmazlığı (satır değiştirilmiş)"})
+                    broken.append({"seq": seq, "reason": "hash mismatch (row changed)"})
                 prev_hash = str(row["hash"])
                 prev_seq = seq
             return broken

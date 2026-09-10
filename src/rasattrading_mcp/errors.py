@@ -1,4 +1,4 @@
-"""Canonical hata kodu sözlüğü (Modül 2/3 genişletecektir)."""
+"""Canonical error-code vocabulary."""
 
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ class ErrorCode:
 
 
 class RasatError(Exception):
-    """Tüm modüllerde fırlatılan canonical hata."""
+    """Canonical error raised across all modules."""
 
     def __init__(
         self,

@@ -1,4 +1,4 @@
-"""2.5 — Screener (scan_market): filtre AST güvenliği + değerlendirme."""
+"""2.5 — Screener (scan_market): filter AST safety + evaluation."""
 
 import time
 
@@ -29,7 +29,7 @@ EQ_SWEEP = [
 
 FALLING = [(105 - i * 0.5, 105.5 - i * 0.5, 104.5 - i * 0.5, 105 - i * 0.5) for i in range(15)]
 
-# Tek BOS event'i → tek OB; fiyat bölgeye geri dönmez → aktif (mitigasyonsuz) OB.
+# One BOS event → one OB; price does not return to zone → active (unmitigated) OB.
 ACTIVE_OB = [
     (100, 100.5, 99.5, 100), (100, 100.5, 99.5, 100), (99, 100, 98, 99.5),
     (99.5, 100.5, 99, 100), (100, 102, 99.5, 101), (101, 101.5, 100.5, 101),
@@ -71,7 +71,7 @@ async def seed_all(db):
 
 
 # ---------------------------------------------------------------------------
-# AST güvenliği (enjeksiyon reddi)
+# AST safety (reject injection)
 # ---------------------------------------------------------------------------
 
 
@@ -117,7 +117,7 @@ def test_validate_nested_and_or():
 
 
 # ---------------------------------------------------------------------------
-# Değerlendirme
+# Evaluation
 # ---------------------------------------------------------------------------
 
 
@@ -128,10 +128,10 @@ async def test_scan_price_change(db):
         [{"type": "price_change", "window_bars": 10, "min": 2}], require_fresh=False
     )
     syms = [s["symbol"] for s in res["symbols"]]
-    assert "BTCUSDT" in syms  # %2.5 artış
-    assert "SOLUSDT" not in syms  # düşüyor
+    assert "BTCUSDT" in syms  # 2.5% increase.
+    assert "SOLUSDT" not in syms  # Falling.
     assert res["combine"] == "AND"
-    assert res["freshness"] == "stale"  # eski damgalı veri
+    assert res["freshness"] == "stale"  # Old-timestamped data.
 
 
 async def test_scan_liquidity_sweep(db):
@@ -139,7 +139,7 @@ async def test_scan_liquidity_sweep(db):
     screener = Screener(db)
     res = await screener.scan([{"type": "liquidity_sweep_occurred"}], require_fresh=False)
     syms = [s["symbol"] for s in res["symbols"]]
-    assert "ETHUSDT" in syms  # eşit high sweep edildi
+    assert "ETHUSDT" in syms  # Equal high was swept.
     assert "BTCUSDT" not in syms
 
 
@@ -152,15 +152,15 @@ async def test_scan_structure_event(db):
 
 
 async def test_scan_near_order_block(db):
-    # UPTREND (BTCUSDT) iki BOS event'i aynı mumu işaret ettiği için dedup sonrası
-    # tek ve mitigasyonlu OB üretiyor (2.15) — bu testte gerçek aktif OB kullanılır.
+    # UPTREND (BTCUSDT) produces one mitigated OB after dedup because two BOS
+    # events point to the same candle (2.15)—this test uses a real active OB.
     await seed(db, "BTCUSDT", ACTIVE_OB)
     await seed(db, "ETHUSDT", EQ_SWEEP)
     screener = Screener(db)
     res = await screener.scan([{"type": "near_order_block", "max_distance_pct": 2.0}], require_fresh=False)
     syms = [s["symbol"] for s in res["symbols"]]
-    assert "BTCUSDT" in syms  # aktif OB'ye yakın
-    assert "ETHUSDT" not in syms  # OB yok
+    assert "BTCUSDT" in syms  # Near active OB.
+    assert "ETHUSDT" not in syms  # No OB.
 
 
 async def test_scan_above_below_vwap(db):
@@ -192,7 +192,7 @@ async def test_scan_funding_rate_fresh_only(db):
     res = await screener.scan([{"type": "funding_rate", "min": 0.0001, "max": 0.001}], require_fresh=False)
     syms = [s["symbol"] for s in res["symbols"]]
     assert "BTCUSDT" in syms  # fresh
-    assert "ETHUSDT" not in syms  # stale skora katılmaz
+    assert "ETHUSDT" not in syms  # Stale data is not scored.
 
 
 async def test_scan_combine_or(db):
@@ -226,7 +226,7 @@ async def test_scan_pagination(db):
             break
         cursor = res["next_cursor"]
     assert pages > 1
-    assert len(seen) == len(set(seen))  # sayfalar örtüşmez
+    assert len(seen) == len(set(seen))  # Pages do not overlap.
 
 
 async def test_scan_stale_marking(db):
@@ -236,7 +236,7 @@ async def test_scan_stale_marking(db):
         [{"type": "price_change", "window_bars": 10, "min": 2}], require_fresh=False
     )
     btc = next(s for s in res["symbols"] if s["symbol"] == "BTCUSDT")
-    assert btc["data_stale"] is True  # eski damgalı mumlar → açıkça işaretli
+    assert btc["data_stale"] is True  # Old-timestamped candles → explicitly marked.
 
 
 async def test_scan_and_or_nested(db):

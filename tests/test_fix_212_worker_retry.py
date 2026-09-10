@@ -1,9 +1,9 @@
-"""2.12 FIX — PA worker retry: marker işlem tamamlandıktan sonra ilerler.
+"""2.12 FIX — PA worker retry: marker advances after processing completes.
 
-Review kanıtları test'e çevrilir (H1, M1):
-- Stale/başarısız/boş hesaplama sonrası `_last_processed` ilerlemez; aynı
-  kapalı bar bir sonraki turda tekrar denenir.
-- Warm-up/backfill mum yüklemesi de `pa_worker_concurrency` semaphore'una dahildir.
+Review evidence is converted into tests (H1, M1):
+- After stale/failed/empty calculation, `_last_processed` does not advance; the
+  same closed bar is retried on the next cycle.
+- Warm-up/backfill candle loading is also included in the `pa_worker_concurrency` semaphore.
 """
 
 import asyncio
@@ -71,7 +71,7 @@ async def seed_at(db, symbol, rows, open_times):
 
 
 async def test_worker_retries_failed_analysis_same_bar(db, cfg, monkeypatch):
-    """H1: analyze geçici hata alırsa marker ilerlemez; aynı bar bir sonraki turda retry edilir."""
+    """H1: if analyze gets a transient error, marker does not advance; retry the same bar next cycle."""
     await seed_at(db, "BTCUSDT", UPTREND, _fresh_times(len(UPTREND)))
     worker = PAWorker(PAEngine(db), FakeUniverse(["BTCUSDT"]), cfg)
 
@@ -95,7 +95,7 @@ async def test_worker_retries_failed_analysis_same_bar(db, cfg, monkeypatch):
 
 
 async def test_worker_retries_stale_bar_when_data_catches_up(db, cfg):
-    """H1: stale mum turu marker'ı ilerletmez; veri aynı kapalı bara yetişince işlenir."""
+    """H1: stale candle cycle does not advance marker; process when data reaches the same closed bar."""
     await seed_at(db, "BTCUSDT", UPTREND, [OLD_BASE + i * PERIOD for i in range(len(UPTREND))])
     worker = PAWorker(PAEngine(db), FakeUniverse(["BTCUSDT"]), cfg)
 
@@ -110,7 +110,7 @@ async def test_worker_retries_stale_bar_when_data_catches_up(db, cfg):
 
 
 async def test_worker_retries_empty_universe_until_symbols_appear(db, cfg):
-    """H1: evren boşken marker ilerlemez; sembol eklenince aynı kapalı bar işlenir."""
+    """H1: marker does not advance with an empty universe; process the same closed bar when a symbol is added."""
     universe = FakeUniverse([])
     worker = PAWorker(PAEngine(db), universe, cfg)
 
@@ -124,7 +124,7 @@ async def test_worker_retries_empty_universe_until_symbols_appear(db, cfg):
 
 
 async def test_worker_load_is_semaphore_limited(db, cfg, monkeypatch):
-    """M1: warm-up/backfill mum yüklemesi de concurrency limitine dahildir."""
+    """M1: warm-up/backfill candle loading is also included in the concurrency limit."""
     symbols = [f"SYM{i}" for i in range(6)]
     for s in symbols:
         await seed_at(db, s, UPTREND, _fresh_times(len(UPTREND)))

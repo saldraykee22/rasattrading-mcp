@@ -1,17 +1,17 @@
-"""2.2 — Likidite bölgeleri + futures context (saf + DB okuma).
+"""2.2 — Liquidity zones plus futures context (pure computation and DB reads).
 
-Kurallar (sürüm `liquidity-v1`):
-- **Equal highs/lows:** Aynı türden swing seviyeleri, fiyat farkı `tolerans`
-  (varsayılan `EQUAL_LEVEL_TOLERANCE_PCT`) içindeyse aynı likidite bölgesinde
-  kümeleşir. En az 2 swing gereklidir; tek seviye bölge üretmez.
-- **Sweep/mitigasyon:** Bölge oluştuktan (`formed_at`) sonra fiyat bölge
-  bandını aşarsa (equal_highs: high > band.high; equal_lows: low < band.low)
-  o seviyedeki likidite alınmış sayılır → `mitigated=true`. `tested` = fiyat
-  banda değdi ama aşmadı.
-- **Futures context (salt-okunur):** `futures_context` tablosundaki funding
-  rate / OI / liquidation yalnızca `fresh` ise likidite skoruna girer.
-  `stale`/`unknown` girişler skora dahil EDİLMEZ ama çıktıda açıkça
-  `included: false` + durum olarak görünür (sessizce 0 sayılmaz).
+Rules (version `liquidity-v1`):
+- **Equal highs/lows:** Swing levels of the same type cluster into one liquidity
+  zone when their price difference is within `EQUAL_LEVEL_TOLERANCE_PCT`. At least
+  two swings are required; a single level does not create a zone.
+- **Sweep/mitigation:** After a zone is formed (`formed_at`), if price exceeds
+  the zone band (equal_highs: high > band.high; equal_lows: low < band.low), the
+  liquidity at that level is considered taken → `mitigated=true`. `tested` means
+  price touched but did not exceed the band.
+- **Futures context (read-only):** funding rate / OI / liquidation from
+  `futures_context` contribute to the liquidity score only when `fresh`.
+  `stale`/`unknown` entries are excluded but explicitly shown with
+  `included: false` and their status (never silently counted as zero).
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ FUTURES_TYPES = ("funding_rate", "open_interest", "liquidation")
 
 
 def _cluster_swings(swings: list[dict], pivot_kind: str, tolerance_pct: float) -> list[list[dict]]:
-    """Aynı türdeki swing seviyelerini tolerans içinde kümeler; en az 2'si olanları döner."""
+    """Cluster swing levels of the same type within tolerance; return clusters with at least two."""
     items = sorted((s for s in swings if s["kind"] == pivot_kind), key=lambda s: s["price"])
     clusters: list[list[dict]] = []
     for s in items:
@@ -74,7 +74,7 @@ def compute_liquidity_zones(
     algo_version: str = LIQUIDITY_ALGO_VERSION,
     tolerance_pct: float = EQUAL_LEVEL_TOLERANCE_PCT,
 ) -> dict[str, Any]:
-    """Swing yapısından likidite bölgeleri + futures tabanlı skor üretir."""
+    """Build liquidity zones from swing structure and a futures-based score."""
     swings = structure.get("swings", [])
     highs = [c["high"] for c in candles]
     lows = [c["low"] for c in candles]
@@ -117,23 +117,22 @@ def _mark_status(zone: dict, sweep_dir: str, times: list[int], highs: list[float
 
 
 def _norm_funding(rate: float) -> float:
-    """|funding rate|/0.001 → 0..1 (0.001 = %0.1 perp fonlama eşiği)."""
+    """Normalize |funding rate|/0.001 → 0..1 (0.001 = 0.1% perp funding threshold)."""
     return min(abs(rate) / 0.001, 1.0)
 
 
 def _norm_liquidation(count: float) -> float:
-    """Son N likidasyon sayısı/5 → 0..1."""
+    """Normalize the last N liquidation count/5 → 0..1."""
     return min(max(count, 0.0), 5.0) / 5.0
 
 
 def liquidity_score(zones: list[dict], futures: dict[str, Any] | None) -> dict[str, Any]:
-    """0-100 likidite skoru. Futures girdileri sadece `fresh` ise katkı verir.
+    """0-100 liquidity score. Futures inputs contribute only when `fresh`.
 
-    2.15 fix — `equal_levels` puanı aktif (mitigasyonsuz) bölge sayısına göre
-    hesaplanır; mitigasyonlu bölgeler "kullanılmış likidite" olarak puan getirmez
-    (10 bölgenin 7'si mitigasyonluysa tam puan verilmez). Funding bileşeni yön
-    bilgisi taşır: `bias: long_crowded|short_crowded` (+ skor üstünde
-    `funding_bias`).
+    2.15 fix — `equal_levels` points are based on active (unmitigated) zone count;
+    mitigated zones are "used liquidity" and earn no points (if 7 of 10 zones are
+    mitigated, do not award full points). The funding component carries direction
+    information: `bias: long_crowded|short_crowded` (also exposed as `funding_bias`).
     """
     futures = futures or {}
     w = LIQUIDITY_WEIGHTS
@@ -149,9 +148,9 @@ def liquidity_score(zones: list[dict], futures: dict[str, Any] | None) -> dict[s
             "active_zones": eq_active,
             "mitigated_zones": eq_mitigated,
             "note": (
-                f"analizde {eq_count} eşit-seviye bölge; {eq_active} aktif (mitigasyonsuz), "
-                f"{eq_mitigated} mitigasyonlu — varsayılan listede yalnızca aktifler görünür; "
-                f"puan aktif bölge sayısına göre hesaplanır"
+                f"equal-level zone count is {eq_count}; {eq_active} active (unmitigated), "
+                f"{eq_mitigated} mitigated — only active zones appear in the default list; "
+                f"points are based on active zone count"
             ),
             "included": True,
             "points": round(min(eq_active, 10) / 10.0 * w["equal_levels"], 1),
@@ -167,17 +166,17 @@ def liquidity_score(zones: list[dict], futures: dict[str, Any] | None) -> dict[s
     for key, weight, norm in specs:
         item = futures.get(key)
         if item is None:
-            components[key] = {"status": "unknown", "included": False, "points": 0, "note": "veri yok"}
+            components[key] = {"status": "unknown", "included": False, "points": 0, "note": "data unavailable"}
             continue
         status = item.get("freshness", "unknown")
         if status != "fresh":
-            components[key] = {"status": status, "included": False, "points": 0, "note": "skora katılmadı"}
+            components[key] = {"status": status, "included": False, "points": 0, "note": "excluded from score"}
             continue
         value = item.get("value")
         points = round(weight * norm(value) if value is not None else 0.0, 1)
         comp: dict[str, Any] = {"status": "fresh", "value": value, "included": True, "points": points}
         if key == "funding_rate" and value is not None:
-            # Pozitif funding → long'lar ödüyor (crowded long); negatif → kısa kalabalığı.
+            # Positive funding → longs pay (crowded long); negative → crowded shorts.
             comp["bias"] = "long_crowded" if value >= 0 else "short_crowded"
         components[key] = comp
         futures_available = True
@@ -195,10 +194,10 @@ def liquidity_score(zones: list[dict], futures: dict[str, Any] | None) -> dict[s
 
 
 async def load_futures_context(db: Database, symbol: str) -> dict[str, dict]:
-    """Sembolün her türü için EN SON futures_context kaydını döndürür.
+    """Return the LATEST futures_context record for each type of a symbol.
 
-    Çıktı: {funding_rate: {type, value, event_time, freshness, fetched_at}, ...}
-    — yalnızca tabloda kayıt varsa anahtar bulunur; yoksa o tür `None`.
+    Output: {funding_rate: {type, value, event_time, freshness, fetched_at}, ...}
+    — a key exists only when the table has a record; otherwise that type is absent.
     """
 
     def _q(conn):
@@ -219,11 +218,11 @@ async def load_futures_context(db: Database, symbol: str) -> dict[str, dict]:
 
 
 async def load_futures_series(db: Database, symbol: str, ftype: str, limit: int = 20) -> list[dict]:
-    """Bir türün zaman sıralı (eski→yeni) EN YENİ `limit` kaydını döndürür.
+    """Return the newest `limit` records for a type in chronological order (oldest→newest).
 
-    `oi_change` gibi değişim filtreleri için türün geçmişine ihtiyaç duyulur;
-    tür bilinmiyorsa boş liste döner (hata değil). En yeni kayıtlar seçilir
-    (ASC+LIMIT eskileri dönüyordu — 2.10 fix), sonra kronolojik sıraya çevrilir.
+    Filters such as `oi_change` need the type's history; return an empty list (not
+    an error) for an unknown type. Select the newest records (ASC+LIMIT returned
+    the oldest — 2.10 fix), then reverse them into chronological order.
     """
 
     def _q(conn):

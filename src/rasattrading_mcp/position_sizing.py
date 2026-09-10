@@ -1,12 +1,12 @@
-"""Pozisyon boyutlandırma + Binance exchangeInfo filtreleri (ticket 3.3).
+"""Position sizing plus Binance exchangeInfo filters (ticket 3.3).
 
-`calculate_position_size` risk-bazlı, fee-aware boyutlandırır ve Binance spot
-filtrelerine (`LOT_SIZE`, `MIN_NOTIONAL`, `PRICE_FILTER`) göre yuvarlar — borsa
-filtrelerine uymayan emir gönderilmez (3.4 bu çıktıyı kullanır).
+`calculate_position_size` performs risk-based, fee-aware sizing and rounds to
+Binance spot filters (`LOT_SIZE`, `MIN_NOTIONAL`, `PRICE_FILTER`); never send an
+order that violates exchange filters (3.4 uses this output).
 
-Cap'lere tolerans UYGULANMAZ (3.2 tolerans ilkesi): `quantity` her zaman
-`max_qty` altında ve `min_qty`/`min_notional`'ı karşılayacak şekilde aşağı
-yuvarlanır; karşılanamıyorsa `FILTER_VIOLATION` ile fail-closed reddedilir.
+Do not apply tolerance to caps (3.2 tolerance principle): always round `quantity`
+down below `max_qty` and in a way that meets `min_qty`/`min_notional`; if this is
+not possible, reject fail closed with `FILTER_VIOLATION`.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ _EPS = 1e-9
 
 @dataclass(frozen=True)
 class SymbolFilters:
-    """Bir sembolün exchangeInfo filter özeti (sayısal)."""
+    """Numeric exchangeInfo filter summary for a symbol."""
 
     symbol: str
     base_asset: str
@@ -88,7 +88,7 @@ class SymbolFilters:
 
 
 def round_down_to_step(value: float, step_size: float) -> float:
-    """`value`'yu `step_size`'ın tam katına AŞAĞI yuvarlar (LOT_SIZE)."""
+    """Round `value` DOWN to a multiple of `step_size` (LOT_SIZE)."""
     if step_size <= 0:
         return value
     return math.floor(value / step_size + _EPS) * step_size
@@ -105,21 +105,21 @@ def calculate_position_size(
     side: str = "BUY",
     fee_rate: float = DEFAULT_FEE_RATE,
 ) -> dict[str, Any]:
-    """Risk-bazlı, fee-aware boyut hesaplar; filtre uyumsuzluğunda fail-closed.
+    """Calculate fee-aware, risk-based size; fail closed on filter violations.
 
-    Mantık:
-    1. Doğruluk: stop yönü (long: stop < entry) her zaman kontrol edilir.
+    Logic:
+    1. Always check stop direction (long: stop < entry).
     2. `risk_amount = account_balance * risk_pct`; `risk_per_unit = |entry - stop|`.
     3. `raw_qty = risk_amount / risk_per_unit` (base asset).
-    4. Fee düşüldükten sonra bakiye sınırı: `qty <= balance / (entry*(1+fee_rate))`.
-    5. `LOT_SIZE.stepSize`'a aşağı yuvarlanır; `max_qty` aşılmaz.
-    6. `min_qty` / `min_notional` (entry fiyatıyla) karşılanamıyorsa `FILTER_VIOLATION`.
-    7. `PRICE_FILTER` (entry `min_price..max_price` içinde) doğrulanır.
+    4. Post-fee balance cap: `qty <= balance / (entry*(1+fee_rate))`.
+    5. Round down to `LOT_SIZE.stepSize`; do not exceed `max_qty`.
+    6. If `min_qty` / `min_notional` (at entry price) cannot be met, `FILTER_VIOLATION`.
+    7. Validate `PRICE_FILTER` (entry within `min_price..max_price`).
     """
     if not isinstance(symbol, str) or not symbol:
-        raise RasatError(ErrorCode.INVALID_REQUEST, "symbol zorunlu (string)")
-    # T01: NaN/Infinity/non-numeric girişler karşılaştırmalara (check_stop_direction
-    # dahil) girmeden önce finite'lanır — string entry TypeError üretmemeli.
+        raise RasatError(ErrorCode.INVALID_REQUEST, "symbol is required (string)")
+    # T01: finite-validate NaN/Infinity/non-numeric inputs before comparisons
+    # (including check_stop_direction); string entry must not produce TypeError.
     account_balance = require_finite(account_balance, "account_balance")
     risk_pct = require_finite(risk_pct, "risk_pct")
     entry = require_finite(entry, "entry")
@@ -127,25 +127,25 @@ def calculate_position_size(
     fee_rate = require_finite(fee_rate, "fee_rate")
     check_stop_direction(side, entry, stop_loss)
     if risk_pct <= 0 or risk_pct > 1:
-        raise RasatError(ErrorCode.INVALID_REQUEST, "risk_pct (0,1] aralığında olmalı")
+        raise RasatError(ErrorCode.INVALID_REQUEST, "risk_pct must be in the (0,1] range")
     if account_balance <= 0:
-        raise RasatError(ErrorCode.INVALID_REQUEST, "account_balance sıfırdan büyük olmalı")
+        raise RasatError(ErrorCode.INVALID_REQUEST, "account_balance must be greater than zero")
     if entry <= 0 or stop_loss <= 0:
-        raise RasatError(ErrorCode.INVALID_REQUEST, "entry ve stop_loss sıfırdan büyük olmalı")
+        raise RasatError(ErrorCode.INVALID_REQUEST, "entry and stop_loss must be greater than zero")
     if fee_rate < 0:
-        raise RasatError(ErrorCode.INVALID_REQUEST, "fee_rate negatif olamaz")
+        raise RasatError(ErrorCode.INVALID_REQUEST, "fee_rate cannot be negative")
 
     if entry < filters.min_price or entry > filters.max_price:
         raise RasatError(
             ErrorCode.FILTER_VIOLATION,
-            f"entry fiyatı PRICE_FILTER dışında: {entry} ([{filters.min_price}, {filters.max_price}])",
+            f"entry price is outside PRICE_FILTER: {entry} ([{filters.min_price}, {filters.max_price}])",
         )
 
     risk_amount = account_balance * risk_pct
     risk_per_unit = abs(entry - stop_loss)
     raw_qty = risk_amount / risk_per_unit
 
-    # Fee-aware bakiye sınırı: qty*entry*(1+fee_rate) <= account_balance
+    # Fee-aware balance cap: qty*entry*(1+fee_rate) <= account_balance.
     balance_cap_qty = account_balance / (entry * (1 + fee_rate))
     qty = min(raw_qty, balance_cap_qty)
     qty = round_down_to_step(qty, filters.step_size)
@@ -156,20 +156,20 @@ def calculate_position_size(
     if qty <= 0 or qty < filters.min_qty:
         raise RasatError(
             ErrorCode.FILTER_VIOLATION,
-            f"miktar LOT_SIZE minQty altında: {qty} < {filters.min_qty} ({symbol})",
+            f"quantity is below LOT_SIZE minQty: {qty} < {filters.min_qty} ({symbol})",
         )
     if qty > filters.max_qty:
         raise RasatError(
             ErrorCode.FILTER_VIOLATION,
-            f"miktar LOT_SIZE maxQty üstünde: {qty} > {filters.max_qty} ({symbol})",
+            f"quantity exceeds LOT_SIZE maxQty: {qty} > {filters.max_qty} ({symbol})",
         )
     if notional < filters.min_notional:
         raise RasatError(
             ErrorCode.FILTER_VIOLATION,
-            f"tutar MIN_NOTIONAL altında: {notional} < {filters.min_notional} ({symbol})",
+            f"notional is below MIN_NOTIONAL: {notional} < {filters.min_notional} ({symbol})",
         )
 
-    # Temel doğruluk: nihai gereken tutar (notional + fee) bakiyeyi aşamaz.
+    # Core correctness: final required amount (notional + fee) cannot exceed balance.
     check_sufficient_balance(account_balance, notional + fee, symbol)
 
     return {

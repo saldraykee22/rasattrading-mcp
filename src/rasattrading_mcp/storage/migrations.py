@@ -1,8 +1,9 @@
-"""Numaralı migration sistemi.
+"""Numbered migration system.
 
-Daemon açılışta `migrating` durumunda `run_migrations`'ı çağırır; uygulanmamış
-migration'lar sırayla, her biri kendi transaction'ında çalışır. Uygulanan sürümler
-`schema_migrations` tablosuna kaydedilir. Boş DB'de ve dolu DB'de idempotenttir.
+The daemon calls `run_migrations` in the `migrating` state at startup; pending
+migrations run in order, each in its own transaction. Applied versions are
+recorded in the `schema_migrations` table. The process is idempotent on both
+empty and populated databases.
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 def _m1_initial_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
-        -- Ham mum verisi (spot/futures kaynaklı)
+        -- Raw candle data (from spot/futures sources)
         CREATE TABLE IF NOT EXISTS candles (
           symbol TEXT NOT NULL,
           timeframe TEXT NOT NULL,
@@ -45,7 +46,7 @@ def _m1_initial_schema(conn: sqlite3.Connection) -> None:
           PRIMARY KEY (symbol, timeframe, open_time, source)
         );
 
-        -- Futures bağlam sinyali (salt-okunur): funding_rate | open_interest | liquidation
+        -- Futures context signals (read-only): funding_rate | open_interest | liquidation
         CREATE TABLE IF NOT EXISTS futures_context (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           symbol TEXT NOT NULL,
@@ -58,7 +59,7 @@ def _m1_initial_schema(conn: sqlite3.Connection) -> None:
           UNIQUE (symbol, type, event_time)
         );
 
-        -- Immutable PA hesap kayıtları: üzerine yazılmaz, algo_version + effective penceresi korunur
+        -- Immutable PA calculation records: never overwritten; algo_version + effective window preserved
         CREATE TABLE IF NOT EXISTS market_structure (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           symbol TEXT NOT NULL,
@@ -92,7 +93,7 @@ def _m1_initial_schema(conn: sqlite3.Connection) -> None:
           created_at INTEGER NOT NULL
         );
 
-        -- Agent işaretlemeleri
+        -- Agent annotations
         CREATE TABLE IF NOT EXISTS annotations (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           symbol TEXT NOT NULL,
@@ -102,7 +103,7 @@ def _m1_initial_schema(conn: sqlite3.Connection) -> None:
           created_at INTEGER NOT NULL
         );
 
-        -- Alarm tanımları (state machine: armed/triggered/cooldown)
+        -- Alert definitions (state machine: armed/triggered/cooldown)
         CREATE TABLE IF NOT EXISTS alerts (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           alert_id TEXT NOT NULL UNIQUE,
@@ -112,7 +113,7 @@ def _m1_initial_schema(conn: sqlite3.Connection) -> None:
           updated_at INTEGER NOT NULL
         );
 
-        -- Tetiklenen alarm kayıtları (dedup key: alert_id + trigger_key)
+        -- Triggered alert records (dedup key: alert_id + trigger_key)
         CREATE TABLE IF NOT EXISTS triggered_alerts (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           alert_id TEXT NOT NULL,
@@ -122,7 +123,7 @@ def _m1_initial_schema(conn: sqlite3.Connection) -> None:
           UNIQUE (alert_id, trigger_key)
         );
 
-        -- Çoklu hesap (key'ler DPAPI/Modül 3 ile şifrelenir)
+        -- Multiple accounts; credentials are encrypted by the credential store.
         CREATE TABLE IF NOT EXISTS accounts (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           account_id TEXT NOT NULL UNIQUE,
@@ -136,7 +137,7 @@ def _m1_initial_schema(conn: sqlite3.Connection) -> None:
           updated_at INTEGER NOT NULL
         );
 
-        -- Append-only, hash-chain'li audit log (sır asla yazılmaz)
+        -- Append-only, hash-chained audit log (secrets are never written)
         CREATE TABLE IF NOT EXISTS audit_log (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           seq INTEGER NOT NULL UNIQUE,
@@ -166,7 +167,7 @@ def _m2_indexes(conn: sqlite3.Connection) -> None:
 
 
 def _m3_alert_cooldown(conn: sqlite3.Connection) -> None:
-    """Alarm state machine'i için soğuma sütunu (armed→triggered→cooldown→armed)."""
+    """Add the cooldown column for the alert state machine (armed→triggered→cooldown→armed)."""
     conn.execute("ALTER TABLE alerts ADD COLUMN cooldown_until INTEGER")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_state ON alerts (state, updated_at)")
 
@@ -174,10 +175,10 @@ def _m3_alert_cooldown(conn: sqlite3.Connection) -> None:
 def _m4_risk_policy(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
-        -- Hesap bazlı opsiyonel risk politikası (v1: spot long-only)
-        -- max_notional_per_order / max_aggregate_exposure cap'leri:
-        --   REAL NULL = sınırsız; varsa KATI üst sınırdır (tolerans uygulanmaz).
-        -- allowed_symbols: JSON string listesi; boş [] = tüm semboller serbest.
+        -- Optional account-level risk policy (v1: spot long-only)
+        -- max_notional_per_order / max_aggregate_exposure caps:
+        --   REAL NULL = unlimited; when set, this is a HARD upper bound (no tolerance).
+        -- allowed_symbols: JSON string list; empty [] = all symbols allowed.
         CREATE TABLE IF NOT EXISTS risk_policy (
           account_id TEXT PRIMARY KEY,
           max_notional_per_order REAL,
@@ -188,9 +189,9 @@ def _m4_risk_policy(conn: sqlite3.Connection) -> None:
           updated_at INTEGER NOT NULL
         );
 
-        -- Tek kullanımlık override state machine: reserved -> applied|reconciled
-        -- (account_id, policy_version, idempotency_key, actor, expires_at) taşır.
-        -- consumed_by_idem = override'ı tüketen emir isteğinin idempotency key'i.
+        -- One-time override state machine: reserved -> applied|reconciled
+        -- Carries (account_id, policy_version, idempotency_key, actor, expires_at).
+        -- consumed_by_idem = the idempotency key of the order request consuming the override.
         CREATE TABLE IF NOT EXISTS risk_override (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           override_id TEXT NOT NULL UNIQUE,
@@ -218,10 +219,10 @@ def _m4_risk_policy(conn: sqlite3.Connection) -> None:
 def _m5_orders(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
-        -- Emir kayıtları: idempotency + gerçek Binance state machine + aggregate exposure.
+        -- Order records: idempotency + real Binance state machine + aggregate exposure.
         -- status: NEW | PARTIALLY_FILLED | FILLED | CANCELED | REJECTED | EXPIRED | UNKNOWN | PAPER
-        -- (account_id, idempotency_key) UNIQUE -> aynı anahtarla retry çift emir üretmez,
-        --   stored emir döner / durum reconcile edilir.
+        -- (account_id, idempotency_key) UNIQUE -> retries with the same key do not create
+        --   duplicate orders; the stored order is returned / its state is reconciled.
         CREATE TABLE IF NOT EXISTS orders (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           order_id TEXT NOT NULL UNIQUE,
@@ -256,9 +257,9 @@ def _m5_orders(conn: sqlite3.Connection) -> None:
 def _m6_emergency_reconciled(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
-        -- emergency_stop log dosyasından audit_log'a reconcile edilen entry'ler.
-        -- entry_hash UNIQUE -> daemon açılışında aynı emergency entry ikinci kez
-        -- audit_log'a yazılmaz (idempotent reconcile).
+        -- Entries reconciled from the emergency_stop log file into audit_log.
+        -- entry_hash UNIQUE -> the same emergency entry is not written to audit_log
+        -- a second time during daemon startup (idempotent reconciliation).
         CREATE TABLE IF NOT EXISTS emergency_reconciled (
           entry_hash TEXT PRIMARY KEY,
           seq INTEGER NOT NULL,
@@ -269,23 +270,24 @@ def _m6_emergency_reconciled(conn: sqlite3.Connection) -> None:
 
 
 def _m7_orders_equity_snapshot(conn: sqlite3.Connection) -> None:
-    """Emir kaydına hesap equity snapshot'ı (3.20 M1).
+    """Add an account equity snapshot to order records (3.20 M1).
 
-    `execute_on_accounts` equity'yi hesaplayıp `_insert_order`'a geçiyordu ama
-    tabloda sütun yoktu; risk_pct boyutlandırmasının yapıldığı anın equity'si
-    kalıcı olarak saklanmazdı. Eski emir kayıtları NULL kalır (geriye dönük dolgu
-    yok — geçmişin equity'si yeniden hesaplanamaz).
+    `execute_on_accounts` calculated equity and passed it to `_insert_order`, but
+    the table had no column; the equity at the time of risk_pct sizing was not
+    persisted. Existing order records remain NULL (no backfill—the historical
+    equity cannot be recalculated).
     """
     conn.execute("ALTER TABLE orders ADD COLUMN equity_snapshot REAL")
 
 
 def _m8_pending_orders(conn: sqlite3.Connection) -> None:
-    """Alarm → onay bekleyen emir kayıtları (2.19).
+    """Add order records awaiting approval after an alert (2.19).
 
-    Alarm tetiklenip `order_spec` taşıdığında `awaiting_approval` kaydı düşer.
-    Emir OTOMATİK açılmaz: `approve_pending_order` onayında gerçek emir
-    açılır (`executed_order_id` doldurulur), `reject_pending_order` iptal eder.
-    `approved_at`/`executed_order_id` onay akışının audit izidir.
+    When an alert fires with an `order_spec`, an `awaiting_approval` record is
+    created. The order is NOT opened automatically: approval via
+    `approve_pending_order` opens the real order (`executed_order_id` is filled),
+    while `reject_pending_order` cancels it. `approved_at`/`executed_order_id`
+    are the audit trail for the approval flow.
     """
     conn.executescript(
         """
@@ -315,19 +317,20 @@ def _m8_pending_orders(conn: sqlite3.Connection) -> None:
 
 
 def _m9_stop_price(conn: sqlite3.Connection) -> None:
-    """Emir kaydına stop_price sütunu (2.20).
+    """Add the stop_price column to order records (2.20).
 
-    STOP_LOSS_LIMIT emirleri stopPrice taşır; kayıtta da saklanmalı (audit +
-    pozisyon koruma görünürlüğü). Eski emirler NULL kalır.
+    STOP_LOSS_LIMIT orders carry stopPrice; it must also be stored in the record
+    (audit + position-protection visibility). Existing orders remain NULL.
     """
     conn.execute("ALTER TABLE orders ADD COLUMN stop_price REAL")
 
 
 def _m10_stop_limit_price(conn: sqlite3.Connection) -> None:
-    """OCO emir kaydına stop_limit_price sütunu (2.21).
+    """Add the stop_limit_price column to OCO order records (2.21).
 
-    OCO'da stopPrice tetiklenince stopLimitPrice seviyesinde LIMIT satış girer;
-    üç fiyat da (price=TP, stop_price, stop_limit_price) kayıtta durmalı.
+    When stopPrice triggers in an OCO, a LIMIT sell is placed at the
+    stopLimitPrice level; all three prices (price=TP, stop_price,
+    stop_limit_price) must remain in the record.
     """
     conn.execute("ALTER TABLE orders ADD COLUMN stop_limit_price REAL")
 
@@ -392,7 +395,7 @@ def _migration_lock(db_path: Path):
                     break
                 except OSError:
                     if time.monotonic() >= deadline:
-                        raise TimeoutError("migration lock alınamadı")
+                        raise TimeoutError("could not acquire migration lock")
                     time.sleep(0.05)
         else:
             import fcntl
@@ -404,7 +407,7 @@ def _migration_lock(db_path: Path):
                     break
                 except BlockingIOError:
                     if time.monotonic() >= deadline:
-                        raise TimeoutError("migration lock alınamadı")
+                        raise TimeoutError("could not acquire migration lock")
                     time.sleep(0.05)
         yield
     finally:
@@ -438,11 +441,11 @@ def applied_names(conn: sqlite3.Connection) -> set[str]:
 
 
 async def run_migrations(db: Database) -> list[int]:
-    """Uygulanmamış migration'ları sırayla uygular; uygulanan sürümleri döner.
+    """Apply pending migrations in order and return the applied versions.
 
-    Atlama ölçütü: sürüm numarası VEYA isim daha önce uygulanmışsa atlanır.
-    İsim kontrolü, numaralandırmanın değiştiği durumlarda (örn. branch merge'i
-    sonrası yeniden numaralandırma) aynı migration'ın çift uygulanmasını engeller.
+    Skip criterion: skip a migration if its version number OR name was already applied.
+    The name check prevents a migration from being applied twice when numbering
+    changes, for example after a branch merge.
     """
 
     def _run(conn: sqlite3.Connection) -> list[int]:
@@ -454,14 +457,14 @@ async def run_migrations(db: Database) -> list[int]:
             for version, name, fn in MIGRATIONS:
                 if version in existing_versions or name in existing_names:
                     continue
-                with conn:  # her migration tek transaction
+                with conn:  # one transaction per migration
                     fn(conn)
                     conn.execute(
                         "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
                         (version, name, int(time.time())),
                     )
                 applied.append(version)
-                logger.info("migration %d (%s) uygulandı", version, name)
+                logger.info("migration %d (%s) applied", version, name)
             return applied
 
     return await db.write(_run)

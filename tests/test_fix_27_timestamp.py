@@ -1,12 +1,12 @@
-"""2.7 FIX — timestamp birimi (ms → s tek standardı).
+"""2.7 FIX — timestamp units (ms → s single standard).
 
-Review kanıtları test'e çevrilir:
-- Gerçek Binance ms kline'ları saniyeye inmeli ve `filter_closed_candles`
-  tarafından yanlışlıkla elenmemeli.
-- Bilerek eski/stale mum → `freshness` `stale` dönmeli (önceden ms ile fresh).
-- Soğuk (saniye) mum verisi warm sanılmamalı → yeniden çekim tetiklenmeli.
-- Retention saniye sözleşmesiyle doğru budamalı.
-- Session/utc_iso saniye değerle Windows'ta OSError fırlatmamalı.
+Review evidence is converted into tests:
+- Real Binance ms klines must become seconds and must not be incorrectly filtered
+  by `filter_closed_candles`.
+- An intentionally old/stale candle → `freshness` must return `stale` (previously fresh as ms).
+- Cold (seconds) candle data must not be considered warm → trigger a refetch.
+- Retention must prune correctly under the seconds contract.
+- Session/utc_iso must not raise OSError on Windows with second values.
 """
 
 import time
@@ -45,17 +45,17 @@ def _ms_kline(open_ms, close="100.0"):
 
 
 async def test_real_ms_klines_become_seconds_and_survive_closed_filter():
-    """Gerçek Binance ms kline'ları saniyeye iner; kapalı mum filtresi onları elenez."""
+    """Real Binance ms klines become seconds; closed-candle filter does not eliminate them."""
     latest_closed = int(time.time() // PERIOD) * PERIOD - PERIOD
     raw = [_ms_kline((latest_closed - 2 * PERIOD) * 1000), _ms_kline((latest_closed - PERIOD) * 1000)]
     rows = parse_klines(raw)
     assert rows[0]["open_time"] == latest_closed - 2 * PERIOD
     kept = filter_closed_candles(rows, TF)
-    assert len(kept) == 2  # geçmişteki gerçek kapalı mumlar yanlışlıkla elenmez
+    assert len(kept) == 2  # Historical real closed candles are not incorrectly filtered.
 
 
 async def test_filter_closed_candles_rejects_forming_bar():
-    """Şu an oluşmakta olan (kapanmamış) bar elenir."""
+    """The currently forming (unclosed) bar is filtered out."""
     latest_closed = int(time.time() // PERIOD) * PERIOD - PERIOD
     raw = [_ms_kline((latest_closed + PERIOD) * 1000)]
     rows = parse_klines(raw)
@@ -63,7 +63,7 @@ async def test_filter_closed_candles_rejects_forming_bar():
 
 
 async def test_pa_freshness_stale_for_old_data(db):
-    """Bilerek eski bir as_of → stale (önceden ms ile yanlışlıkla fresh)."""
+    """Intentionally old as_of → stale (previously incorrectly fresh as ms)."""
     old = int(time.time()) - 10 * PERIOD
     assert PAEngine.freshness_for(TF, old) == FRESHNESS_STALE
 
@@ -89,7 +89,7 @@ async def test_klineservice_freshness_uses_seconds(db, cfg):
 
 
 async def test_get_candles_cold_seconds_trigger_refetch(cfg, db):
-    """Saniye cinsinden eski mum 'warm' sanılmamalı → öncelikli yeniden çekim tetiklenmeli."""
+    """Old candle in seconds must not be considered 'warm' → trigger a priority refetch."""
     from tests.helpers import FakeClock, FakeRest
     from rasattrading_mcp.data.universe import UniverseService
 
@@ -110,7 +110,7 @@ async def test_get_candles_cold_seconds_trigger_refetch(cfg, db):
 
         await db.write(_w)
         rows = await svc.get_candles("BTCUSDT", "15m", 100)
-        assert len(rows) == 100  # cold → FakeRest'ten taze veri çekildi
+        assert len(rows) == 100  # Cold → fresh data fetched from FakeRest.
         latest = rows[-1]["open_time"]
         assert latest >= int(time.time()) - 3600
     finally:
@@ -118,7 +118,7 @@ async def test_get_candles_cold_seconds_trigger_refetch(cfg, db):
 
 
 async def test_retention_prunes_old_seconds_data(db):
-    """Retention saniye sözleşmesiyle doğru budar (ms ile asla budamıyordu)."""
+    """Retention prunes correctly under the seconds contract (never did so with ms)."""
     now = int(time.time())
 
     def _w(conn):

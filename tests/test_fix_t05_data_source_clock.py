@@ -1,16 +1,16 @@
-"""T05 FIX — futures kline source ayrımı ve server clock.
+"""T05 FIX — futures kline source separation and server clock.
 
-Review bulguları test'e çevrilir (rasattrading-mcp-detayli-review P2):
-- `source="futures"` spot kline endpoint'inden veri alıp futures diye etiketliyordu
-  (`_fetch` her durumda `/api/v3/klines` çağırıyordu).
-- Kline in-flight dedup anahtarında `source` yoktu; concurrent spot/futures
-  istekleri birleşiyor, çağrılardan biri boş/yanlış kaynak okuyabiliyordu.
-- Mum kapanışı ve freshness yerel saate bağlıydı; host saat kayması forming bar'ı
-  kabul etme veya güncel barı stale sayma riski taşıyordu.
+Review findings converted to tests (rasattrading-mcp-detailed-review P2):
+- `source="futures"` fetched from the spot kline endpoint and labeled it futures
+  (`_fetch` always called `/api/v3/klines`).
+- `source` was missing from the in-flight kline dedup key; concurrent spot/futures
+  requests merged, so one call could read empty data or the wrong source.
+- Candle closing and freshness depended on local time; host clock skew could accept
+  a forming bar or mark a current bar stale.
 
-Kapsam: spot `/api/v3/klines`, futures `/fapi/v1/klines` (ayrı REST client),
-source'a özel dedup/warm-map/scheduler/read-write, fapi universe ile sembol
-doğrulama, `/api/v3/time` offset'li injectable clock (fail-closed).
+Scope: spot `/api/v3/klines`, futures `/fapi/v1/klines` (separate REST client),
+source-specific dedup/warm-map/scheduler/read-write, symbol validation against the
+fapi universe, and an injectable offset-aware `/api/v3/time` clock (fail-closed).
 """
 
 import asyncio
@@ -66,12 +66,12 @@ async def _count_by_source(db, symbol, tf):
 
 
 # ---------------------------------------------------------------------------
-# Endpoint / source ayrımı
+# Endpoint / source separation
 # ---------------------------------------------------------------------------
 
 
 async def test_futures_source_calls_fapi_and_stores_no_spot(cfg, db):
-    """source=futures `/fapi/v1/klines` kaydeder ve source=spot satırı üretmez."""
+    """source=futures stores `/fapi/v1/klines` and does not create a source=spot row."""
     fake = FakeRest(["BTCUSDT"])
     _, svc = await _svc(cfg, db, fake)
     try:
@@ -93,7 +93,7 @@ async def test_futures_source_calls_fapi_and_stores_no_spot(cfg, db):
 
 
 async def test_spot_source_keeps_api_v3_and_stores_spot(cfg, db):
-    """Varsayılan spot davranışı korunur: `/api/v3/klines` ve source='spot' satırı."""
+    """Default spot behavior is preserved: `/api/v3/klines` and a source='spot' row."""
     fake = FakeRest(["BTCUSDT"])
     _, svc = await _svc(cfg, db, fake)
     try:
@@ -112,12 +112,12 @@ async def test_spot_source_keeps_api_v3_and_stores_spot(cfg, db):
 
 
 # ---------------------------------------------------------------------------
-# Concurrent dedup: source anahtarın parçası
+# Concurrent dedup: source is part of the key
 # ---------------------------------------------------------------------------
 
 
 class _DualRest(FakeRest):
-    """Futures kline'ı farklı close ile döndürür — kaynaklar ayırt edilebilir."""
+    """Return futures klines with a different close so sources can be distinguished."""
 
     def __init__(self, symbols):
         super().__init__(symbols)
@@ -135,10 +135,10 @@ class _DualRest(FakeRest):
 
 
 async def test_concurrent_spot_futures_no_cross_dedup(cfg, db):
-    """Aynı (symbol,timeframe) için eşzamanlı spot/futures istekleri birbirini dedup etmez.
+    """Concurrent spot/futures requests for the same (symbol,timeframe) do not deduplicate.
 
-    Her çağrı kendi kaynağının verisini döndürür (spot close=100.5, futures=200.5);
-    tek fetch'te birleşseydi biri diğerinin verisiyle dönerdi.
+    Each call returns its own source's data (spot close=100.5, futures=200.5);
+    if merged into one fetch, one would return the other source's data.
     """
     fake = _DualRest(["BTCUSDT"])
     _, svc = await _svc(cfg, db, fake)
@@ -164,19 +164,19 @@ async def test_concurrent_spot_futures_no_cross_dedup(cfg, db):
 
 
 async def test_warm_spot_does_not_warm_futures(cfg, db):
-    """Spot verisi warm olsa bile futures isteği soğuk kalır ve yeniden çeker."""
+    """Even with warm spot data, a futures request remains cold and fetches again."""
     fake = FakeRest(["BTCUSDT"])
     _, svc = await _svc(cfg, db, fake)
     try:
         await svc.get_candles("BTCUSDT", TF, 100, source="spot")
 
-        # Spot warm — ikinci spot isteği fetch yapmamalı
+        # Spot warm—the second spot request must not fetch.
         n_before = len([c for c in fake.calls if c[0] == "/api/v3/klines"])
         await svc.get_candles("BTCUSDT", TF, 100, source="spot")
         n_after = len([c for c in fake.calls if c[0] == "/api/v3/klines"])
         assert n_after == n_before
 
-        # Ama futures hâlâ soğuk → /fapi/v1/klines çekilir
+        # But futures is still cold → fetch /fapi/v1/klines.
         fut_before = len([c for c in fake.calls if c[0] == "/fapi/v1/klines"])
         rows = await svc.get_candles("BTCUSDT", TF, 100, source="futures")
         assert len(rows) == 100
@@ -191,14 +191,14 @@ async def test_warm_spot_does_not_warm_futures(cfg, db):
 
 
 # ---------------------------------------------------------------------------
-# Futures sembol doğrulama
+# Futures symbol validation
 # ---------------------------------------------------------------------------
 
 
 async def test_futures_unknown_symbol_rejected(cfg, db):
-    """Spot evreninde olup fapi'de olmayan sembol futures isteğinde reddedilir."""
+    """A symbol in the spot universe but not in fapi is rejected for a futures request."""
     fake = FakeRest(["BTCUSDT", "ETHUSDT"])
-    fake.fapi_symbols = ["BTCUSDT"]  # ETHUSDT futures'ta yok
+    fake.fapi_symbols = ["BTCUSDT"]  # ETHUSDT is not in futures.
     _, svc = await _svc(cfg, db, fake)
     try:
         with pytest.raises(RasatError) as exc:
@@ -206,7 +206,7 @@ async def test_futures_unknown_symbol_rejected(cfg, db):
         assert exc.value.code == ErrorCode.INVALID_SYMBOL
         assert "futures" in exc.value.message
 
-        # Aynı sembol spot'ta geçerlidir
+        # The same symbol is valid on spot.
         rows = await svc.get_candles("ETHUSDT", TF, 10, source="spot")
         assert len(rows) == 10
     finally:
@@ -214,7 +214,7 @@ async def test_futures_unknown_symbol_rejected(cfg, db):
 
 
 async def test_futures_symbol_independent_of_spot_universe(cfg, db):
-    """Futures doğrulaması fapi evrenine bakar — spot evrenine gerek yok."""
+    """Futures validation uses the fapi universe—it does not need the spot universe."""
     fake = FakeRest(["BTCUSDT"])
     fake.fapi_symbols = ["BTCUSDT", "ETHUSDT"]
     _, svc = await _svc(cfg, db, fake)
@@ -226,11 +226,11 @@ async def test_futures_symbol_independent_of_spot_universe(cfg, db):
 
 
 async def test_futures_universe_unreachable_fail_closed(cfg, db):
-    """fapi exchangeInfo alınamıyorsa futures sembolü sessizce kabul edilmez."""
+    """If fapi exchangeInfo cannot be loaded, the futures symbol is not silently accepted."""
     class _EiFailRest(FakeRest):
         async def get(self, path, params=None, weight=1):
             if path == "/fapi/v1/exchangeInfo":
-                raise RasatError(ErrorCode.INTERNAL_ERROR, "fapi erişilemez")
+                raise RasatError(ErrorCode.INTERNAL_ERROR, "fapi is unreachable")
             return await super().get(path, params, weight)
 
     fake = _EiFailRest(["BTCUSDT"])
@@ -239,22 +239,23 @@ async def test_futures_universe_unreachable_fail_closed(cfg, db):
         with pytest.raises(RasatError) as exc:
             await svc.get_candles("BTCUSDT", TF, 100, source="futures")
         assert exc.value.code == ErrorCode.INVALID_SYMBOL
-        assert "doğrulanamadı" in exc.value.message
+        assert "could not validate symbol" in exc.value.message
     finally:
         await svc.stop()
 
 
 # ---------------------------------------------------------------------------
-# Server clock: kapalı mum ve freshness
+# Server clock: closed candle and freshness
 # ---------------------------------------------------------------------------
 
 
 async def test_clock_offset_rejects_forming_bar(cfg, db):
-    """Offset'li clock: yerel saatin "kapanmış" saydığı bar server'a göre hâlâ forming ise reddedilir.
+    """With an offset clock, reject a bar that local time considers "closed" but the server still considers forming.
 
-    Host saati sunucudan 2 period ileride olsun (offset=-2P). FakeRest bar setini
-    yerel son kapanışa kadar üretir; server saatine göre o barlar hâlâ oluşuyor.
-    Yalnızca server'ın son kapanmış barına (`server_latest_closed`) kadar olanlar saklanır.
+    Host time is 2 periods ahead of server (offset=-2P). FakeRest bar set
+    The local clock produces through its latest close, but those bars are still
+    forming according to server time. Store only through the server's last closed
+    bar (`server_latest_closed`).
     """
     fake = FakeRest(["BTCUSDT"])
     clock = FakeClock(offset=-2 * PERIOD)
@@ -266,7 +267,7 @@ async def test_clock_offset_rejects_forming_bar(cfg, db):
 
         rows = await svc.get_candles("BTCUSDT", TF, 10)
         assert rows[-1]["open_time"] <= server_latest_closed
-        assert rows[-1]["open_time"] < local_latest_closed  # local'in kapanmış dediği bar kabul edilmedi
+        assert rows[-1]["open_time"] < local_latest_closed  # Bar locally considered closed was rejected.
 
         def _q(conn):
             row = conn.execute(
@@ -282,7 +283,7 @@ async def test_clock_offset_rejects_forming_bar(cfg, db):
 
 
 async def test_clock_sync_accepts_forming_bar_drop(cfg, db):
-    """Senkronize clock (offset=0): Binance'in oluşmakta olan barı hâlâ saklanmaz."""
+    """Synchronized clock (offset=0): Binance's forming bar is still not stored."""
     from rasattrading_mcp.config import TIMEFRAME_SECONDS
 
     class _FormingRest(FakeRest):
@@ -303,7 +304,7 @@ async def test_clock_sync_accepts_forming_bar_drop(cfg, db):
         rows = await svc.get_candles("BTCUSDT", TF, 10)
         latest_closed = int(time.time() // PERIOD) * PERIOD - PERIOD
         assert all(r["open_time"] <= latest_closed for r in rows)
-        assert rows[-1]["volume"] == 1000.0  # kısmi hacim (90) saklanmadı
+        assert rows[-1]["volume"] == 1000.0  # Partial volume (90) was not stored.
 
         def _q(conn):
             row = conn.execute(
@@ -318,36 +319,36 @@ async def test_clock_sync_accepts_forming_bar_drop(cfg, db):
 
 
 async def test_clock_unavailable_fail_closed(cfg, db):
-    """Clock yoksa veri saklanmaz ve freshness fail-closed `stale` olur."""
+    """Without clock, data is not stored and freshness is fail-closed `stale`."""
     fake = FakeRest(["BTCUSDT"])
     clock = FakeClock(available=False)
     _, svc = await _svc(cfg, db, fake, clock=clock)
     try:
         rows = await svc.get_candles("BTCUSDT", TF, 100)
-        assert rows == []  # hiçbir satır saklanmadı
+        assert rows == []  # No row was stored.
 
         counts = await _count_by_source(db, "BTCUSDT", TF)
         assert counts == {}
 
-        # DB'de veri olsa bile clock yokken freshness stale'dir (fail-closed)
+        # Even with DB data, freshness is stale without clock (fail-closed).
         assert svc.freshness_for("BTCUSDT", TF, [{"open_time": int(time.time())}]) == FRESHNESS_STALE
     finally:
         await svc.stop()
 
 
 async def test_freshness_uses_clock_offset(cfg, db):
-    """Freshness, server clock'a göre hesaplanır (offset'li)."""
+    """Freshness is calculated against the server clock (with offset)."""
     fake = FakeRest(["BTCUSDT"])
     clock = FakeClock(offset=-PERIOD)  # host 1 period ileride
     _, svc = await _svc(cfg, db, fake, clock=clock)
     try:
         server_now = clock.server_now()
         server_latest_closed = int(server_now // PERIOD) * PERIOD - PERIOD
-        # Server'ın son kapanmış barı → fresh
+        # Server's last closed bar → fresh.
         assert svc.freshness_for("BTCUSDT", TF, [{"open_time": server_latest_closed}]) == "fresh"
-        # Bir önceki bar → stale
+        # Previous bar → stale.
         assert svc.freshness_for("BTCUSDT", TF, [{"open_time": server_latest_closed - PERIOD}]) == FRESHNESS_STALE
-        # Yerel saatin son kapanmışı server'a göre hâlâ forming → fresh sayılmamalı
+        # Local latest close is still forming according to server → must not be fresh.
         local_latest_closed = int(time.time() // PERIOD) * PERIOD - PERIOD
         assert svc.freshness_for("BTCUSDT", TF, [{"open_time": local_latest_closed}]) == FRESHNESS_STALE
     finally:
@@ -360,7 +361,7 @@ async def test_freshness_uses_clock_offset(cfg, db):
 
 
 class _TimeRest:
-    """`/api/v3/time` döndüren minimal REST taklidi."""
+    """Minimal REST double returning `/api/v3/time`."""
 
     def __init__(self, server_time_seconds):
         self.server_time_seconds = server_time_seconds
@@ -376,7 +377,7 @@ async def test_binance_clock_sync_sets_offset():
     now = time.time()
     rest = _TimeRest(now + 120)
     clock = BinanceClock(rest, refresh_seconds=60, max_offset_age_seconds=300)
-    assert clock.server_now() is None  # henüz sync edilmedi
+    assert clock.server_now() is None  # Not synchronized yet.
     assert clock.offset is None
 
     ok = await clock.sync()
@@ -388,7 +389,7 @@ async def test_binance_clock_sync_sets_offset():
 
 
 async def test_binance_clock_bounded_offset_rejected():
-    """Aşırı host saat kayması offset'e güvenilmez kılar (fail-closed)."""
+    """Excessive host clock skew makes the offset untrusted (fail-closed)."""
     now = time.time()
     rest = _TimeRest(now + 100_000)  # ~28 saat kayma
     clock = BinanceClock(rest, max_offset_seconds=3600)
@@ -404,7 +405,7 @@ async def test_binance_clock_stale_offset_returns_none():
     clock = BinanceClock(rest, refresh_seconds=60, max_offset_age_seconds=300)
     ok = await clock.sync()
     assert ok
-    clock._synced_at = 0  # offset çok eski → stale
+    clock._synced_at = 0  # Offset is too old → stale.
     assert clock.server_now() is None
     assert clock.offset is None
 
@@ -413,7 +414,7 @@ async def test_binance_clock_sync_failure_keeps_unavailable():
     class _FailRest(_TimeRest):
         async def get(self, path, params=None, weight=1):
             self.calls.append((path, dict(params or {}), weight))
-            raise RasatError(ErrorCode.INTERNAL_ERROR, "ağ hatası")
+            raise RasatError(ErrorCode.INTERNAL_ERROR, "network error")
 
     clock = BinanceClock(_FailRest(0), max_offset_age_seconds=300)
     ok = await clock.sync()
@@ -429,6 +430,6 @@ async def test_binance_clock_start_stop_refreshes():
     clock.start()
     try:
         await asyncio.sleep(0.15)
-        assert len(rest.calls) >= 2  # arka planda birkaç kez tazelendi
+        assert len(rest.calls) >= 2  # Refreshed several times in the background.
     finally:
         await clock.stop()

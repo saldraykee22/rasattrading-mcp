@@ -223,10 +223,10 @@ async def test_daemon_stop_closes_broker_before_pipeline_and_db(tmp_path):
 
 
 async def test_daemon_run_stops_in_finally_on_cancellation(tmp_path):
-    """run() iptal edilse (CancelledError/Windows Ctrl+C) bile stop() finally'de çalışır.
+    """stop() runs in finally even when run() is canceled (CancelledError/Windows Ctrl+C).
 
-    T3 regresyonu: stop() try/finally dışında olduğunda CancelledError bu satıra
-    ulaşmadan yayılır, DB writer executor ve lock kapanmadan daemon asılı kalırdı.
+    T3 regression: when stop() was outside try/finally, CancelledError propagated
+    before reaching this line, leaving the daemon hanging with DB writer executor and lock open.
     """
     runner = DaemonRunner(Config(data_dir=tmp_path, pipeline_enabled=False))
     events: list[str] = []
@@ -234,7 +234,7 @@ async def test_daemon_run_stops_in_finally_on_cancellation(tmp_path):
     runner.db = _Recorder(events, "db")
 
     task = asyncio.create_task(runner.run())
-    await asyncio.sleep(0.05)  # run() artık _stop.wait()'te bekliyor
+    await asyncio.sleep(0.05)  # run() now waits at _stop.wait().
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -246,7 +246,7 @@ async def test_daemon_run_stops_in_finally_on_cancellation(tmp_path):
 
 
 async def test_daemon_run_returns_zero_on_normal_stop(tmp_path):
-    """Normal bitişte (request_stop) run() 0 döner ve stop() yine çalışır."""
+    """On normal finish (request_stop), run() returns 0 and stop() still runs."""
     runner = DaemonRunner(Config(data_dir=tmp_path, pipeline_enabled=False))
     events: list[str] = []
     runner.order_broker = _Recorder(events, "broker")

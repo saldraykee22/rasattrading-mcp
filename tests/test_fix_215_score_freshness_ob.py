@@ -1,17 +1,17 @@
-"""2.15 FIX — Skor/Tazelik/OB tasarım zayıflıkları regresyon testleri.
+"""2.15 FIX — Score/freshness/OB design-weakness regression tests.
 
-Bağımsız eleştiri ajanının (INJ/SEI/ARB canlı analizi) bulduğu 5 zayıflık test'e
-çevrilir:
+Five weaknesses found by an independent critic agent (INJ/SEI/ARB live analysis)
+are converted into tests:
 
-- S1 (tazelik): `freshness_for` son kapanmış mumdan bir period eski snapshot'ı
-  artık `stale` sayar (önceden `- period` toleransıyla `fresh` diyordu); PA meta
-  `freshness_note` taşır.
-- S2 (mitigasyon ağırlığı): `equal_levels` puanı aktif bölge sayısına göre —
-  10 bölgenin 7'si mitigasyonluysa tam puan verilmez.
-- S3 (funding yön): funding bileşeni `bias: long_crowded|short_crowded` taşır.
-- S4 (breaker): kapanışla kırılan OB `zone_type=breaker` + `mitigated=true`.
-- S5 (OB dedup): aynı/çok yakın fiyat aralığını kapsayan OB'ler tek mantıksal
-  bölgede birleştirilir (birden çok BOS/CHoCH aynı mumu seçiyordu).
+- S1 (freshness): `freshness_for` now considers a snapshot one period older than
+  the last closed candle `stale` (previously `fresh` with `- period` tolerance);
+  PA meta carries `freshness_note`.
+- S2 (mitigation weighting): `equal_levels` points use active-zone count—7 of 10
+  mitigated zones do not receive full points.
+- S3 (funding direction): funding component carries `bias: long_crowded|short_crowded`.
+- S4 (breaker): an OB broken on close becomes `zone_type=breaker` + `mitigated=true`.
+- S5 (OB dedup): OBs covering the same/very close price range merge into one
+  logical zone (multiple BOS/CHoCH events selected the same candle).
 """
 
 import time
@@ -31,7 +31,7 @@ from rasattrading_mcp.storage.migrations import run_migrations
 TF = "1h"
 PERIOD = 3600
 
-# İki BOS event'i (7 ve 12) aynı mumu (index 6) OB adayı seçer → aynı aralık.
+# Two BOS events (7 and 12) select the same candle (index 6) as an OB candidate → same range.
 DUP_EVENTS = [
     (100, 100.5, 99.5, 100), (100, 100.5, 99.5, 100), (99, 100, 98, 99.5),
     (99.5, 100.5, 99, 100), (100, 102, 99.5, 101), (101, 101.5, 100.5, 101),
@@ -40,7 +40,7 @@ DUP_EVENTS = [
     (103, 105, 102.5, 104.5), (104, 104.5, 103.5, 104), (104, 104.5, 103.5, 103.5),
 ]
 
-# OB sonrası fiyat bölgeyi kapanışla aşar → breaker.
+# Price crosses the zone on close after the OB → breaker.
 BREAKER = DUP_EVENTS[:8] + [
     (102, 102.5, 101.5, 102),
     (101.5, 102, 100.4, 100.3),  # close 100.3 < OB.low 100.5 → breaker
@@ -56,24 +56,24 @@ def mk(rows):
 
 
 # ---------------------------------------------------------------------------
-# S1 — tazelik
+# S1 — freshness
 # ---------------------------------------------------------------------------
 
 
 def test_s1_freshness_strict_no_period_tolerance():
-    """Son kapanmış mumdan bir period eski snapshot artık fresh DEĞİL (2.15)."""
+    """A snapshot one period older than the last closed candle is no longer fresh (2.15)."""
     latest_closed = int(time.time() // PERIOD) * PERIOD - PERIOD
-    # En güncel: analiz son kapanmış mumu içerir → fresh.
+    # Latest: analysis includes the last closed candle → fresh.
     assert PAEngine.freshness_for(TF, latest_closed) == FRESHNESS_FRESH
-    # Bir period geri: son kapanmış mum eksik → artık stale (önceden toleransla fresh).
+    # One period behind: last closed candle is missing → stale (previously fresh with tolerance).
     assert PAEngine.freshness_for(TF, latest_closed - PERIOD) == FRESHNESS_STALE
-    # İki period geri: hâlâ stale.
+    # Two periods behind: still stale.
     assert PAEngine.freshness_for(TF, latest_closed - 2 * PERIOD) == FRESHNESS_STALE
     assert PAEngine.freshness_for(TF, None) == FRESHNESS_STALE
 
 
 async def test_s1_pa_meta_carries_freshness_note(db, cfg):
-    """PA tool meta'sı freshness anlamını açıklayan not taşır."""
+    """PA tool meta carries a note explaining freshness semantics."""
     latest_closed = int(time.time() // PERIOD) * PERIOD - PERIOD
     times = [latest_closed - (len(DUP_EVENTS) - 1 - i) * PERIOD for i in range(len(DUP_EVENTS))]
 
@@ -89,13 +89,13 @@ async def test_s1_pa_meta_carries_freshness_note(db, cfg):
     ctx = {"db": db, "config": cfg, "readiness": None, "pipeline": None, "started_at": time.time()}
     dispatcher = build_dispatcher(ctx)
     data, meta = await dispatcher.dispatch("get_full_analysis", {"symbol": "BTCUSDT", "timeframe": TF}, ctx)
-    assert meta.freshness == FRESHNESS_FRESH  # taze mum verisi
+    assert meta.freshness == FRESHNESS_FRESH  # fresh candle data
     assert "freshness_note" in meta.to_dict()
-    assert "kapanmış mum" in meta.to_dict()["freshness_note"]
+    assert "last closed candle" in meta.to_dict()["freshness_note"]
 
 
 async def test_s1_klineservice_freshness_strict(db, cfg):
-    """KlineService.freshness_for da fazladan bir period toleransı içermez."""
+    """KlineService.freshness_for also has no extra period tolerance."""
     from tests.helpers import FakeClock, FakeRest
     from rasattrading_mcp.data.klines import KlineService
     from rasattrading_mcp.data.universe import UniverseService
@@ -111,12 +111,12 @@ async def test_s1_klineservice_freshness_strict(db, cfg):
 
 
 # ---------------------------------------------------------------------------
-# S2 — mitigasyon ağırlığı
+# S2 — mitigation weighting
 # ---------------------------------------------------------------------------
 
 
 def test_s2_equal_levels_weighted_by_active_zones():
-    """10 bölgenin 7'si mitigasyonlu → tam puan (40) verilmez, aktif sayıya göre."""
+    """Seven of 10 zones are mitigated → no full score (40); use active count."""
     zones = [{"kind": "equal_highs", "mitigated": i < 7} for i in range(10)]
     sc = liquidity_score(zones, None)
     eq = sc["components"]["equal_levels"]
@@ -124,7 +124,7 @@ def test_s2_equal_levels_weighted_by_active_zones():
     assert eq["active_zones"] == 3
     assert eq["mitigated_zones"] == 7
     assert eq["points"] == 12.0  # 3/10 * 40
-    assert "puan aktif bölge sayısına göre" in eq["note"]
+    assert "points are based on active zone count" in eq["note"]
 
 
 def test_s2_all_mitigated_scores_zero():
@@ -135,7 +135,7 @@ def test_s2_all_mitigated_scores_zero():
 
 
 # ---------------------------------------------------------------------------
-# S3 — funding yön
+# S3 — funding direction
 # ---------------------------------------------------------------------------
 
 
@@ -171,8 +171,8 @@ def test_s4_breaker_is_mitigated():
     res = compute_order_blocks(mk(BREAKER), st)
     ob = next(o for o in res["order_blocks"] if o["event_index"] == 7)
     assert ob["zone_type"] == "breaker"
-    assert ob["mitigated"] is True  # kapanışla kırılmış → geçerli aktif bölge değil
-    # Varsayılan (aktif) görünümde breaker görünmemeli — include_mitigated ile görünür.
+    assert ob["mitigated"] is True  # Broken on close → not a valid active zone.
+    # Breaker must not appear in the default (active) view—visible with include_mitigated.
     active = [o for o in res["order_blocks"] if not o["mitigated"]]
     assert all(o["zone_type"] != "breaker" for o in active)
 
@@ -183,30 +183,30 @@ def test_s4_breaker_is_mitigated():
 
 
 def test_s5_duplicate_events_same_candle_collapse():
-    """İki BOS event'i aynı mumu seçse de tek mantıksal OB üretilir."""
+    """Two BOS events selecting the same candle still produce one logical OB."""
     st = detect_structure(mk(DUP_EVENTS))
     assert [e["type"] for e in st["events"]] == ["bos_bullish", "bos_bullish"]
     res = compute_order_blocks(mk(DUP_EVENTS), st)
     obs = res["order_blocks"]
-    assert len(obs) == 1  # önceden 2 ayrı kayıt üretiliyordu
+    assert len(obs) == 1  # Previously produced two separate records.
     assert obs[0]["range"] == {"low": 100.5, "high": 101.5}
-    assert obs[0]["event_index"] == 7  # ilk (en erken) kayıt korunur
+    assert obs[0]["event_index"] == 7  # Preserve the first (earliest) record.
 
 
 def test_s5_distinct_ranges_not_merged():
-    """Farklı fiyat aralığındaki OB'ler birleştirilmez."""
+    """OBs with different price ranges are not merged."""
     rows = DUP_EVENTS[:8] + [
-        (102, 102.5, 101.6, 102),     # fiyat ilk OB'ye geri dönmez → aktif kalır
+        (102, 102.5, 101.6, 102),     # Price does not return to first OB → remains active.
         (102, 102.5, 101.6, 102),
         (102.5, 103.5, 102, 103),
-        (103.5, 103.0, 101.8, 102.6),  # kırmızı mum → yeni OB adayı (farklı aralık)
-        (103, 105, 102.4, 104.5),      # bos_bullish@12 → bu mumu OB seçer
+        (103.5, 103.0, 101.8, 102.6),  # Red candle → new OB candidate (different range).
+        (103, 105, 102.4, 104.5),      # bos_bullish@12 → selects this candle as OB.
         (104, 104.5, 103.5, 104),
     ]
     st = detect_structure(mk(rows))
     res = compute_order_blocks(mk(rows), st)
     obs = res["order_blocks"]
-    # İki farklı fiyat aralığı → dedup birleştirmez.
+    # Two different price ranges → dedup does not merge them.
     assert len(obs) == 2
     ranges = {o["range"]["low"] for o in obs}
     assert 100.5 in ranges and 101.8 in ranges

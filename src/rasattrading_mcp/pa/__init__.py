@@ -1,7 +1,7 @@
-"""Modül 2 — Price Action & Screener/Alarm hesaplama katmanı.
+"""Price-action, screener, and alarm computation layer.
 
-Saf, deterministik hesaplama fonksiyonları (swings, likidite, OB/FVG, VWAP,
-session) + kalıcı immutable kayıtları yöneten analiz/annotation/screener/alarm
-servisleri. Tüm eşikler sürümlenir: bir eşik değişirse `algo_version` artar,
-eski kayıtlar `effective_to` ile kapatılır (üzerine yazma yok).
+Pure, deterministic computation functions (swings, liquidity, OB/FVG, VWAP,
+session) plus analysis/annotation/screener/alarm services that manage persistent
+immutable records. All thresholds are versioned: when a threshold changes,
+`algo_version` increases and old records are closed with `effective_to` (never overwritten).
 """

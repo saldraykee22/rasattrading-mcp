@@ -1,13 +1,13 @@
-"""2.18 FIX — PA worker kalıcı yetersiz veriyi tur blokajından ayırır.
+"""2.18 FIX — PA worker separates permanently insufficient data from cycle blocking.
 
-Canlı gözlem: tokenized hisse senedi çiftleri (SMCIBUSDT, ALABBUSDT, ...)
-1d'de yalnızca ~2 kapanmış mum taşıyor; `analyze` `STALE_DATA` fırlatınca
-worker her döngüde 489 sembolün tamamını yeniden işliyordu (1d turları
-~25 sn'de bir tekrarlıyordu) çünkü `_last_processed` hiç ilerleyemiyordu.
+Live observation: tokenized stock pairs (SMCIBUSDT, ALABBUSDT, ...)
+have only ~2 closed candles on 1d; when `analyze` raised `STALE_DATA`, the
+worker reprocessed all 489 symbols every cycle (1d cycles repeated about every
+25 seconds) because `_last_processed` could never advance.
 
-Fix: `STALE_DATA` (yetersiz kapanmış mum) `"insufficient"` olarak sayılır —
-turu bloklamaz, yeni kapalı bar geldiğinde yeniden denenir. Geçici durumlar
-(stale veri, hata, boş) 2.12 davranışını korur: tur bloklanır, retry edilir.
+Fix: `STALE_DATA` (insufficient closed candles) counts as `"insufficient"`—it
+does not block the cycle and is retried when a new closed bar arrives. Transient
+states (stale data, error, empty) preserve 2.12 behavior: block the cycle and retry.
 """
 
 import time
@@ -77,47 +77,47 @@ async def seed_at(db, symbol, rows, open_times):
 
 
 async def test_insufficient_symbol_does_not_block_round(db, cfg):
-    """Sağlıklı + yetersiz veri karışımında tur tamamlanır; yetersiz sembol atlanır."""
+    """A mixed healthy + insufficient-data cycle completes; skip the insufficient symbol."""
     await seed_at(db, "BTCUSDT", UPTREND, _fresh_times(len(UPTREND)))
     await seed_at(db, "SMCIBUSDT", UPTREND[:2], _fresh_times(2))  # 2 bar < 2*SWING_LOOKBACK+1
     worker = PAWorker(PAEngine(db), FakeUniverse(["BTCUSDT", "SMCIBUSDT"]), cfg)
 
-    assert await worker.check_and_process() == 1  # yalnızca BTCUSDT başarılı sayılır
-    assert worker._last_processed.get(TF) is not None  # tur YİNE DE tamamlandı
+    assert await worker.check_and_process() == 1  # Only BTCUSDT counts as successful.
+    assert worker._last_processed.get(TF) is not None  # Cycle still completed.
     assert len(await _read_history(db, "market_structure", "BTCUSDT", TF)) == 1
     assert await _read_history(db, "market_structure", "SMCIBUSDT", TF) == []
 
 
 async def test_all_symbols_insufficient_still_advances(db, cfg):
-    """Yalnızca yetersiz veri olan evren turu bloklamaz (tekrarlanan 489-sembol turları biter)."""
+    """A universe with only insufficient data does not block the cycle (repeated 489-symbol cycles end)."""
     await seed_at(db, "SMCIBUSDT", UPTREND[:2], _fresh_times(2))
     worker = PAWorker(PAEngine(db), FakeUniverse(["SMCIBUSDT"]), cfg)
 
     assert await worker.check_and_process() == 0
     assert worker._last_processed.get(TF) is not None
 
-    # Aynı kapalı bar için tur tekrarlanmaz (marker ilerledi)
+    # Do not repeat the cycle for the same closed bar (marker advanced).
     assert await worker.check_and_process() == 0
     assert worker._last_processed.get(TF) is not None
 
 
 async def test_insufficient_symbol_retried_when_new_bar_arrives(db, cfg):
-    """Yetersiz sembol yeni kapalı bar geldiğinde yeniden denenir (kalıcı atlama değil)."""
+    """Retry an insufficient symbol when a new closed bar arrives (not a permanent skip)."""
     await seed_at(db, "SMCIBUSDT", UPTREND[:2], _fresh_times(2))
     worker = PAWorker(PAEngine(db), FakeUniverse(["SMCIBUSDT"]), cfg)
     assert await worker.check_and_process() == 0
     first_marker = worker._last_processed.get(TF)
     assert first_marker is not None
 
-    # 3. kapanmış bar eklendi (hâlâ < 5, yine insufficient) → yeni bar olduğu için tur başlar
+    # Third closed bar added (still < 5, still insufficient) → cycle starts because it is new.
     times = _fresh_times(3)
     await seed_at(db, "SMCIBUSDT", UPTREND[:3], times)
     assert await worker.check_and_process() == 0
-    assert worker._last_processed.get(TF) == times[2]  # yeni marker
+    assert worker._last_processed.get(TF) == times[2]  # new marker
 
 
 async def test_stale_insufficient_still_blocks_round(db, cfg):
-    """2.12 korunur: yetersiz veri STALE ise (hedef bara yetişmemişse) tur bloklanır."""
+    """Preserve 2.12: if insufficient data is STALE (has not reached target bar), block the cycle."""
     await seed_at(db, "SMCIBUSDT", UPTREND[:2], [OLD_BASE + i * PERIOD for i in range(2)])
     worker = PAWorker(PAEngine(db), FakeUniverse(["SMCIBUSDT"]), cfg)
 

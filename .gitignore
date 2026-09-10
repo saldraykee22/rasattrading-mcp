@@ -29,3 +29,40 @@ venv/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Databases, backups, and temporary files
+*.sqlite*
+*.bak
+*.tmp.*
+*.swp
+*.swo
+
+# Certificates and private keys
+*.pem
+*.key
+*.crt
+*.cer
+*.cert
+*.der
+*.p12
+*.pfx
+*.jks
+*private-key*
+*private_key*
+
+# Coverage and test reports
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.pytest_cache/
+pytest-report.xml
+junit*.xml
+test-results/
+
+# Local configuration
+.env.*
+!.env.example
+*.local.*
+config.local.*
+settings.local.*

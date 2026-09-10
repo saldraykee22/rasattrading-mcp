@@ -1,4 +1,4 @@
-"""2.4 — PA engine (immutable kayıtlar) + annotation + handler entegrasyonu."""
+"""2.4 — PA engine (immutable records) + annotation + handler integration."""
 
 import json
 import time
@@ -15,7 +15,7 @@ from rasattrading_mcp.storage.migrations import run_migrations
 BASE = 1_700_000_000
 TF = "1h"
 
-# UPTREND benzeri: bos_bullish olayları üreten dizilim
+# UPTREND-like sequence producing bos_bullish events.
 UPTREND = [
     (100, 100.5, 99.5, 100),
     (100, 100.5, 99.5, 100),
@@ -23,7 +23,7 @@ UPTREND = [
     (99.5, 100.5, 99, 100),
     (100, 102, 99.5, 101),        # swing high 102
     (101, 101.5, 100.5, 101),
-    (101, 101.5, 100.5, 100.5),   # OB adayı (kırmızı)
+    (101, 101.5, 100.5, 100.5),   # OB candidate (red).
     (100.5, 103, 101, 102.5),     # bos_bullish@7
     (102, 102.5, 101.5, 102),
     (102, 102.5, 101.5, 102),
@@ -34,7 +34,7 @@ UPTREND = [
     (104, 104.5, 103.5, 103.5),
 ]
 
-# Eşit high'lar + sweep (likidite bölgesi mitigate olur)
+# Equal highs + sweep (liquidity zone becomes mitigated).
 EQ_SWEEP = [
     (100, 100.5, 99.5, 100),
     (100, 100.5, 99.5, 100),
@@ -97,7 +97,7 @@ async def test_analyze_recompute_creates_history(db):
     await seed_candles(db, "BTCUSDT", UPTREND)
     engine = PAEngine(db)
     await engine.analyze("BTCUSDT", TF)
-    # Yeni bar kapanınca yeniden hesaplama → eski kayıt kapanır
+    # Recalculate after a new bar closes → old record closes.
     await seed_candles(db, "BTCUSDT", UPTREND, offset=len(UPTREND))
     await engine.analyze("BTCUSDT", TF)
 
@@ -106,7 +106,7 @@ async def test_analyze_recompute_creates_history(db):
     assert rows[0]["effective_to"] == rows[1]["effective_from"] - 1
     assert rows[1]["effective_to"] is None
 
-    # Aynı bar için tekrar → yeni satır açılmaz, mevcut güncellenir
+    # Repeat for same bar → no new row, update existing.
     await engine.analyze("BTCUSDT", TF)
     rows2 = await _read_history(db, "market_structure", "BTCUSDT", TF)
     assert len(rows2) == 2
@@ -124,7 +124,7 @@ async def test_liquidity_zones_default_excludes_mitigated(db):
     await seed_candles(db, "BTCUSDT", EQ_SWEEP)
     engine = PAEngine(db)
     data = await engine.get_liquidity_zones("BTCUSDT", TF)
-    assert data["zones"] == []  # tek bölge mitigate oldu → varsayılan aktif listesi boş
+    assert data["zones"] == []  # One zone was mitigated → default active list is empty.
 
     full = await engine.get_liquidity_zones("BTCUSDT", TF, include_mitigated=True)
     assert len(full["zones"]) == 1
@@ -135,13 +135,13 @@ async def test_order_blocks_default_and_history(db):
     await seed_candles(db, "BTCUSDT", UPTREND)
     engine = PAEngine(db)
     data = await engine.get_order_blocks("BTCUSDT", TF)
-    # UPTREND'te 2 BOS event'i (7 ve 12) aynı mumu OB adayı seçer → aynı fiyat
-    # aralığı dedup ile tek mantıksal bölgeye iner (2.15); bu bölge de sweep
-    # edildiği için varsayılan (aktif) liste boş döner.
+    # In UPTREND, two BOS events (7 and 12) select the same candle as an OB
+    # candidate → dedup reduces the same price range to one logical zone (2.15);
+    # because this zone is also swept, the default (active) list is empty.
     assert data["order_blocks"] == []
 
     full = await engine.get_order_blocks("BTCUSDT", TF, include_mitigated=True)
-    assert len(full["order_blocks"]) == 1  # tek mantıksal bölge tarihçede görünür
+    assert len(full["order_blocks"]) == 1  # One logical zone appears in history.
     assert full["order_blocks"][0]["mitigated"] is True
 
 
@@ -150,7 +150,7 @@ async def test_get_full_analysis_reasonable_size(db):
     engine = PAEngine(db)
     data = await engine.get_full_analysis("BTCUSDT", TF)
     assert {"structure", "liquidity", "order_blocks", "vwap", "sessions"} <= set(data)
-    assert len(data["vwap"]["points"]) <= 20  # context şişmesin
+    assert len(data["vwap"]["points"]) <= 20  # Keep context compact.
     assert data["liquidity"]["score"]["futures_available"] is False
 
 

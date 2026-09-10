@@ -179,11 +179,11 @@ async def test_remove_real_account_refused_fail_closed(account_service, account_
     assert "trading_lock=real" in err.details["reasons"]
     assert err.details["account_id"] == created["account_id"]
 
-    # DB ve credentials değişmedi.
+    # DB and credentials are unchanged.
     assert (await account_service.list_accounts())["count"] == 1
     assert await account_service.get_credentials(created["account_id"]) == ("AK_REAL", "AS_REAL")
 
-    # Red audit kaydı düştü, zincir sağlam ve secret içermiyor.
+    # Red audit record was added; chain is intact and contains no secret.
     assert await AuditLog(account_db).verify() == []
     entries = await AuditLog(account_db).tail(10)
     refused = [e for e in entries if e["action"] == "remove_account_refused"]
@@ -203,7 +203,7 @@ async def test_remove_paper_account_with_open_order_refused(account_service, acc
     assert exc_info.value.code == ErrorCode.ACCOUNT_IN_USE
     assert any(r.startswith("open_orders=") for r in exc_info.value.details["reasons"])
 
-    # Hesap ve emir yerinde kaldı; hiçbir şey cascade ile silinmedi.
+    # Account and order remain; nothing was cascade-deleted.
     assert (await account_service.list_accounts())["count"] == 1
     assert await _order_count(account_db, created["account_id"]) == 1
 
@@ -235,7 +235,7 @@ async def test_remove_paper_account_with_risk_policy_refused(account_service, ac
 async def test_remove_paper_account_with_risk_override_refused(account_service, account_db):
     created = await account_service.add_account(label="paper")
     risk = RiskPolicyService(account_db, audit=AuditLog(account_db))
-    await risk.create_override(created["account_id"], reason="deneme", idempotency_key="ov-1", actor="test")
+    await risk.create_override(created["account_id"], reason="test", idempotency_key="ov-1", actor="test")
 
     with pytest.raises(RasatError) as exc_info:
         await account_service.remove_account(created["account_id"])
@@ -261,7 +261,7 @@ async def test_remove_paper_account_keeps_historical_orders(account_service, acc
     removed = await account_service.remove_account(created["account_id"])
     assert removed["removed"] is True
     assert (await account_service.list_accounts())["count"] == 0
-    # Tarihsel kayıtlar cascade ile silinmez.
+    # Historical records are not cascade-deleted.
     assert await _order_count(account_db, created["account_id"]) == 1
 
 
@@ -282,7 +282,7 @@ async def test_remove_races_with_dependency_insert_stays_consistent(account_serv
 
     def _insert_open_order_if_account_exists(conn):
         if conn.execute("SELECT 1 FROM accounts WHERE account_id = ?", (account_id,)).fetchone() is None:
-            raise RasatError(ErrorCode.ACCOUNT_NOT_FOUND, "account silindi")
+            raise RasatError(ErrorCode.ACCOUNT_NOT_FOUND, "account was deleted")
         oid = uuid.uuid4().hex
         now = int(time.time())
         conn.execute(
@@ -306,8 +306,8 @@ async def test_remove_races_with_dependency_insert_stays_consistent(account_serv
 
     acc_present, open_order_count = await account_db.read(_snapshot)
 
-    # Tek writer altında ya insert kazandı (remove ACCOUNT_IN_USE, hesap duruyor)
-    # ya da remove kazandı (hesap gitti, orphan emir kalmadı). İkisi birden asla.
+    # Under one writer, either insert wins (remove gets ACCOUNT_IN_USE, account remains)
+    # or remove wins (account is gone, no orphan order remains). Never both.
     assert not (acc_present is False and open_order_count > 0)
     if acc_present:
         assert isinstance(results[0], RasatError)

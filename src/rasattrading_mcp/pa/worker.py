@@ -1,17 +1,17 @@
-"""2.8 — Arka plan PA hesaplama worker'ı.
+"""2.8 — Background PA computation worker.
 
-Plan Bölüm 2.3: sabit timeframe seti (15m/1h/4h/1d) sürekli güncel tutulur.
-Bu worker, bir timeframe'in kapalı barı yenilendiğinde evrendeki semboller için
-PA zincirini otomatik yeniden hesaplar — agent'ın `get_market_structure`
-çağrısını beklemeden. Sembolün mum verisi hedef kapalı bara yetişmemişse
-(stale / kline scheduler tamamlamadıysa) yeniden hesaplama atlanır; veri
-tazelenince bir sonraki turda işlenir. Concurrency semaphore ile sınırlanır.
+Plan Section 2.3: continuously keep the fixed timeframe set (15m/1h/4h/1d) current.
+When a timeframe's closed bar updates, this worker recomputes the PA chain for
+universe symbols automatically, without waiting for the agent's
+`get_market_structure` call. If candle data has not reached the target closed bar
+(stale / kline scheduler has not finished), skip computation and process it on the
+next pass after refresh. Limit concurrency with a semaphore.
 
-2.18: **Kalıcı yetersiz veri** (tokenized hisse senedi gibi yeni listelenmiş
-sembollerde `PA_LOOKBACK` kadarlık kapanmış mum bulunamaması) turu bloklamaz:
-o semboller `insufficient` sayılır, `_last_processed` ilerler ve yeni kapalı
-bar geldiğinde yeniden denenir. Aksi halde tek bloklayıcı sembol (örn. 1d'de
-2 mumluk SMCIBUSDT) her döngüde 489 sembolün tamamını yeniden işletiyordu.
+2.18: **Persistent insufficient data** (newly listed symbols such as tokenized
+stocks lacking `PA_LOOKBACK` closed candles) does not block a pass: mark those
+symbols `insufficient`, advance `_last_processed`, and retry when a new closed bar
+arrives. Otherwise one blocking symbol (e.g. SMCIBUSDT with two 1d candles) would
+reprocess all 489 symbols on every loop.
 """
 
 from __future__ import annotations
@@ -38,10 +38,10 @@ class PAWorker:
 
     @staticmethod
     def latest_closed(tf: str, now: float | None = None) -> int:
-        """Timeframe'in son kapanmış mumunun `open_time`'ı (server clock ile, T2).
+        """`open_time` of the timeframe's last closed candle (server clock, T2).
 
-        `now` verilmezse yerel saate düşülür; `PAWorker` turları server clock ile
-        tutarlı kalması için `engine._now()` geçirir.
+        If `now` is omitted, fall back to local time; `PAWorker` passes `engine._now()`
+        so passes remain consistent with the server clock.
         """
         period = TIMEFRAME_SECONDS[tf]
         if now is None:
@@ -56,18 +56,17 @@ class PAWorker:
             except asyncio.CancelledError:
                 return
             except Exception:  # noqa: BLE001
-                logger.exception("PA worker döngü hatası")
+                logger.exception("PA worker loop failed")
 
     async def check_and_process(self) -> int:
-        """Bir geçiş: yeni kapalı bar olan timeframe'ler için PA'yı yeniden hesaplar.
+        """One pass: recompute PA for timeframes with a new closed bar.
 
-        İşlenen (başarılı) sembol sayısını döndürür (gözlem/diagnostik). İlk turda her
-        timeframe işlenir (soğuk evren warm-up'ı) — `_last_processed` boştur.
-        Marker yalnızca timeframe turu TAMAMEN başarılı olduğunda ilerler:
-        stale/hatalı/boş kalan bir sembol varsa aynı kapalı bar bir sonraki
-        turda tekrar denenir (2.12 fix). **Kalıcı yetersiz veri sembolleri
-        (`insufficient`, 2.18) turu bloklamaz** — onlar yeni kapalı bar
-        geldiğinde yeniden denenir.
+        Return the number of processed (successful) symbols (observability/diagnostics).
+        Process every timeframe on the first pass (cold-universe warm-up); `_last_processed`
+        is empty. Advance the marker only when a timeframe pass is COMPLETELY successful:
+        retry the same closed bar on the next pass if any symbol is stale/failed/empty
+        (2.12 fix). **Persistent insufficient-data symbols (`insufficient`, 2.18) do
+        not block a pass**; retry them when a new closed bar arrives.
         """
         processed = 0
         now = self.engine._now()
@@ -78,7 +77,7 @@ class PAWorker:
             symbols = sorted(self.universe.snapshot())
             if not symbols:
                 continue
-            logger.info("PA yeniden hesaplama turu: %s (%d sembol)", tf, len(symbols))
+            logger.info("PA recomputation pass: %s (%d symbols)", tf, len(symbols))
             results = await asyncio.gather(
                 *(self._process(symbol, tf) for symbol in symbols), return_exceptions=True
             )
@@ -90,30 +89,30 @@ class PAWorker:
         return processed
 
     async def _process(self, symbol: str, tf: str) -> bool | str:
-        """Sembolü işler. `True` başarı, `"insufficient"` kalıcı yetersiz veri,
-        `False` geçici başarısızlık (sonraki turda yeniden denenir)."""
+        """Process a symbol. `True` success, `"insufficient"` persistent insufficient data,
+        `False` transient failure (retry on the next pass)."""
         async with self._sem:
             try:
                 candles = await self.engine._load_candles(symbol, tf, PA_LOOKBACK)
             except Exception as exc:  # noqa: BLE001
-                logger.debug("PA mum yüklenemedi (atlandı): %s %s — %r", symbol, tf, exc)
+                logger.debug("could not load PA candles (skipped): %s %s — %r", symbol, tf, exc)
                 return False
             if not candles:
                 return False
             if self.engine.freshness(tf, candles[-1]["open_time"]) != FRESHNESS_FRESH:
-                # Mum verisi hedef kapalı bara yetişmedi → kline scheduler tamamlayınca işlenir.
+                # Candle data has not reached the target closed bar → process after kline scheduler catches up.
                 return False
             try:
                 await self.engine.analyze(symbol, tf)
                 return True
             except RasatError as exc:
                 if exc.code == ErrorCode.STALE_DATA:
-                    # Kalıcı yetersiz veri (örn. tokenized stock'ta 1d için az mum):
-                    # turu bloklamaz, yeni kapalı bar geldiğinde yeniden denenir.
-                    logger.info("PA veri yetersiz (atlandı): %s %s — %s", symbol, tf, exc.message)
+                    # Persistent insufficient data (e.g. too few 1d candles for a
+                    # tokenized stock): do not block the pass; retry on a new closed bar.
+                    logger.info("insufficient PA data (skipped): %s %s — %s", symbol, tf, exc.message)
                     return "insufficient"
-                logger.warning("PA hesaplama başarısız: %s %s — %s", symbol, tf, exc.message)
+                logger.warning("PA computation failed: %s %s — %s", symbol, tf, exc.message)
                 return False
             except Exception as exc:  # noqa: BLE001
-                logger.warning("PA hesaplama başarısız: %s %s — %r", symbol, tf, exc)
+                logger.warning("PA computation failed: %s %s — %r", symbol, tf, exc)
                 return False

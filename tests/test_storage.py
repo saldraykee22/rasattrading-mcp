@@ -54,7 +54,7 @@ async def test_migrations_on_empty_db(cfg, db):
         return {r["name"] for r in conn.execute("PRAGMA table_info(orders)").fetchall()}
 
     order_cols = await db.read(_order_cols)
-    assert "equity_snapshot" in order_cols  # 3.20 M1: migration 7 sütunu ekler
+    assert "equity_snapshot" in order_cols  # 3.20 M1: migration 7 adds the column.
 
     def _pending_cols(conn):
         return {r["name"] for r in conn.execute("PRAGMA table_info(pending_orders)").fetchall()}
@@ -80,7 +80,7 @@ async def test_migrations_idempotent_on_filled_db(cfg, db):
 
     await db.write(_insert)
     applied_again = await run_migrations(db)
-    assert applied_again == []  # ikinci çalıştırma no-op
+    assert applied_again == []  # Second run is a no-op.
 
     def _count(conn):
         return conn.execute("SELECT COUNT(*) AS c FROM candles").fetchone()["c"]
@@ -118,7 +118,7 @@ async def test_write_queue_returns_value(cfg, db):
 
 
 async def test_concurrent_writers_no_lock_errors(cfg, db):
-    """WS+REST+PA+alarm+execution simülasyonu: eşzamanlı yazıcılar hata üretmemeli."""
+    """WS+REST+PA+alert+execution simulation: concurrent writers must not error."""
     await run_migrations(db)
 
     def _mk_writer(n, i):
@@ -184,7 +184,7 @@ async def test_audit_append_and_verify(cfg, db):
 
     tail = await audit.tail()
     assert len(tail) == 3
-    # Sır redact edildi (tail seq DESC olduğu için aktöre göre bul)
+    # Secret was redacted (find by actor because tail seq is DESC).
     place_order = next(t for t in tail if t["actor"] == "agent-a")
     assert "SECRET123" not in place_order["details"]
     assert "REDACTED" in place_order["details"]
@@ -220,7 +220,7 @@ async def test_audit_detects_deletion(cfg, db):
 
 
 async def test_immutable_record_pattern(cfg, db):
-    """market_structure gibi immutable kayıtlar üzerine yazılmaz, pencerelerle kapatılır."""
+    """Immutable records such as market_structure are not overwritten; close them with windows."""
     await run_migrations(db)
 
     def _insert(conn):
@@ -254,7 +254,7 @@ async def test_retention_prunes_old_candles(cfg, db):
 
     def _insert(conn):
         now = 1_700_000_000
-        # A (15m) çok eski -> budanır; B (1d) yeni -> kalır
+        # A (15m) very old → pruned; B (1d) new → retained.
         conn.execute(
             "INSERT INTO candles (symbol, timeframe, open_time, open, high, low, close, volume, source, updated_at) "
             "VALUES ('A','15m',?,1,2,0,3,1,'spot',?)",

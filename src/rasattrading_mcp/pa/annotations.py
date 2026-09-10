@@ -1,7 +1,7 @@
-"""2.4 — Chart annotation servisi (symbol+timeframe anahtarlı, stateless).
+"""2.4 — Chart annotation service (keyed by symbol+timeframe, stateless).
 
-Agent'ların kendi PA işaretlemeleri `annotations` tablosuna kaydedilir.
-Sembol+timeframe bazlı ekleme/okuma/temizleme; hesaplama mantığı yoktur.
+Agents' own PA annotations are stored in the `annotations` table.
+Add/read/clear by symbol+timeframe; there is no computation logic.
 """
 
 from __future__ import annotations
@@ -21,17 +21,17 @@ class AnnotationService:
     async def annotate(
         self, symbol: str, timeframe: str, annotations: list[dict] | dict, created_by: str = "agent"
     ) -> list[int]:
-        """Bir veya birden çok işaretlemeyi ekler; kaydedilen id'leri döner."""
+        """Add one or more annotations and return their saved IDs."""
         if not isinstance(symbol, str) or not symbol:
-            raise RasatError(ErrorCode.INVALID_REQUEST, "symbol zorunlu (string)")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "symbol is required (string)")
         if not isinstance(timeframe, str) or not timeframe:
-            raise RasatError(ErrorCode.INVALID_REQUEST, "timeframe zorunlu (string)")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "timeframe is required (string)")
         items = annotations if isinstance(annotations, list) else [annotations]
         if not items:
             return []
         for it in items:
             if not isinstance(it, dict):
-                raise RasatError(ErrorCode.INVALID_REQUEST, "annotation bir nesne olmalı")
+                raise RasatError(ErrorCode.INVALID_REQUEST, "annotation must be an object")
 
         now = int(time.time())
 

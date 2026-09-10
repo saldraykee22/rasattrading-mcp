@@ -1,9 +1,10 @@
-"""2.19 FIX — Alarm → ajan bildirimi (notify_command) + onay bekleyen emir (order_spec).
+"""Alert → agent notification (notify_command) + order awaiting approval (order_spec).
 
-Kullanıcı akışı: alarm tetiklenince (a) daemon harici bir komut çalıştırır
-(örn. `traycer agent send` ile ajanı uyandırır), (b) alarm `order_spec`
-taşıyorsa `pending_orders`'a `awaiting_approval` kaydı düşer. Emir OTOMATİK
-AÇILMAZ: `approve_pending_order` → handler emri açar → `executed`.
+User flow: when an alert fires, (a) the daemon runs an external command
+(for example, an agent notification via `agent notify`), and (b) when the alert
+carries `order_spec`, it creates an `awaiting_approval` record in
+`pending_orders`. The order is NOT opened automatically:
+`approve_pending_order` → handler opens the order → `executed`.
 """
 
 import json
@@ -74,7 +75,7 @@ def _make_service(db, notify_command=None):
 
 
 async def test_alert_with_order_spec_creates_pending_on_trigger(db):
-    """order_spec'li alarm tetiklenince awaiting_approval kaydı düşer (emir açılmaz)."""
+    """When an alert with order_spec fires, create awaiting_approval (order is not opened)."""
     await seed(db, "BTCUSDT", UPTREND)
     engine, alarms = _make_service(db)
 
@@ -104,7 +105,7 @@ async def test_alert_with_order_spec_creates_pending_on_trigger(db):
 
 
 async def test_alert_without_order_spec_creates_no_pending(db):
-    """order_spec yoksa tetiklenme pending kaydı üretmez (eski davranış korunur)."""
+    """Without order_spec, firing does not create a pending record (preserve old behavior)."""
     await seed(db, "BTCUSDT", UPTREND)
     engine, alarms = _make_service(db)
 
@@ -118,7 +119,7 @@ async def test_alert_without_order_spec_creates_no_pending(db):
 
 
 async def test_order_spec_validation(db):
-    """order_spec allowlist: bilinmeyen anahtar / eksik zorunlu reddedilir."""
+    """order_spec allowlist: reject unknown keys / missing required fields."""
     engine, alarms = _make_service(db)
     from rasattrading_mcp.errors import ErrorCode, RasatError
 
@@ -132,7 +133,7 @@ async def test_order_spec_validation(db):
     with pytest.raises(RasatError) as e2:
         await alarms.create_alert(
             "BTCUSDT", TF, [{"type": "structure_event", "event": "bos_bullish"}],
-            order_spec={"symbol": "BTCUSDT", "side": "BUY"},  # account_id yok
+        order_spec={"symbol": "BTCUSDT", "side": "BUY"},  # account_id missing.
         )
     assert e2.value.code == ErrorCode.INVALID_REQUEST
 
@@ -145,7 +146,7 @@ async def test_order_spec_validation(db):
 
 
 async def test_notify_uses_safe_argv_shell_false(db, monkeypatch):
-    """T02: notify güvenli argv + shell=False; placeholder'lar tek argv elemanı."""
+    """T02: notify uses safe argv + shell=False; placeholders remain one argv element."""
     await seed(db, "BTCUSDT", UPTREND)
     calls = []
 
@@ -156,7 +157,7 @@ async def test_notify_uses_safe_argv_shell_false(db, monkeypatch):
     monkeypatch.setattr("rasattrading_mcp.pa.alarms.subprocess.Popen", _fake_popen)
     engine, alarms = _make_service(
         db,
-        notify_command="traycer agent send --message {note} --symbol {symbol} --tf {timeframe} --id {alert_id}",
+        notify_command="agent notify --message {note} --symbol {symbol} --tf {timeframe} --id {alert_id}",
     )
     created = await alarms.create_alert(
         "BTCUSDT", TF, [{"type": "structure_event", "event": "bos_bullish", "since_bars": 24}],
@@ -168,7 +169,7 @@ async def test_notify_uses_safe_argv_shell_false(db, monkeypatch):
     argv = calls[0]["argv"]
     kwargs = calls[0]["kwargs"]
     assert kwargs["shell"] is False
-    assert argv[0:3] == ["traycer", "agent", "send"]
+    assert argv[0:2] == ["agent", "notify"]
     assert argv[argv.index("--message") + 1] == "; whoami"
     assert argv[argv.index("--symbol") + 1] == "BTCUSDT"
     assert argv[argv.index("--tf") + 1] == TF
@@ -176,7 +177,7 @@ async def test_notify_uses_safe_argv_shell_false(db, monkeypatch):
 
 
 async def test_notify_note_shell_metachars_stays_single_arg(db, monkeypatch):
-    """T02: note içindeki shell metacharacter'ları process komutu olarak yorumlanmaz."""
+    """T02: shell metacharacters in note are not interpreted as process commands."""
     await seed(db, "BTCUSDT", UPTREND)
     calls = []
 
@@ -198,7 +199,7 @@ async def test_notify_note_shell_metachars_stays_single_arg(db, monkeypatch):
 
 
 async def test_notify_parse_error_fails_closed(db, monkeypatch):
-    """T02: şablon parse hatasında notify fail-closed — process başlamaz, alarm state bozulmaz."""
+    """T02: on template parse error, notify fails closed—the process does not start and alert state is unchanged."""
     await seed(db, "BTCUSDT", UPTREND)
     called = []
 
@@ -207,7 +208,7 @@ async def test_notify_parse_error_fails_closed(db, monkeypatch):
         return None
 
     monkeypatch.setattr("rasattrading_mcp.pa.alarms.subprocess.Popen", _fake_popen)
-    engine, alarms = _make_service(db, notify_command="notifier --message '{note}")  # dengesiz tırnak
+    engine, alarms = _make_service(db, notify_command="notifier --message '{note}")  # Unbalanced quote.
     await alarms.create_alert(
         "BTCUSDT", TF, [{"type": "structure_event", "event": "bos_bullish", "since_bars": 24}],
         cooldown_seconds=0,
@@ -216,11 +217,11 @@ async def test_notify_parse_error_fails_closed(db, monkeypatch):
 
     assert called == []
     triggered = await alarms.get_triggered_alerts()
-    assert len(triggered["triggered"]) == 1  # tetiklenme kaydı bozulmadı
+    assert len(triggered["triggered"]) == 1  # Trigger record remains intact.
 
 
 async def test_notify_does_not_log_command_or_note(db, monkeypatch, caplog):
-    """T02: komutun tamamı loglanmaz (note/hassas içerik sızmaz)."""
+    """T02: the full command is not logged (note/sensitive content does not leak)."""
     import logging
 
     await seed(db, "BTCUSDT", UPTREND)
@@ -241,7 +242,7 @@ async def test_notify_does_not_log_command_or_note(db, monkeypatch, caplog):
 
 
 async def test_approve_reject_pending_lifecycle(db):
-    """onay/red state machine'i: awaiting → approved|rejected; retry güvenli."""
+    """Approval/rejection state machine: awaiting → approved|rejected; retry-safe."""
     await seed(db, "BTCUSDT", UPTREND)
     engine, alarms = _make_service(db)
 
@@ -254,18 +255,18 @@ async def test_approve_reject_pending_lifecycle(db):
     rec = (await alarms.get_pending_orders())["pending"][0]
     oid = rec["order_id"]
 
-    # onayla
+    # Approve the order.
     await alarms.approve_pending_order(oid)
     assert (await alarms.get_pending_orders(status="approved"))["count"] == 1
 
-    # aynı emri tekrar onaylamak reddedilmeli (state zaten approved)
+    # Re-approving the same order must be rejected (state is already approved).
     from rasattrading_mcp.errors import ErrorCode, RasatError
 
     with pytest.raises(RasatError) as e:
         await alarms.approve_pending_order(oid)
     assert e.value.code == ErrorCode.INVALID_REQUEST
 
-    # ikinci bir emir üret (cooldown 0 → yeni bar tetikleyebilir)
+    # Create a second order (cooldown 0 → a new bar can trigger it).
     await alarms.create_alert(
         "BTCUSDT", TF, [{"type": "structure_event", "event": "bos_bullish", "since_bars": 24}],
         cooldown_seconds=0,
@@ -273,6 +274,6 @@ async def test_approve_reject_pending_lifecycle(db):
     )
     await engine.analyze("BTCUSDT", TF)
     rec2 = (await alarms.get_pending_orders(status=PENDING_AWAITING))["pending"][-1]
-    await alarms.reject_pending_order(rec2["order_id"], reason="kullanıcı vazgeçti")
+    await alarms.reject_pending_order(rec2["order_id"], reason="user canceled")
     assert rec2["order_id"] not in [p["order_id"] for p in (await alarms.get_pending_orders(status=PENDING_AWAITING))["pending"]]
     assert (await alarms.get_pending_orders(status=PENDING_REJECTED))["count"] == 1

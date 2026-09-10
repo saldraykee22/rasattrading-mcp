@@ -1,8 +1,8 @@
-"""2.8 FIX — arka plan PA worker: bar kapanışında otomatik yeniden hesaplama.
+"""2.8 FIX — background PA worker: automatic recalculation at bar close.
 
-Review kanıtları test'e çevrilir:
-- Agent tool çağırmadan, bir timeframe kapandığında PA kaydı otomatik üretilir/güncellenir.
-- Stale mum verisi varken yeniden hesaplama yapılmaz (tetiklenmez).
+Review evidence is converted into tests:
+- When a timeframe closes, generate/update the PA record automatically without an agent tool call.
+- Do not recalculate (or trigger) while candle data is stale.
 """
 
 import time
@@ -73,7 +73,7 @@ def _worker(db, cfg):
 
 
 async def test_worker_produces_pa_without_agent_call(db, cfg):
-    """Agent `get_market_structure` çağırmadan worker PA kaydını üretir."""
+    """Worker creates the PA record without an agent `get_market_structure` call."""
     await seed_at(db, "BTCUSDT", UPTREND, _fresh_times(len(UPTREND)))
     worker = _worker(db, cfg)
     processed = await worker.check_and_process()
@@ -84,7 +84,7 @@ async def test_worker_produces_pa_without_agent_call(db, cfg):
 
 
 async def test_worker_skips_stale_data(db, cfg):
-    """Stale mum verisi varken yeniden hesaplama yapılmaz."""
+    """Do not recalculate while candle data is stale."""
     await seed_at(db, "BTCUSDT", UPTREND, [OLD_BASE + i * PERIOD for i in range(len(UPTREND))])
     worker = _worker(db, cfg)
     processed = await worker.check_and_process()
@@ -93,7 +93,7 @@ async def test_worker_skips_stale_data(db, cfg):
 
 
 async def test_worker_recomputes_on_new_closed_bar(db, cfg, monkeypatch):
-    """Yeni kapalı bar → aynı sembolün PA kaydı otomatik güncellenir (eski kayıt kapanır)."""
+    """New closed bar → PA record for the same symbol updates automatically (old record closes)."""
     import time as _time
 
     now0 = int(time.time())
@@ -114,9 +114,9 @@ async def test_worker_recomputes_on_new_closed_bar(db, cfg, monkeypatch):
 
 
 async def test_worker_does_not_duplicate_same_bar(db, cfg):
-    """Aynı bar için ikinci turda yeni kayıt açılmaz (idempotent)."""
+    """Do not create a new record on the second cycle for the same bar (idempotent)."""
     await seed_at(db, "BTCUSDT", UPTREND, _fresh_times(len(UPTREND)))
     worker = _worker(db, cfg)
     assert await worker.check_and_process() == 1
-    assert await worker.check_and_process() == 0  # yeni kapalı bar yok
+    assert await worker.check_and_process() == 0  # No new closed bar.
     assert len(await _read_history(db, "market_structure", "BTCUSDT", TF)) == 1

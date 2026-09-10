@@ -46,7 +46,7 @@ async def test_enable_real_trading_is_permanent_and_audited(services):
     assert result["trading_lock"] == "real"
     assert result["already_real"] is False
 
-    # idempotent: tekrar çağrı hata değil
+    # Idempotent: repeated call is not an error.
     again = await accounts.enable_real_trading(created["account_id"])
     assert again["already_real"] is True
 
@@ -96,14 +96,14 @@ async def test_set_risk_policy_upserts_and_bumps_version(services):
     assert first["changed"] is True
     assert first["allowed_symbols"] == ["BTCUSDT", "ETHUSDT"]  # upper + dedup
 
-    # aynı değerle tekrar -> değişiklik yok, versiyon artmaz
+    # Same value again → no change, version does not increase.
     unchanged = await risk.set_risk_policy(
         created["account_id"], max_notional_per_order=1000, allowed_symbols=["BTCUSDT", "ETHUSDT"]
     )
     assert unchanged["policy_version"] == 1
     assert unchanged["changed"] is False
 
-    # yeni değer -> versiyon artar
+    # New value → version increases.
     changed = await risk.set_risk_policy(created["account_id"], max_aggregate_exposure=5000)
     assert changed["policy_version"] == 2
     assert changed["changed"] is True
@@ -146,13 +146,13 @@ async def test_override_reserved_and_single_use(services):
     created = await _add_cred_account(accounts)
     await risk.set_risk_policy(created["account_id"], max_notional_per_order=1000)
 
-    override = await risk.create_override(created["account_id"], reason="büyük pozisyon")
+    override = await risk.create_override(created["account_id"], reason="large position")
     assert override["state"] == "reserved"
     assert override["scope"] == "next_order"
     assert override["policy_version"] == 1
     assert override["expires_at"] > override["created_at"]
 
-    # ilk tüketim kazanır
+    # First consumption wins.
     consumed = await risk.consume_override(
         created["account_id"], policy_version=1, consumed_by_idem="order-1"
     )
@@ -160,7 +160,7 @@ async def test_override_reserved_and_single_use(services):
     assert consumed["state"] == "applied"
     assert consumed["consumed_by_idem"] == "order-1"
 
-    # ikinci tüketim aynı override'ı alamaz
+    # Second consumption cannot get the same override.
     second = await risk.consume_override(created["account_id"], policy_version=1, consumed_by_idem="order-2")
     assert second is None
 
@@ -171,8 +171,8 @@ async def test_override_idempotent_retry_no_duplicate(services):
     risk_db, accounts, risk = services
     created = await _add_cred_account(accounts)
 
-    first = await risk.create_override(created["account_id"], reason="tek", idempotency_key="ov-1")
-    retry = await risk.create_override(created["account_id"], reason="tek", idempotency_key="ov-1")
+    first = await risk.create_override(created["account_id"], reason="test", idempotency_key="ov-1")
+    retry = await risk.create_override(created["account_id"], reason="test", idempotency_key="ov-1")
     assert retry["override_id"] == first["override_id"]
     assert retry["state"] == "reserved"
 
@@ -205,7 +205,7 @@ async def test_override_requires_reason_and_valid_scope(services):
 async def test_concurrent_consumers_single_winner(services):
     risk_db, accounts, risk = services
     created = await _add_cred_account(accounts)
-    await risk.create_override(created["account_id"], reason="yarış")
+    await risk.create_override(created["account_id"], reason="race")
 
     results = await asyncio.gather(
         risk.consume_override(created["account_id"], policy_version=0, consumed_by_idem="order-a"),
@@ -222,10 +222,10 @@ async def test_override_stale_when_policy_version_changes(services):
     created = await _add_cred_account(accounts)
     await risk.set_risk_policy(created["account_id"], max_notional_per_order=1000)
 
-    await risk.create_override(created["account_id"], reason="eski politikaya bağlı")
+    await risk.create_override(created["account_id"], reason="bound to old policy")
     await risk.set_risk_policy(created["account_id"], max_notional_per_order=5000)
 
-    # policy_version değişti; eski override tüketilemez ve reconcile edilir
+    # policy_version changed; old override cannot be consumed and is reconciled.
     consumed = await risk.consume_override(created["account_id"], policy_version=2, consumed_by_idem="order-x")
     assert consumed is None
 
@@ -240,7 +240,7 @@ async def test_override_stale_when_policy_version_changes(services):
 async def test_reconcile_expired_overrides(services):
     risk_db, accounts, risk = services
     created = await _add_cred_account(accounts)
-    override = await risk.create_override(created["account_id"], reason="süresi dolar")
+    override = await risk.create_override(created["account_id"], reason="will expire")
     reconciled = await risk.reconcile_overrides(now=override["expires_at"] + 1)
     assert reconciled == 1
 
@@ -252,15 +252,15 @@ async def test_reconcile_expired_overrides(services):
     assert await risk.reconcile_overrides() == 0
 
 
-# ---------- tolerans ilkesi + katı cap'ler ----------
+# ---------- tolerance principle + strict caps ----------
 
 
 def test_within_tolerance_soft_threshold():
-    # RR hedef 2.0, tolerans %2 -> 1.97 (band içi) kabul, 1.95 (band dışı) red
+    # RR target 2.0, 2% tolerance → 1.97 (inside band) accepted, 1.95 (outside) rejected.
     assert within_tolerance(1.97, 2.0, DEFAULT_TOLERANCE_PCT)
     assert within_tolerance(1.95, 2.0, DEFAULT_TOLERANCE_PCT) is False
     assert within_tolerance(2.03, 2.0, DEFAULT_TOLERANCE_PCT)
-    # tolerans sıfır = katı
+    # Zero tolerance = strict.
     assert within_tolerance(1.999, 2.0, 0) is False
     assert within_tolerance(2.0, 2.0, 0)
 
@@ -322,7 +322,7 @@ async def test_risk_tools_registered_and_dispatch(services):
 
     override, _ = await dispatcher.dispatch(
         "override_risk_policy",
-        {"account_id": created["account_id"], "reason": "tool üzerinden", "idempotency_key": "ov-tool"},
+        {"account_id": created["account_id"], "reason": "through tool", "idempotency_key": "ov-tool"},
         ctx,
     )
     assert override["state"] == "reserved"
@@ -330,6 +330,6 @@ async def test_risk_tools_registered_and_dispatch(services):
     fetched, _ = await dispatcher.dispatch("get_risk_policy", {"account_id": created["account_id"]}, ctx)
     assert fetched["max_notional_per_order"] == 1000
 
-    # temel doğruluk kontrolleri override'dan bağımsız çalışır (3.3 kapsamı, burada dokunulmaz)
+    # Basic correctness checks run independently of override (3.3 scope, untouched here).
     policy = await risk.get_policy(created["account_id"])
     assert policy["policy_version"] == 1

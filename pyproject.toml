@@ -5,10 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "rasattrading-mcp"
 version = "0.1.0"
-description = "AI ajanlar icin Binance price-action/likidite odakli MCP sunucusu (daemon + ince MCP adapter)"
+description = "A Binance price-action/liquidity-focused MCP server for AI agents (daemon + thin MCP adapter)"
 requires-python = ">=3.11"
 dependencies = [
-  "mcp>=1.0,<2.0",
+  "mcp>=1.29.0,<2.0",
   "aiohttp>=3.9.0",
   "websockets>=12.0",
   "psutil>=5.9",

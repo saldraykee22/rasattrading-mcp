@@ -1,20 +1,20 @@
-"""2.5 — Screener (scan_market): allowlisted filtre AST + güvenli değerlendirme.
+"""2.5 — Screener (scan_market): allowlisted filter AST plus safe evaluation.
 
-Filtreler serbest SQL DEĞİLDİR. `validate_filters` bilinen türler ve anahtar
-kümeleriyle sınırlı bir AST üretir; bilinmeyen tür/anahtar/tipe sahip her girdi
-reddedilir (enjeksiyon riski yok — değerlendirme Python tarafında, bağlı
-parametrelerle yapılır). Değerlendirme sembol başına sembol context'i üzerinden
-çalışır; veri `stale` ise sembol sonucu açıkça `data_stale: true` taşır.
+Filters are NOT free-form SQL. `validate_filters` builds an AST limited to known
+types and key sets; reject every input with an unknown type/key/type (no injection
+risk — evaluation happens in Python with bound parameters). Evaluate through a
+per-symbol context; when data is `stale`, the symbol result explicitly carries
+`data_stale: true`.
 
-Filtre türleri:
-- volume_change: {recent_bars?, baseline_bars?, min?, max?} — son pencere hacmi
-  vs önceki eşit pencere (%)
-- price_change: {window_bars?, min?, max?} — close değişimi (%)
+Filter types:
+- volume_change: {recent_bars?, baseline_bars?, min?, max?} — recent window volume
+  vs. preceding equal window (%)
+- price_change: {window_bars?, min?, max?} — close change (%)
 - structure_event: {event, since_bars?}
 - liquidity_sweep_occurred: {since_bars?}
 - near_order_block: {max_distance_pct}
-- funding_rate: {min?, max?}   (yalnız fresh veri eşleşir)
-- oi_change: {min?, max?, window?} (OI örnekleri arası % değişim)
+- funding_rate: {min?, max?}   (only fresh data matches)
+- oi_change: {min?, max?, window?} (percentage change between OI samples)
 - above_below_vwap: {position: above|below}
 """
 
@@ -55,7 +55,7 @@ FILTER_KEYS: dict[str, set[str]] = {
 
 EVENT_TYPES = {"bos_bullish", "bos_bearish", "choch_bullish", "choch_bearish"}
 
-# pozitif integer bekleyen anahtarlar (varsa)
+# Keys that require a positive integer when present.
 INT_KEYS_BY_FILTER: dict[str, tuple[str, ...]] = {
     "volume_change": ("recent_bars", "baseline_bars"),
     "price_change": ("window_bars",),
@@ -81,60 +81,60 @@ def _defaults(f: dict) -> dict:
 
 
 def validate_filters(filters: list | dict | None, combine: str = "AND") -> dict:
-    """Filtre listesini doğrular; normalize edilmiş kök AST düğümünü döner."""
+    """Validate the filter list and return the normalized root AST node."""
     combine = (combine or "AND").upper()
     if combine not in ("AND", "OR"):
-        raise RasatError(ErrorCode.INVALID_REQUEST, f"combine yalnızca AND|OR olabilir: {combine}")
+        raise RasatError(ErrorCode.INVALID_REQUEST, f"combine can only be AND|OR: {combine}")
     items = filters if isinstance(filters, list) else ([filters] if filters else [])
     if not items:
-        raise RasatError(ErrorCode.INVALID_REQUEST, "en az bir filtre gerekli")
+        raise RasatError(ErrorCode.INVALID_REQUEST, "at least one filter is required")
     validated = [_validate_node(it) for it in items]
     return {"type": combine.lower(), "filters": validated}
 
 
 def _validate_node(node: Any) -> dict:
     if not isinstance(node, dict) or "type" not in node:
-        raise RasatError(ErrorCode.INVALID_REQUEST, "filtre bir nesne ve 'type' alanı taşımalı")
+        raise RasatError(ErrorCode.INVALID_REQUEST, "filter must be an object with a 'type' field")
     ftype = node["type"]
     if ftype in ("and", "or"):
         for key in node:
             if key not in ("type", "filters"):
-                raise RasatError(ErrorCode.INVALID_REQUEST, f"{ftype} düğümü bilinmeyen anahtar: {key}")
+                raise RasatError(ErrorCode.INVALID_REQUEST, f"unknown key in {ftype} node: {key}")
         subs = node.get("filters")
         if not isinstance(subs, list) or not subs:
-            raise RasatError(ErrorCode.INVALID_REQUEST, f"{ftype} düğümü en az bir alt filtre ister")
+            raise RasatError(ErrorCode.INVALID_REQUEST, f"{ftype} node requires at least one child filter")
         return {"type": ftype, "filters": [_validate_node(s) for s in subs]}
     if ftype not in FILTER_KEYS:
-        raise RasatError(ErrorCode.INVALID_REQUEST, f"bilinmeyen filtre türü: {ftype}")
+        raise RasatError(ErrorCode.INVALID_REQUEST, f"unknown filter type: {ftype}")
     allowed = FILTER_KEYS[ftype]
     for key in node:
         if key == "type":
             continue
         if key not in allowed:
-            raise RasatError(ErrorCode.INVALID_REQUEST, f"filtre '{ftype}' bilinmeyen anahtar: {key}")
+            raise RasatError(ErrorCode.INVALID_REQUEST, f"unknown key in filter '{ftype}': {key}")
     for key in INT_KEYS_BY_FILTER.get(ftype, ()):
         if key in node and (isinstance(node[key], bool) or not isinstance(node[key], int) or node[key] < 1):
-            raise RasatError(ErrorCode.INVALID_REQUEST, f"{ftype}.{key} pozitif integer olmalı (verildi: {node[key]!r})")
+            raise RasatError(ErrorCode.INVALID_REQUEST, f"{ftype}.{key} must be a positive integer (given: {node[key]!r})")
     for key in ("min", "max"):
         if key in node:
             v = node[key]
             if isinstance(v, bool) or not isinstance(v, (int, float)):
-                raise RasatError(ErrorCode.INVALID_REQUEST, f"{ftype}.{key} sayı olmalı")
+                raise RasatError(ErrorCode.INVALID_REQUEST, f"{ftype}.{key} must be a number")
     if "min" in node and "max" in node and node["min"] > node["max"]:
-        raise RasatError(ErrorCode.INVALID_REQUEST, f"{ftype}: min, max'tan büyük olamaz")
+        raise RasatError(ErrorCode.INVALID_REQUEST, f"{ftype}: min cannot exceed max")
     if ftype == "structure_event" and node.get("event") not in EVENT_TYPES:
-        raise RasatError(ErrorCode.INVALID_REQUEST, f"bilinmeyen structure event: {node.get('event')}")
+        raise RasatError(ErrorCode.INVALID_REQUEST, f"unknown structure event: {node.get('event')}")
     if ftype == "above_below_vwap" and node.get("position") not in ("above", "below"):
-        raise RasatError(ErrorCode.INVALID_REQUEST, "above_below_vwap.position above|below olmalı")
+        raise RasatError(ErrorCode.INVALID_REQUEST, "above_below_vwap.position must be above|below")
     if ftype == "near_order_block":
         v = node.get("max_distance_pct")
         if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
-            raise RasatError(ErrorCode.INVALID_REQUEST, "near_order_block.max_distance_pct >= 0 sayı olmalı")
+            raise RasatError(ErrorCode.INVALID_REQUEST, "near_order_block.max_distance_pct must be a number >= 0")
     return _defaults(node)
 
 
 # ---------------------------------------------------------------------------
-# Filtre değerlendirme
+# Filter evaluation
 # ---------------------------------------------------------------------------
 
 
@@ -293,11 +293,10 @@ def _eval_node(node: dict, ctx: dict) -> bool:
 
 
 def _eval_with_matches(node: dict, ctx: dict) -> tuple[bool, list[dict]]:
-    """`_eval_node` + eşleşen yaprak filtreler (denetlenebilirlik için, 2.16).
+    """`_eval_node` plus matching leaf filters (for auditability, 2.16).
 
-    `(bool, [eşleşen filtre düğümleri])` döner. AND düğümünde tüm alt filtreler
-    eşleşmişse eşleşenler birleştirilir; OR düğümünde yalnız eşleşen alt
-    filtreler toplanır.
+    Return `(bool, [matching filter nodes])`. For an AND node, merge matches when
+    all child filters match; for an OR node, collect only matching child filters.
     """
     ftype = node["type"]
     if ftype == "and":
@@ -321,7 +320,7 @@ def _eval_with_matches(node: dict, ctx: dict) -> tuple[bool, list[dict]]:
 
 
 def _signal_summary(f: dict, ctx: dict) -> str:
-    """Eşleşen bir filtre için kısa, insan-okunur sinyal özeti (2.16)."""
+    """Short, human-readable signal summary for a matching filter (2.16)."""
     ftype = f["type"]
     if ftype == "structure_event":
         return f"{f['event']} since={f['since_bars']}"
@@ -364,7 +363,7 @@ def _signal_summary(f: dict, ctx: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Screener servisi
+# Screener service
 # ---------------------------------------------------------------------------
 
 
@@ -373,10 +372,10 @@ class Screener:
         self.db = db
         self.engine = engine or PAEngine(db, pipeline=pipeline)
         self.pipeline = pipeline
-        # T2 (K3 deseni — bkz. pa/alarms.py): depolanmış analiz yokken talep
-        # üzerine `analyze` (ve dolayısıyla warm-up/backfill yükü) soğuk evrende
-        # başıboş artmasın — her scan turunda sınırlı on-demand hesaplamaya izin
-        # verilir, aşan semboller ertelenir (`deferred_analysis`).
+        # T2 (K3 pattern — see pa/alarms.py): bound on-demand `analyze` (and thus
+        # warm-up/backfill load) in a cold universe when stored analysis is absent;
+        # allow limited on-demand computation per scan pass and defer excess symbols
+        # (`deferred_analysis`).
         if compute_budget is None:
             cfg = self.engine.config if self.engine is not None else None
             compute_budget = getattr(cfg, "alarm_compute_budget", 8) if cfg is not None else 8
@@ -385,7 +384,7 @@ class Screener:
         self._compute_deferred = 0
 
     def begin_evaluation_pass(self) -> None:
-        """Yeni scan turu başlangıcı: on-demand PA hesap bütçesi sıfırlanır (T2)."""
+        """Start a new scan pass: reset the on-demand PA computation budget (T2)."""
         self._compute_used = 0
         self._compute_deferred = 0
 
@@ -402,9 +401,9 @@ class Screener:
         return await self.db.read(_q)
 
     async def _build_context(self, symbol: str, timeframe: str, needs_analysis: bool, filter_types: list[str]) -> dict | None:
-        # PA engine'in yapı/likidite payload'ıyla AYNI pencere (2.16 fix): event
-        # indeksleri bu pencereye göre üretilir; farklı mum sayısı event/sweep
-        # indekslerini hizasız bırakıp gerçek son olayları kaçırıyordu.
+        # SAME window as the PA engine's structure/liquidity payload (2.16 fix):
+        # event indexes are generated relative to this window; a different candle
+        # count misaligned event/sweep indexes and missed recent events.
         candles = await self.engine._read_candles(symbol, timeframe, PA_LOOKBACK)
         if not candles:
             return None
@@ -424,8 +423,8 @@ class Screener:
             lz = await _read_current(self.db, "liquidity_zones", symbol, timeframe)
             ob = await _read_current(self.db, "order_blocks", symbol, timeframe)
             if ms is None or lz is None or ob is None:
-                # T2: soğuk evrende her sembol için bütçesiz analyze çağrısı scan'i
-                # dakikalarca sürdürebiliyordu — K3 deseniyle sınırlandırılır.
+                # T2: an unbudgeted analyze call for every symbol in a cold universe
+                # could keep a scan running for minutes; bound it with the K3 pattern.
                 if self._compute_used >= self._compute_budget:
                     self._compute_deferred += 1
                     return None
@@ -452,12 +451,12 @@ class Screener:
         return series[-1] if series else None
 
     def _symbol_validity(self, symbol: str) -> bool | None:
-        """Evren doğrulanabilirse sembol geçerliliği (2.16): True/False, bilinmiyorsa None.
+        """Symbol validity when the universe can be verified (2.16): True/False, else None.
 
-        `data_stale` yalnızca PA tazeliğini ölçer; sembolün hâlâ işlem yapılabilir
-        olduğunu (evrende olup olmadığını) kapsamaz. Evren yüklüyse (`snapshot`
-        dolu) `universe.contains` ile doğrularız; evren henüz yüklenmemişse
-        (snapshot boş) filtreleme yapamayız — `None` döner, sembol aday kalır.
+        `data_stale` measures only PA freshness; it does not say whether the symbol
+        is still tradable (in the universe). When the universe is loaded (non-empty
+        `snapshot`), validate with `universe.contains`; when it is not loaded (empty
+        snapshot), filtering is impossible, so return `None` and keep the symbol as a candidate.
         """
         if self.pipeline is None or not hasattr(self.pipeline, "universe"):
             return None
@@ -478,9 +477,9 @@ class Screener:
     ) -> dict:
         root = validate_filters(filters, combine)
         if not 1 <= limit <= 250:
-            raise RasatError(ErrorCode.INVALID_REQUEST, f"limit 1-250 arası olmalı (verildi: {limit})")
+            raise RasatError(ErrorCode.INVALID_REQUEST, f"limit must be between 1 and 250 (given: {limit})")
         if sort_by not in ("symbol", "price_change", "volume_change"):
-            raise RasatError(ErrorCode.INVALID_REQUEST, f"bilinmeyen sort_by: {sort_by}")
+            raise RasatError(ErrorCode.INVALID_REQUEST, f"unknown sort_by: {sort_by}")
         self.begin_evaluation_pass()
 
         def _collect(node, acc):
@@ -501,7 +500,7 @@ class Screener:
         for symbol in symbols:
             valid = self._symbol_validity(symbol)
             if valid is False:
-                # Delist edilmiş / evrende olmayan sembol — yanıltıcı eşleşme üretme (2.16).
+                # Delisted / non-universe symbol — do not produce a misleading match (2.16).
                 continue
             ctx = await self._build_context(symbol, timeframe, needs_analysis, filter_types)
             if ctx is None:
@@ -522,8 +521,8 @@ class Screener:
                 "sort_value": self._sort_value(sort_by, ctx),
             }
             if stale and require_fresh:
-                # T2: stale semboller filtre sonucuna karışık tazelikte girmesin
-                # (alarmlarla aynı fail-closed davranış); ayrı raporda görünür kalır.
+                # T2: do not mix stale symbols into filter results (same fail-closed
+                # behavior as alarms); keep them visible in the separate report.
                 stale_symbols.append({"symbol": symbol, "as_of": ctx["as_of"]})
                 continue
             matched.append(entry)

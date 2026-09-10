@@ -1,10 +1,10 @@
-"""2.13 POLISH — M2 immutable doğrulama + M5 algo_version + K2 alarm gecikmesi + K3 warm-up bütçesi.
+"""2.13 POLISH — M2 immutable validation + M5 algo_version + K2 alert delay + K3 warm-up budget.
 
-Review bulguları (entegrasyon-glue-review M2/M5/K1/K2/K3) test'e çevrilir:
-- M2: aynı bar için algo_version değişince eski revision effective_to ile kapanır.
-- M5: PA tool meta'sı gerçek `algo_version` taşır (None değil).
-- K2: alarm döngüsü ilk değerlendirmeyi sleep'ten ÖNCE yapar (30s gecikme yok).
-- K3: depolanmış analiz yokken on-demand `analyze` per-tur bütçeyle sınırlanır.
+Review findings (integration-glue-review M2/M5/K1/K2/K3) are converted into tests:
+- M2: when algo_version changes for the same bar, close the old revision with effective_to.
+- M5: PA tool meta carries the real `algo_version` (not None).
+- K2: alert loop performs its first evaluation BEFORE sleep (no 30s delay).
+- K3: when no stored analysis exists, on-demand `analyze` is limited by per-cycle budget.
 """
 
 import asyncio
@@ -61,12 +61,12 @@ async def seed(db, symbol, rows):
 
 
 # ---------------------------------------------------------------------------
-# M2 — immutable doğrulama (analysis.py _store_payload)
+# M2 — immutable validation (analysis.py _store_payload)
 # ---------------------------------------------------------------------------
 
 
 async def test_m2_same_bar_version_change_closes_old(db):
-    """Aynı effective_from'da algo_version değişirse eski revision tarihçede kalır."""
+    """When algo_version changes at the same effective_from, keep the old revision in history."""
     await _store_payload(db, "market_structure", "BTCUSDT", TF, "swing-v1", 300, {"a": 1})
     await _store_payload(db, "market_structure", "BTCUSDT", TF, "swing-v2", 300, {"a": 2})
     rows = await _read_history(db, "market_structure", "BTCUSDT", TF)
@@ -75,13 +75,13 @@ async def test_m2_same_bar_version_change_closes_old(db):
     open_rows = [r for r in rows if r["effective_to"] is None]
     assert len(closed) == 1
     assert closed[0]["algo_version"] == "swing-v1"
-    assert closed[0]["effective_to"] == 300  # nokta aralık, üzerine yazma yok
+    assert closed[0]["effective_to"] == 300  # Point range, no overwrite.
     assert len(open_rows) == 1
     assert open_rows[0]["algo_version"] == "swing-v2"
 
 
 # ---------------------------------------------------------------------------
-# M5 — meta.algo_version gerçek değer taşır
+# M5 — meta.algo_version carries the real value
 # ---------------------------------------------------------------------------
 
 
@@ -103,7 +103,7 @@ async def test_m5_pa_meta_carries_real_algo_version(db, cfg):
 
 
 # ---------------------------------------------------------------------------
-# K2 — alarm döngüsü ilk değerlendirmeyi sleep'ten önce yapar
+# K2 — alert loop evaluates before sleep
 # ---------------------------------------------------------------------------
 
 
@@ -135,7 +135,7 @@ async def test_k2_alarm_loop_evaluates_before_first_sleep(cfg):
             if ("eval", "BTCUSDT") in runner.alarm_service.passes:
                 break
             await asyncio.sleep(0.01)
-        # 300s sleep'ten önce değerlendirme yapıldığına göre ilk tur anında.
+        # First cycle is immediate because evaluation occurs before the 300s sleep.
         assert "begin" in runner.alarm_service.passes
         assert ("eval", "BTCUSDT") in runner.alarm_service.passes
     finally:
@@ -144,7 +144,7 @@ async def test_k2_alarm_loop_evaluates_before_first_sleep(cfg):
 
 
 # ---------------------------------------------------------------------------
-# K3 — on-demand PA hesabı per-tur bütçeyle sınırlanır
+# K3 — on-demand PA calculation is limited by per-cycle budget
 # ---------------------------------------------------------------------------
 
 
@@ -160,13 +160,13 @@ async def test_k3_compute_budget_limits_on_demand_analyze(db):
     assert await _read_history(db, "market_structure", "BTCUSDT", TF) == []
     assert await _read_history(db, "market_structure", "SOLUSDT", TF) == []
 
-    # Bütçe 1 → ilk sembol hesaplatılır, ikincisi bu turda ertelenir.
+    # Budget 1 → first symbol is analyzed, second is deferred this cycle.
     await alarms.evaluate_symbol("BTCUSDT", TF)
     await alarms.evaluate_symbol("SOLUSDT", TF)
     assert len(await _read_history(db, "market_structure", "BTCUSDT", TF)) == 1
     assert await _read_history(db, "market_structure", "SOLUSDT", TF) == []
 
-    # Yeni tur (begin_evaluation_pass) → bütçe sıfırlanır, SOLUSDT de hesaplanır.
+    # New cycle (begin_evaluation_pass) → budget resets, SOLUSDT is also analyzed.
     alarms.begin_evaluation_pass()
     await alarms.evaluate_symbol("SOLUSDT", TF)
     assert len(await _read_history(db, "market_structure", "SOLUSDT", TF)) == 1

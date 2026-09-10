@@ -1,11 +1,11 @@
-"""T01 — Execution validation, timeout ve order lifecycle regresyon testleri.
+"""T01 — Execution validation, timeout, and order lifecycle regression tests.
 
 Kapsar:
-- ortak `validate_execution_order`: finite/enum/koşullu alanlar/stop yönü/OCO
+- shared `validate_execution_order`: finite/enum/conditional fields/stop direction/OCO
   geometrisi/SymbolFilters (min/max/step/tick/min-notional);
-- LIMIT fiyat fallback'inin kaldırılması (açık fiyat zorunlu);
-- broker `asyncio.TimeoutError` → canonical TIMEOUT/reconcile (kör retry yok);
-- close_all_positions exchange open order kapsamı + cancellation audit;
+- removal of LIMIT price fallback (explicit price required);
+- broker `asyncio.TimeoutError` → canonical TIMEOUT/reconcile (no blind retry);
+- close_all_positions exchange open-order scope + cancellation audit;
 - get_total_exposure per-account errors / complete=false + risk gating fail-closed;
 - risk.py / position_sizing.py NaN fail-closed;
 - HTTP /rpc: schema validation, transport field merge, body limit, error redaction.
@@ -117,7 +117,7 @@ async def _order_rows(db):
 
 
 # =====================================================================
-# Validator — unit düzeyi
+# Validator — unit level
 # =====================================================================
 
 
@@ -156,7 +156,7 @@ def test_validator_conditional_fields():
 
 
 def test_validator_stop_direction_vs_market():
-    # SELL stop koruması: stop market'in ALTINDA olmalı.
+    # SELL stop protection: stop must be BELOW the market.
     with pytest.raises(RasatError) as exc:
         validate_execution_order(
             side="SELL", order_type="STOP_LOSS_LIMIT", quantity=1.0,
@@ -202,7 +202,7 @@ def test_validator_filter_quantity_min_max():
 
 
 def test_validator_filter_step_and_tick():
-    # miktar step katı değil
+    # Quantity is not a step multiple.
     with pytest.raises(RasatError) as exc:
         validate_execution_order(
             side="BUY", order_type="MARKET", quantity=0.1234567,
@@ -210,7 +210,7 @@ def test_validator_filter_step_and_tick():
         )
     assert exc.value.code == ErrorCode.FILTER_VIOLATION
 
-    # limit fiyatı tick katı değil
+    # Limit price is not a tick multiple.
     with pytest.raises(RasatError) as exc:
         validate_execution_order(
             side="BUY", order_type="LIMIT", quantity=1.0, price=100.005,  # tick 0.01
@@ -229,22 +229,22 @@ def test_validator_filter_min_notional():
 
 
 def test_validator_stop_price_price_filter():
-    # stop_price da PRICE_FILTER min/max/tick'e tabidir (yalnızca price değil).
-    # SELL stop < market geçerli iken tick katı olmayan stop reddedilmeli.
+    # stop_price is also subject to PRICE_FILTER min/max/tick (not only price).
+    # Reject a non-tick-multiple stop even when SELL stop < market is valid.
     with pytest.raises(RasatError) as exc:
         validate_execution_order(
             side="SELL", order_type="STOP_LOSS_LIMIT", quantity=1.0,
             price=90.0, stop_price=95.005, market_price=100.0, filters=FILTERS,
         )
     assert exc.value.code == ErrorCode.FILTER_VIOLATION
-    # stop_price min_price altında → FILTER_VIOLATION
+    # stop_price below min_price → FILTER_VIOLATION
     with pytest.raises(RasatError) as exc:
         validate_execution_order(
             side="SELL", order_type="STOP_LOSS_LIMIT", quantity=1.0,
             price=90.0, stop_price=0.005, market_price=100.0, filters=FILTERS,
         )
     assert exc.value.code == ErrorCode.FILTER_VIOLATION
-    # stop_price max_price üstünde → FILTER_VIOLATION (direction geçerli kalır)
+    # stop_price above max_price → FILTER_VIOLATION (direction remains valid)
     over = SymbolFilters(**{**FILTERS.__dict__, "max_price": 50.0})
     with pytest.raises(RasatError) as exc:
         validate_execution_order(
@@ -266,7 +266,7 @@ def test_validator_stop_limit_price_price_filter():
 
 
 # =====================================================================
-# Service — broker asla çağrılmaz (fail-closed)
+# Service — broker is never called (fail-closed)
 # =====================================================================
 
 
@@ -319,7 +319,7 @@ async def test_place_order_invalid_order_type_no_broker(ex_ctx):
 
 
 async def test_place_order_below_min_qty_filter_violation_no_broker(ex_ctx):
-    # Kabul kriteri: quantity 1e-6 / minQty 1e-5 → FILTER_VIOLATION, broker çağrılmaz.
+    # Acceptance criterion: quantity 1e-6 / minQty 1e-5 → FILTER_VIOLATION, broker is not called.
     account_id = await _add_real_account(ex_ctx)
     service = ex_ctx["service"]
     with pytest.raises(RasatError) as exc:
@@ -368,10 +368,10 @@ async def test_place_order_market_notional_below_min_no_broker(ex_ctx):
 
 
 async def test_oco_bad_geometry_rejects_before_account(ex_db):
-    # Hesap servisi ulaşılmamalı — geometri pre-validation'da kesilmeli.
+    # Account service must not be reached—geometry must be rejected in pre-validation.
     class _FakeAccounts:
         async def get_account(self, account_id):
-            raise AssertionError("doğrulama hesaba ulaşmadan reddetmeli")
+            raise AssertionError("validation must reject before reaching the account")
 
     service = OrderService(ex_db, accounts=_FakeAccounts(), market=None, broker=None, risk=None, audit=None)
     with pytest.raises(RasatError) as exc:
@@ -396,9 +396,9 @@ async def test_execute_on_accounts_limit_tick_violation(ex_ctx):
 
 
 async def test_execute_on_accounts_stop_loss_limit_passes_price_and_stop(ex_ctx):
-    # T01 regresyon: _execute_one_sized STOP_LOSS_LIMIT'i "price zorunlu" diye
-    # reddetmemeli — entry/stop_loss validator'a price/stop_price olarak geçer,
-    # validator geçer ve akış bakiye gate'ine ulaşır (SELL: base yok).
+    # T01 regression: _execute_one_sized must not reject STOP_LOSS_LIMIT as "price required"
+    # Must not reject—entry/stop_loss are passed to the validator as price/stop_price,
+    # validation passes, and the flow reaches the balance gate (SELL: no base).
     account_id = await _add_real_account(ex_ctx)
     service = ex_ctx["service"]
     result = await service.execute_on_accounts(
@@ -413,8 +413,8 @@ async def test_execute_on_accounts_stop_loss_limit_passes_price_and_stop(ex_ctx)
 
 
 async def test_execute_on_accounts_stop_loss_limit_reaches_broker_with_stop(ex_ctx):
-    # T01 regresyon: bakiye gate'i geçince STOP_LOSS_LIMIT, stop_price ile birlikte
-    # _place_and_record chokepoint'inden broker'a ulaşır ("stop_price zorunlu" değil).
+    # T01 regression: after passing the balance gate, STOP_LOSS_LIMIT reaches the
+    # broker through _place_and_record with stop_price (not "stop_price is required").
     account_id = await _add_real_account(ex_ctx, base_holdings={"BTC": 100.0})
     service = ex_ctx["service"]
     result = await service.execute_on_accounts(
@@ -431,7 +431,7 @@ async def test_execute_on_accounts_stop_loss_limit_reaches_broker_with_stop(ex_c
 
 
 # =====================================================================
-# Timeout → canonical TIMEOUT/reconcile (kör retry yok)
+# Timeout → canonical TIMEOUT/reconcile (no blind retry)
 # =====================================================================
 
 
@@ -440,15 +440,15 @@ async def test_raw_timeout_error_maps_to_unknown_contract(ex_ctx):
     account_id = await _add_real_account(ctx)
     service = ctx["service"]
     cid = to_client_order_id("idem-raw-timeout")
-    # Çıplak asyncio.TimeoutError (broker tarafında map edilse de servis de güvenli).
-    ctx["broker"].place_errors[cid] = asyncio.TimeoutError("ağ timeout")
-    ctx["broker"].query_results[cid] = None  # Binance'te bulunamadı
+    # Raw asyncio.TimeoutError (even if mapped by the broker, the service is safe too).
+    ctx["broker"].place_errors[cid] = asyncio.TimeoutError("network timeout")
+    ctx["broker"].query_results[cid] = None  # Not found on Binance.
 
     result = await service.place_order(
         account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="MARKET",
         quantity=1.0, idempotency_key="idem-raw-timeout",
     )
-    # Çıplak TimeoutError dışarı kaçmaz → canonical UNKNOWN/ORDER_UNKNOWN sözleşmesi.
+    # Raw TimeoutError does not escape → canonical UNKNOWN/ORDER_UNKNOWN contract.
     assert result["status"] == "UNKNOWN"
     assert result["error"]["code"] == ErrorCode.ORDER_UNKNOWN
     assert len(ctx["broker"].placed) == 1
@@ -460,7 +460,7 @@ async def test_raw_timeout_error_reconciles_to_filled(ex_ctx):
     account_id = await _add_real_account(ctx)
     service = ctx["service"]
     cid = to_client_order_id("idem-raw-timeout-fill")
-    ctx["broker"].place_errors[cid] = asyncio.TimeoutError("ağ timeout")
+    ctx["broker"].place_errors[cid] = asyncio.TimeoutError("network timeout")
     ctx["broker"].query_results[cid] = OrderResult(status="FILLED", exchange_order_id="EX-T", executed_qty=1.0, avg_price=100.0)
 
     result = await service.place_order(
@@ -469,7 +469,7 @@ async def test_raw_timeout_error_reconciles_to_filled(ex_ctx):
     )
     assert result["status"] == "FILLED"
     assert result["exchange_order_id"] == "EX-T"
-    assert len(ctx["broker"].placed) == 1  # körlemesine retry yok
+    assert len(ctx["broker"].placed) == 1  # No blind retry.
 
 
 async def test_oco_raw_timeout_no_blind_resend(ex_ctx):
@@ -477,7 +477,7 @@ async def test_oco_raw_timeout_no_blind_resend(ex_ctx):
     account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
     service = ctx["service"]
     cid = to_client_order_id("idem-oco-timeout")
-    ctx["broker"].place_errors[cid] = asyncio.TimeoutError("ağ timeout")
+    ctx["broker"].place_errors[cid] = asyncio.TimeoutError("network timeout")
     ctx["broker"].oco_query_results[cid] = None
 
     result = await service.place_oco_order(
@@ -495,7 +495,7 @@ async def test_oco_raw_timeout_reconciles_executing_to_new(ex_ctx):
     account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
     service = ctx["service"]
     cid = to_client_order_id("idem-oco-timeout-executing")
-    ctx["broker"].place_errors[cid] = asyncio.TimeoutError("ağ timeout")
+    ctx["broker"].place_errors[cid] = asyncio.TimeoutError("network timeout")
     ctx["broker"].oco_query_results[cid] = OrderResult(
         status="NEW", exchange_order_id="OL-EXECUTING",
     )
@@ -594,7 +594,7 @@ async def test_broker_request_maps_timeout_to_timestamp():
 async def test_close_all_cancels_exchange_open_order_not_in_local_db(ex_ctx):
     ctx = ex_ctx
     account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
-    # Borsada local DB'de kaydı OLMAYAN açık emir.
+    # Open order on the exchange with no local DB record.
     ctx["broker"].open_orders = [
         {"symbol": "BTCUSDT", "order_id": "EX-ORPHAN", "client_order_id": "orphan-ex-1",
          "side": "BUY", "quantity": 0.5},
@@ -605,9 +605,9 @@ async def test_close_all_cancels_exchange_open_order_not_in_local_db(ex_ctx):
     detail = result["results"][0]
     assert detail["closed"] is True
     assert "BTCUSDT" in detail["cancelled"]
-    # borsadaki yetim emir iptal edildi
+    # Orphan exchange order was canceled.
     assert any(c["client_order_id"] == "orphan-ex-1" for c in ctx["broker"].cancelled)
-    # ve holding satıldı
+    # and the holding was sold
     sold = {s["symbol"]: s for s in detail["sold"]}
     assert sold["BTCUSDT"]["status"] == "FILLED"
 
@@ -619,7 +619,7 @@ async def test_close_all_exchange_cancel_failure_unknown_closed_false(ex_ctx):
         {"symbol": "BTCUSDT", "order_id": "EX-1", "client_order_id": "orphan-fail",
          "side": "BUY", "quantity": 0.5},
     ]
-    ctx["broker"].cancel_errors["orphan-fail"] = RasatError(ErrorCode.TIMEOUT, "iptal ağ hatası")
+    ctx["broker"].cancel_errors["orphan-fail"] = RasatError(ErrorCode.TIMEOUT, "cancel network error")
     service = ctx["service"]
 
     result = await service.close_all_positions(account_id=account_id, actor="test")
@@ -631,7 +631,7 @@ async def test_close_all_exchange_cancel_failure_unknown_closed_false(ex_ctx):
 async def test_close_all_cancel_writes_audit(ex_ctx):
     ctx = ex_ctx
     account_id = await _add_real_account(ctx, base_holdings={"BTC": 1.0})
-    # local açık emir yerleştir
+    # Place a local open order.
     ctx["broker"].place_result = {"status": "NEW"}
     placed = await ctx["service"].place_order(
         account_id=account_id, symbol="BTCUSDT", side="BUY", order_type="LIMIT",
@@ -656,25 +656,25 @@ async def test_get_total_exposure_reports_incomplete_and_errors(ex_ctx):
     ctx = ex_ctx
     a1 = await _add_real_account(ctx, label="ok", base_holdings={"BTC": 1.0})
     a2 = await _add_real_account(ctx, label="broken", base_holdings={"ETH": 2.0})
-    ctx["broker"].get_balance_errors[a2] = RasatError(ErrorCode.TIMEOUT, "ağ hatası")
+    ctx["broker"].get_balance_errors[a2] = RasatError(ErrorCode.TIMEOUT, "network error")
     service = ctx["service"]
 
     exposure = await service.get_total_exposure()
     assert exposure["complete"] is False
     assert exposure["errors"] == [
-        {"account_id": a2, "error": {"code": ErrorCode.TIMEOUT, "message": "ağ hatası"}}
+        {"account_id": a2, "error": {"code": ErrorCode.TIMEOUT, "message": "network error"}}
     ]
-    # sağlam hesap hâlâ raporlanır; hatalı hesap sessizce 0 sayılmaz.
+    # The healthy account is still reported; the failed account is not silently counted as zero.
     assert exposure["per_account"][a1] == pytest.approx(100.0)
     assert a2 not in exposure["per_account"]
     assert exposure["by_symbol"]["BTCUSDT"] == pytest.approx(100.0)
 
 
 async def test_exposure_failure_fails_closed_order(ex_ctx):
-    # Risk gating: exposure hesabı başarısızsa emir reddedilir (kısmi veriyle gitmez).
+    # Risk gating: reject the order when exposure calculation fails (do not proceed with partial data).
     ctx = ex_ctx
     account_id = await _add_real_account(ctx)
-    ctx["broker"].get_balance_errors[account_id] = RasatError(ErrorCode.TIMEOUT, "ağ hatası")
+    ctx["broker"].get_balance_errors[account_id] = RasatError(ErrorCode.TIMEOUT, "network error")
     service = ctx["service"]
     with pytest.raises(RasatError) as exc:
         await service.place_order(
@@ -695,7 +695,7 @@ def test_enforce_policy_caps_nan_fail_closed():
         enforce_policy_caps(symbol="BTCUSDT", notional=float("nan"), policy={})
     assert exc.value.code == ErrorCode.INVALID_REQUEST
 
-    # NaN cap karşılaştırmayı bypass edemesin.
+    # NaN must not bypass the cap comparison.
     with pytest.raises(RasatError) as exc:
         enforce_policy_caps(
             symbol="BTCUSDT", notional=200.0,
@@ -711,7 +711,7 @@ def test_within_tolerance_nan_fail_closed():
 
 
 def test_within_tolerance_non_numeric_fail_closed():
-    # T01: non-numeric tolerance TypeError ile dışarı kaçmamalı — require_finite önce.
+    # T01: non-numeric tolerance must not escape as TypeError—require_finite first.
     with pytest.raises(RasatError) as exc:
         within_tolerance(value=1.9, target=2.0, tolerance_pct="abc")
     assert exc.value.code == ErrorCode.INVALID_REQUEST
@@ -734,8 +734,8 @@ def test_calculate_position_size_nan_fail_closed():
 
 
 def test_calculate_position_size_non_numeric_fail_closed():
-    # T01: non-numeric entry, check_stop_direction öncesi require_finite ile
-    # kesilmeli — TypeError yerine INVALID_REQUEST.
+    # T01: non-numeric entry is handled by require_finite before check_stop_direction.
+    # Must fail with INVALID_REQUEST rather than TypeError.
     with pytest.raises(RasatError) as exc:
         calculate_position_size(
             symbol="BTCUSDT", account_balance=10000, risk_pct=0.01,
@@ -751,7 +751,7 @@ def test_calculate_position_size_non_numeric_fail_closed():
 
 
 # =====================================================================
-# tools.py schema senkronizasyonu (T02 sözleşmesi)
+# tools.py schema synchronization (T02 contract)
 # =====================================================================
 
 
@@ -824,7 +824,7 @@ async def test_rpc_schema_rejects_missing_required(cfg):
             assert resp.status == 400
             body = await resp.json()
             assert body["error"]["code"] == ErrorCode.INVALID_REQUEST
-            assert "eksik zorunlu alan" in body["error"]["message"]
+            assert "missing required field" in body["error"]["message"]
 
 
 async def test_rpc_schema_rejects_unknown_param(cfg):
@@ -896,7 +896,7 @@ async def test_rpc_transport_field_merge_and_conflict(cfg):
     app = build_app(cfg, _ready(), "t1", dispatcher)
     async with TestServer(app) as server:
         async with TestClient(server) as client:
-            # Top-level idempotency_key params'a birleşir → required geçer.
+            # Top-level idempotency_key merges into params → required validation passes.
             resp = await _rpc_post(client, {"tool": "t_place", "params": {"symbol": "BTCUSDT"}, "idempotency_key": "top-1"})
             assert resp.status == 200
             body = await resp.json()
@@ -904,7 +904,7 @@ async def test_rpc_transport_field_merge_and_conflict(cfg):
             assert body["data"]["echo"] == "top-1"
             assert seen["idempotency_key"] == "top-1"
 
-            # Çakışma: top-level ≠ params → INVALID_REQUEST.
+            # Conflict: top-level ≠ params → INVALID_REQUEST.
             resp2 = await _rpc_post(
                 client,
                 {"tool": "t_place", "params": {"symbol": "BTCUSDT", "idempotency_key": "p-1"}, "idempotency_key": "top-2"},
@@ -930,7 +930,7 @@ async def test_rpc_body_size_limit(cfg):
 
 async def test_rpc_generic_error_redacts_exception(cfg):
     async def _boom(params, ctx):
-        raise RuntimeError("süper gizli iç yol detayı")
+        raise RuntimeError("super secret internal path detail")
 
     registry = ToolRegistry()
     registry.register(ToolSpec(name="t_boom", description="", input_schema={"type": "object", "properties": {}}))
@@ -943,16 +943,16 @@ async def test_rpc_generic_error_redacts_exception(cfg):
             assert resp.status == 500
             body = await resp.json()
             assert body["error"]["code"] == ErrorCode.INTERNAL_ERROR
-            assert "süper gizli" not in body["error"]["message"]
+            assert "super secret" not in body["error"]["message"]
 
 
 # =====================================================================
-# T3: market emir entry doldurma + geçici hata eşlemesi (approve handler)
+# T3: fill entry for market orders + transient error mapping (approve handler)
 # =====================================================================
 
 
 def test_transient_error_codes_exclude_permanent_ones():
-    """Geçici hata seti kalıcı hataları içermez — rejected kararı güvenilir kalır."""
+    """Transient error set excludes permanent errors—rejected decisions remain reliable."""
     from rasattrading_mcp.daemon import handlers
 
     transient = handlers._PENDING_TRANSIENT_ERRORS
@@ -972,7 +972,7 @@ def test_transient_error_codes_exclude_permanent_ones():
 
 
 async def test_approve_handler_market_missing_entry_uses_market_feed(ex_db, ex_ctx):
-    """Approve handler, market emirde entry boşsa market feed'den fiyatı doldurur."""
+    """Approve handler fills a market order's empty entry from the market feed."""
     import uuid
 
     from rasattrading_mcp.pa.alarms import AlarmService
@@ -1014,5 +1014,5 @@ async def test_approve_handler_market_missing_entry_uses_market_feed(ex_db, ex_c
         return dict(conn.execute("SELECT * FROM pending_orders WHERE order_id=?", (oid,)).fetchone())
 
     rec = await db.read(_q)
-    assert rec["entry"] == pytest.approx(100.0)  # FakeMarket BTCUSDT fiyatı
+    assert rec["entry"] == pytest.approx(100.0)  # FakeMarket BTCUSDT price.
     assert rec["status"] == "executed"

@@ -1,9 +1,9 @@
-"""2.11 FIX — AST doğrulama sertleştirme + composite cooldown + cooldown kalıcılığı.
+"""2.11 FIX — AST validation hardening + composite cooldown + cooldown persistence.
 
-Review kanıtları test'e çevrilir:
-- Hatalı bir filtre AST'si TypeError değil, yapılandırılmış INVALID_REQUEST döner.
-- Composite alarm cooldown'u da doğrulanır (negative/integer olmayan reddedilir).
-- Cooldown durumu açıkça/kalıcı olarak saklanır — restart sonrası korunur.
+Review evidence is converted into tests:
+- A bad filter AST returns structured INVALID_REQUEST, not TypeError.
+- Composite alert cooldown is also validated (reject negative/non-integer values).
+- Cooldown state is stored explicitly/persistently and survives restart.
 """
 
 import time
@@ -45,7 +45,7 @@ async def db(cfg):
 
 
 # ---------------------------------------------------------------------------
-# AST doğrulama (TypeError yerine INVALID_REQUEST)
+# AST validation (INVALID_REQUEST instead of TypeError)
 # ---------------------------------------------------------------------------
 
 
@@ -101,7 +101,7 @@ def test_valid_ast_still_accepted():
 
 
 # ---------------------------------------------------------------------------
-# Composite cooldown doğrulaması
+# Composite cooldown validation
 # ---------------------------------------------------------------------------
 
 
@@ -115,7 +115,7 @@ async def test_composite_cooldown_validation(db):
 
 
 # ---------------------------------------------------------------------------
-# Cooldown kalıcılığı (restart sonrası korunur)
+# Cooldown persistence (survives restart)
 # ---------------------------------------------------------------------------
 
 
@@ -149,7 +149,7 @@ async def test_cooldown_state_persisted_and_restart(db):
     assert stored["cooldown_until"] is not None
     assert stored["cooldown_until"] > int(time.time())
 
-    # restart (yeni servis) → cooldown durumu kaybolmaz
+    # Restart (new service) → cooldown state persists.
     fresh_alarms = AlarmService(db, engine=PAEngine(db))
     listed = await fresh_alarms.list_alerts()
     assert listed[0]["state"] == "cooldown"
@@ -167,6 +167,6 @@ async def test_cooldown_expires_to_armed(db, monkeypatch):
     await engine.analyze("BTCUSDT", TF)
     assert (await alarms.list_alerts())[0]["state"] == "cooldown"
 
-    later = int(time.time()) + 7200  # cooldown süresi doldu
+    later = int(time.time()) + 7200  # Cooldown expired.
     monkeypatch.setattr(_time, "time", lambda: later)
     assert (await alarms.list_alerts())[0]["state"] == "armed"

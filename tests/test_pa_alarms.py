@@ -1,8 +1,8 @@
-"""2.6 — Alarm motoru: state machine, dedup, kalıcılık, stale kuralı.
+"""2.6 — Alert engine: state machine, deduplication, persistence, stale rule.
 
-2.8 notu: `on_analysis_updated` artık freshness kapısı taşır — stale analizle
-tetiklenmez. Bu yüzden tetikleme testleri taze (kapalı bara hizalı) mumlarla
-seed edilir; "eski mum → tetiklenmez" senaryosu ayrı testtir (review kanıtı).
+2.8 note: `on_analysis_updated` now has a freshness gate—it does not fire on
+stale analysis. Therefore trigger tests seed fresh candles aligned to closed bars;
+the "old candle → does not fire" scenario is a separate test (review evidence).
 """
 
 import time
@@ -116,7 +116,7 @@ async def test_create_alert_validation(db):
 
 
 # ---------------------------------------------------------------------------
-# Tetikleme + dedup + cooldown
+# Triggering + dedup + cooldown
 # ---------------------------------------------------------------------------
 
 
@@ -131,11 +131,11 @@ async def test_trigger_on_analysis_update(db):
     assert len(rec["triggered"]) == 1
     assert rec["triggered"][0]["alert_id"] == (await alarms.list_alerts())[0]["alert_id"]
     state = (await alarms.list_alerts())[0]["state"]
-    assert state == "cooldown"  # cooldown_seconds=300 → kalıcı cooldown state'i
+    assert state == "cooldown"  # cooldown_seconds=300 → persistent cooldown state.
 
 
 async def test_stale_data_does_not_trigger(db):
-    """Review kanıtı: stale analiz snapshot'ı event-driven yoldan alarm tetiklememeli."""
+    """Review evidence: a stale analysis snapshot must not fire an alert event-driven."""
     await seed(db, "BTCUSDT", UPTREND)  # OLD_BASE → stale
     engine, alarms = engine_with_alarms(db)
     await alarms.create_alert("BTCUSDT", TF, [{"type": "above_below_vwap", "position": "above"}], cooldown_seconds=0)
@@ -149,21 +149,21 @@ async def test_dedup_same_bar(db):
     await alarms.create_alert("BTCUSDT", TF, [{"type": "above_below_vwap", "position": "above"}], cooldown_seconds=0)
 
     await engine.analyze("BTCUSDT", TF)
-    await engine.analyze("BTCUSDT", TF)  # aynı son bar → aynı trigger_key → dedup
+    await engine.analyze("BTCUSDT", TF)  # Same last bar → same trigger_key → dedup.
     rec = await alarms.get_triggered_alerts()
     assert len(rec["triggered"]) == 1
 
 
 def _advance_clock(monkeypatch, now: int):
-    """`time.time`'ı global taklit eder — tüm modüller (analysis/swings/alarms) aynı stdlib
-    modülüne referans verdiği için tek patch yeterli."""
+    """Patch global `time.time`—all modules (analysis/swings/alarms) reference the
+    same stdlib module, so one patch is sufficient."""
     import time as _time
 
     monkeypatch.setattr(_time, "time", lambda: now)
 
 
 async def test_cooldown_blocks_new_bar(db, monkeypatch):
-    """Cooldown süresi dolmadıkça yeni kapalı bar alarmı yeniden tetiklemez."""
+    """Do not fire again on a new closed bar until the cooldown expires."""
     now0 = int(time.time())
     await seed_at(db, "BTCUSDT", UPTREND, _open_times(len(UPTREND), fresh=True))
     engine, alarms = engine_with_alarms(db)
@@ -171,7 +171,7 @@ async def test_cooldown_blocks_new_bar(db, monkeypatch):
     await engine.analyze("BTCUSDT", TF)
     assert len((await alarms.get_triggered_alerts())["triggered"]) == 1
 
-    # Zamanı bir period ileri al + yeni kapalı bar ekle → koşul hâlâ doğru, cooldown sürüyor
+    # Advance one period + add a new closed bar → condition remains true, cooldown continues.
     now1 = now0 + PERIOD
     _advance_clock(monkeypatch, now1)
     await seed_at(db, "BTCUSDT", [(104.5, 106, 104, 105.5)], [int(now1 // PERIOD) * PERIOD - PERIOD])
@@ -180,7 +180,7 @@ async def test_cooldown_blocks_new_bar(db, monkeypatch):
 
 
 async def test_new_bar_triggers_after_cooldown_zero(db, monkeypatch):
-    """Cooldown yoksa (0) yeni kapalı bar → yeni trigger_key → yeniden tetiklenir."""
+    """With no cooldown (0), a new closed bar → new trigger_key → fires again."""
     now0 = int(time.time())
     await seed_at(db, "BTCUSDT", UPTREND, _open_times(len(UPTREND), fresh=True))
     engine, alarms = engine_with_alarms(db)
@@ -192,23 +192,23 @@ async def test_new_bar_triggers_after_cooldown_zero(db, monkeypatch):
     _advance_clock(monkeypatch, now1)
     await seed_at(db, "BTCUSDT", [(104.5, 106, 104, 105.5)], [int(now1 // PERIOD) * PERIOD - PERIOD])
     await engine.analyze("BTCUSDT", TF)
-    assert len((await alarms.get_triggered_alerts())["triggered"]) == 2  # yeni bar = yeni trigger_key
+    assert len((await alarms.get_triggered_alerts())["triggered"]) == 2  # new bar = new trigger_key
 
 
 async def test_persistence_across_service_restart(db):
-    """Agent bağlı değilken tetiklenen kayıt, yeni servis (yeni session) ile görülür."""
+    """A triggered record while no agent is connected is visible to a new service (new session)."""
     await seed(db, "BTCUSDT", UPTREND, fresh=True)
     engine, alarms = engine_with_alarms(db)
     alert = await alarms.create_alert("BTCUSDT", TF, [{"type": "above_below_vwap", "position": "above"}], cooldown_seconds=0)
     await engine.analyze("BTCUSDT", TF)
 
-    fresh_alarms = AlarmService(db, engine=PAEngine(db))  # yeni oturum
+    fresh_alarms = AlarmService(db, engine=PAEngine(db))  # new session
     rec = await fresh_alarms.get_triggered_alerts(alert_id=alert["alert_id"])
     assert len(rec["triggered"]) == 1
 
 
 # ---------------------------------------------------------------------------
-# Kompozit + stale kuralı
+# Composite + stale rule
 # ---------------------------------------------------------------------------
 
 
@@ -232,7 +232,7 @@ async def test_composite_and_triggers(db):
 
 
 async def test_composite_stale_clause_defers(db):
-    """Clause'lardan biri stale → kompozit tetiklenmez (stale kuralı)."""
+    """If one clause is stale → composite does not fire (stale rule)."""
     await seed(db, "BTCUSDT", UPTREND, fresh=True)
     await seed(db, "SOLUSDT", FALLING, fresh=False)  # stale veri
     engine, alarms = engine_with_alarms(db)
@@ -253,22 +253,22 @@ async def test_evaluate_symbol_fresh_only(db):
     engine, alarms = engine_with_alarms(db)
     alert = await alarms.create_alert("BTCUSDT", TF, [{"type": "above_below_vwap", "position": "above"}], cooldown_seconds=0)
     await engine.analyze("BTCUSDT", TF)
-    await alarms.delete_alert(alert["alert_id"])  # değerlendirme için yeniden kur
+    await alarms.delete_alert(alert["alert_id"])  # Recreate for evaluation.
     await alarms.create_alert("BTCUSDT", TF, [{"type": "above_below_vwap", "position": "above"}], cooldown_seconds=0)
     triggered = await alarms.evaluate_symbol("BTCUSDT", TF)
     assert len(triggered) == 1
 
 
 async def test_evaluate_symbol_computes_missing_analysis(db):
-    """PA kaydı yokken alarm döngüsü boş dönmez — evaluate_symbol analizi hesaplatır."""
+    """When no PA record exists, alert loop does not return empty—evaluate_symbol computes analysis."""
     await seed(db, "BTCUSDT", UPTREND, fresh=True)
     engine, alarms = engine_with_alarms(db)
     await alarms.create_alert("BTCUSDT", TF, [{"type": "above_below_vwap", "position": "above"}], cooldown_seconds=0)
-    # analyze hiç çağrılmadı → market_structure kaydı yok
+    # analyze was never called → no market_structure record.
     assert await _read_history(db, "market_structure", "BTCUSDT", TF) == []
     await alarms.evaluate_symbol("BTCUSDT", TF)
-    # Analiz hesaplandı ve alarm tetiklendi (on_analysis_updated event-driven yolu da
-    # aynı bar için tek trigger üretir — dedup). Kayıt kalıcıdır.
+    # Analysis was computed and alert fired (the on_analysis_updated event-driven
+    # path also creates one trigger for the same bar—dedup). Record is persistent.
     assert len(await _read_history(db, "market_structure", "BTCUSDT", TF)) == 1
     rec = await alarms.get_triggered_alerts()
     assert len(rec["triggered"]) == 1

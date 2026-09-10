@@ -7,7 +7,7 @@ structure, liquidity zones, order blocks), and evaluates screener and alarm logi
 stdio adapter connects to that daemon over local HTTP RPC and exposes the system to AI agents
 as tools.
 
-**English | [Türkçe](README.tr.md)**
+**English | [Turkish](README.tr.md)**
 
 ![MIT](https://img.shields.io/badge/license-MIT-brightgreen)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
@@ -44,8 +44,11 @@ default and enforces a paper-first account lifecycle.
 - **Alarm engine**: event-driven triggers with deduplication and cooldown; composite alerts
   supported. A triggered alarm can create a `pending_order` awaiting approval.
 - **Execution**: idempotent order placement, OCO orders, reconcile-before-retry, and a
-  fail-closed risk policy. Orders are **never opened automatically** — alarms and order specs
-  produce `pending_orders` that require explicit human approval (`approve_pending_order`).
+  fail-closed risk policy. Alarm-generated order specs follow the approval path:
+  `pending_orders` → explicit human approval via `approve_pending_order`. The
+  `execute_on_accounts` and `place_order` tools are exceptions: they place orders directly and
+  bypass the pending-approval queue. If the account is unlocked for real trading, those tools
+  can place real-money orders.
 - **Paper / real separation**: each account starts with `trading_lock=paper`.
   `enable_real_trading` is a one-way, irreversible unlock. Accounts with real trading enabled
   cannot be deleted.

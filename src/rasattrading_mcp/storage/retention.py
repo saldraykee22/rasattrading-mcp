@@ -1,4 +1,4 @@
-"""Retention/compaction: candles ve futures_context sınırsız büyümesin."""
+"""Retention/compaction: keep candles and futures_context from growing without bound."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ async def prune_candles(
     retention_days: Mapping[str, int],
     now: float | None = None,
 ) -> dict[str, int]:
-    """Her timeframe için cutoff öncesi mumları siler. Silinen satır sayısını döner."""
+    """Delete candles before the cutoff for each timeframe and return deleted row counts."""
     now = now if now is not None else time.time()
 
     def _prune(conn: sqlite3.Connection) -> dict[str, int]:
@@ -39,7 +39,7 @@ async def prune_candles(
 
 
 async def prune_futures_context(db: Database, max_days: int = 30, now: float | None = None) -> int:
-    """Eski futures_context kayıtlarını budar."""
+    """Prune old futures_context records."""
     now = now if now is not None else time.time()
     cutoff = int(now) - int(max_days * 86400)
 
@@ -49,5 +49,5 @@ async def prune_futures_context(db: Database, max_days: int = 30, now: float | N
 
     removed = await db.write(_prune)
     if removed:
-        logger.info("futures_context retention: %s satır", removed)
+        logger.info("futures_context retention: %s rows", removed)
     return removed

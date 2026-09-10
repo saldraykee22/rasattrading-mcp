@@ -1,23 +1,23 @@
-"""Zaman birimi yardımcıları.
+"""Time-unit helpers.
 
-Tek zaman standardı: UNIX epoch **saniye**. Binance REST ham timestamp'leri
-milisaniye döndürür (`open_time`, `event_time`, `time`); `to_epoch_seconds`
-bunları girişte bir kez saniyeye normalize eder. Kod içinde karışık birim
-kalmamalı — PA/freshness/retention/session/envelope'nin tamamı saniye bekler.
+Single time standard: UNIX epoch **seconds**. Binance REST raw timestamps are in
+milliseconds (`open_time`, `event_time`, `time`); `to_epoch_seconds` normalizes them
+to seconds once at input. No mixed units should remain in code; PA/freshness/
+retention/session/envelope all expect seconds.
 """
 
 from __future__ import annotations
 
-# Saniye olarak yıl ~5138'a denk gelir; gerçek ms değerleri ~1.7e12 üzerindedir.
+# As seconds this reaches about year 5138; real ms values are above ~1.7e12.
 _MS_THRESHOLD = 100_000_000_000
 
 
 def to_epoch_seconds(ts: int | float) -> int:
-    """Binance ms değerini saniyeye çevirir; zaten saniye olanı aynen bırakır.
+    """Convert a Binance ms value to seconds; leave a value already in seconds unchanged.
 
-    Test fixture'ları saniye üretebildiği için (FakeRest gibi) keskin `/1000`
-    yerine eşik bazlı dönüşüm kullanılır: ~10^11 üzerindeki değerler ms kabul
-    edilip 1000'e bölünür, altı saniye sayılır.
+    Because test fixtures such as FakeRest may produce seconds, use threshold-based
+    conversion instead of blindly dividing by `/1000`: values above ~10^11 are
+    treated as ms and divided by 1000; lower values are treated as seconds.
     """
     value = int(ts)
     if value >= _MS_THRESHOLD:

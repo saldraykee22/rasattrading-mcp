@@ -12,7 +12,7 @@ class ReadinessError(Exception):
 
 
 class Readiness:
-    """İleri yönlü (forward-only) state machine. State sorgulanabilir, `ready` beklene bilir."""
+    """Forward-only state machine. Its state can be queried and `ready` can be awaited."""
 
     def __init__(self) -> None:
         self._state = "starting"
@@ -32,20 +32,20 @@ class Readiness:
 
     def set_state(self, state: str) -> None:
         if state not in STATES:
-            raise ReadinessError(f"geçersiz state: {state}")
-        # İleri yön kontrolü (starting dışına dönüş yasak, ready geri alınamaz)
+            raise ReadinessError(f"invalid state: {state}")
+        # Enforce forward-only transitions (no return to starting; ready cannot be undone).
         if state in ("starting",):
             if self._state != "starting":
-                raise ReadinessError(f"{state} durumuna geri dönülemez (mevcut: {self._state})")
+                raise ReadinessError(f"cannot return to state {state} (current: {self._state})")
         elif self._state not in STATES[: STATES.index(state)]:
-            raise ReadinessError(f"durum sırası ihlali: {self._state} -> {state}")
+            raise ReadinessError(f"state order violation: {self._state} -> {state}")
         if state == "ready":
             self._event.set()
         self._state = state
         self._history.append(state)
 
     async def wait_ready(self, timeout: float | None = None) -> bool:
-        """`ready` olana kadar bekler. Timeout'ta False döner."""
+        """Wait until `ready`; return False on timeout."""
         if self.is_ready():
             return True
         try:

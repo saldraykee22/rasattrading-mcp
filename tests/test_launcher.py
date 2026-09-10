@@ -1,8 +1,9 @@
-"""Launcher entegrasyon testleri: gerçek daemon subprocess'i ile.
+"""Launcher integration tests using a real daemon subprocess.
 
-1-1 Doğrulama Beklentisi:
-- İki adapter aynı anda çalıştırılırsa tek daemon başlamalı (race yok)
-- Daemon zorla öldürülüp adapter tekrar çağrılırsa stale kilit temizlenip yeni daemon başlamalı
+1-1 Validation expectations:
+- Starting two adapters simultaneously must start one daemon (no race).
+- After forcibly killing the daemon and calling the adapter again, clear the stale
+  lock and start a new daemon.
 """
 
 import asyncio
@@ -48,14 +49,14 @@ async def test_ensure_daemon_spawns_and_reuses(cfg):
     assert pid1 is not None
     assert token1
 
-    # İkinci çağrı aynı daemon'ı kullanır (yeni spawn yok)
+    # Second call uses the same daemon (no new spawn).
     token2 = await ensure_daemon(cfg)
     pid2 = await _daemon_pid(cfg)
     assert token1 == token2
     assert pid1 == pid2
     assert owner_alive(read_lock(cfg.lock_path))
 
-    # daemon gerçekten ready ve token ile yanıt veriyor
+    # Daemon is really ready and responds with the token.
     client = DaemonClient(cfg, token1)
     try:
         health = await client.health()
@@ -73,7 +74,7 @@ async def test_two_concurrent_ensure_daemon_single_instance(cfg):
     assert results[0] == results[1]
     pid = await _daemon_pid(cfg)
     assert pid is not None
-    # Sadece bir daemon ayakta olmalı (aynı pid)
+    # Only one daemon should be alive (same pid).
     assert pid == read_lock(cfg.lock_path).pid
     await _kill_daemon(cfg)
 
@@ -82,16 +83,16 @@ async def test_stale_lock_after_force_kill(cfg):
     token1 = await ensure_daemon(cfg)
     pid1 = await _daemon_pid(cfg)
 
-    # Daemon'ı zorla öldür (sessizce kilit temizlenemez)
+    # Force-kill the daemon (lock cannot be silently cleaned).
     await _kill_daemon(cfg)
     await asyncio.sleep(0.5)
     assert not owner_alive(read_lock(cfg.lock_path))
 
-    # Adapter tekrar çağrılırsa stale kilit temizlenip yeni daemon başlar
+    # Calling the adapter again clears the stale lock and starts a new daemon.
     token2 = await ensure_daemon(cfg)
     pid2 = await _daemon_pid(cfg)
-    assert token2 != token1  # yeni token
-    assert pid2 != pid1  # yeni daemon süreci
+    assert token2 != token1  # new token
+    assert pid2 != pid1  # New daemon process.
     assert owner_alive(read_lock(cfg.lock_path))
 
     await _kill_daemon(cfg)

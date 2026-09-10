@@ -45,7 +45,7 @@ def test_second_acquire_while_alive_raises(cfg):
 
 def test_stale_lock_recovered(cfg):
     info = LockInfo.create(port=cfg.port)
-    info.pid = 999_999_999  # muhtemelen ölü PID
+    info.pid = 999_999_999  # Probably dead PID.
     info.state = "ready"
     cfg.lock_path.write_text(_json(info))
     assert not pid_alive(info.pid)
@@ -85,7 +85,7 @@ def test_release_does_not_remove_others(cfg):
     mgr = LockManager(cfg.lock_path, cfg.port)
     info = mgr.acquire()
     other = LockInfo.create(port=cfg.port)
-    cfg.lock_path.write_text(_json(other))  # halef el koydu
+    cfg.lock_path.write_text(_json(other))  # successor took ownership
     mgr.release()
     current = read_lock(cfg.lock_path)
     assert current is not None
@@ -93,11 +93,11 @@ def test_release_does_not_remove_others(cfg):
 
 
 def test_owner_alive_pid_reuse_detected(cfg):
-    """Aynı PID ama farklı start_time -> sahibi değil (PID reuse koruması)."""
+    """Same PID but different start_time → not owner (PID reuse protection)."""
     info = LockInfo.create(port=cfg.port)
-    assert owner_alive(info) is True  # bizim kendi sürecimiz
+    assert owner_alive(info) is True  # Our own process.
 
-    info.start_time = info.start_time - 10_000  # eski bir process başlangıcı
+    info.start_time = info.start_time - 10_000  # Old process start.
     assert owner_alive(info) is False
 
 
@@ -150,12 +150,12 @@ async def test_wait_ready_timeout():
 
 
 async def test_run_daemon_signal_fallback_on_windows(tmp_path, monkeypatch):
-    """add_signal_handler NotImplementedError (Windows) → signal.signal fallback kurulur."""
+    """add_signal_handler NotImplementedError (Windows) → install signal.signal fallback."""
     from rasattrading_mcp.daemon import main as dm
 
     class _FakeLoop:
         def add_signal_handler(self, sig, cb):
-            raise NotImplementedError("Windows signal handler desteklenmez")
+            raise NotImplementedError("Windows signal handler is not supported")
 
         def call_soon_threadsafe(self, cb):
             cb()
@@ -176,7 +176,7 @@ async def test_run_daemon_signal_fallback_on_windows(tmp_path, monkeypatch):
 
     result = await dm.run_daemon(Config(data_dir=tmp_path, pipeline_enabled=False))
     assert result == 0
-    # SIGINT + SIGTERM için signal.signal fallback'i kuruldu (break yerine).
+    # Install signal.signal fallback for SIGINT + SIGTERM (instead of break).
     assert len(installed) == 2
     sigs = {s for s, _ in installed}
     assert dm.signal.SIGINT in sigs
@@ -184,7 +184,7 @@ async def test_run_daemon_signal_fallback_on_windows(tmp_path, monkeypatch):
 
 
 async def test_run_daemon_signal_fallback_handler_requests_stop(tmp_path, monkeypatch):
-    """Fallback handler tetiklenince request_stop loop thread'ine iletilir."""
+    """When the fallback handler fires, request_stop is sent to the loop thread."""
     from rasattrading_mcp.daemon import main as dm
 
     class _FakeLoop:
@@ -211,7 +211,7 @@ async def test_run_daemon_signal_fallback_handler_requests_stop(tmp_path, monkey
     monkeypatch.setattr(dm.DaemonRunner, "request_stop", lambda self: stop_calls.append(self))
 
     assert await dm.run_daemon(Config(data_dir=tmp_path, pipeline_enabled=False)) == 0
-    # Fallback handler'ı elle tetikle → request_stop loop thread'ine iletilmeli.
+    # Trigger fallback handler manually → deliver to request_stop loop thread.
     assert captured
     handler = captured[0][1]
     handler(dm.signal.SIGINT, None)

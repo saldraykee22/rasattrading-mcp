@@ -34,7 +34,7 @@ DEFAULT_FILTERS = SymbolFilters(
 )
 
 
-# ---------- temel doğruluk kontrolleri ----------
+# ---------- basic correctness checks ----------
 
 
 def test_check_symbol_valid():
@@ -61,7 +61,7 @@ def test_check_stop_direction():
     check_stop_direction("BUY", entry=100, stop_loss=95)
     check_stop_direction("SELL", entry=100, stop_loss=105)
     with pytest.raises(RasatError) as exc_info:
-        check_stop_direction("BUY", entry=100, stop_loss=100)  # stop == entry geçersiz
+        check_stop_direction("BUY", entry=100, stop_loss=100)  # stop == entry is invalid.
     assert exc_info.value.code == ErrorCode.INVALID_REQUEST
     with pytest.raises(RasatError) as exc_info:
         check_stop_direction("BUY", entry=100, stop_loss=101)
@@ -105,7 +105,7 @@ def test_calculate_position_size_basic():
 
 
 def test_calculate_position_size_rounds_down_to_step():
-    # risk 100, risk-per-unit 3 -> qty 33.3333 -> 33.33333 (step 0.00001 aşağı yuvarlama)
+    # risk 100, risk-per-unit 3 -> qty 33.3333 -> 33.33333 (round down to step 0.00001)
     result = calculate_position_size(
         symbol="BTCUSDT",
         account_balance=10000,
@@ -115,13 +115,13 @@ def test_calculate_position_size_rounds_down_to_step():
         filters=DEFAULT_FILTERS,
     )
     assert result["quantity"] == pytest.approx(33.33333, rel=1e-6)
-    # yuvarlama sonrası nihai değer risk cap'ini aşmamalı
+    # Final value after rounding must not exceed risk cap.
     assert result["risk_amount"] >= result["quantity"] * result["risk_per_unit"]
 
 
 def test_calculate_position_size_respects_balance_cap():
     # bakiye 100; entry 100, stop 95 -> risk-per-unit 5, risk_pct 1.0 -> qty 20
-    # ama bakiye ancak ~0.999 USDT karşılar -> balance cap uygulanır
+    # But balance covers only ~0.999 USDT → apply balance cap.
     result = calculate_position_size(
         symbol="BTCUSDT",
         account_balance=100,
@@ -135,7 +135,7 @@ def test_calculate_position_size_respects_balance_cap():
 
 
 def test_calculate_position_size_balance_cap_keeps_total_affordable():
-    # risk-bazlı qty devasa olsa bile fee-aware balance cap total'i bakiye içinde tutar
+    # Even if risk-based qty is huge, fee-aware balance cap keeps total within balance.
     result = calculate_position_size(
         symbol="BTCUSDT",
         account_balance=1000,
@@ -149,7 +149,7 @@ def test_calculate_position_size_balance_cap_keeps_total_affordable():
 
 
 def test_calculate_position_size_min_notional_violation():
-    # min_notional 5; düşük fiyatlı sembolde yeterli büyüklük geçer
+    # min_notional 5; sufficient size passes for a low-priced symbol.
     filters = SymbolFilters(**{**DEFAULT_FILTERS.__dict__, "min_price": 0.0, "tick_size": 0.000001})
     ok = calculate_position_size(
         symbol="BTCUSDT",
@@ -161,7 +161,7 @@ def test_calculate_position_size_min_notional_violation():
     )
     assert ok["notional"] >= 5
 
-    # aynı sembolde küçük risk -> notional 2 < 5 -> FILTER_VIOLATION
+    # Small risk on the same symbol → notional 2 < 5 → FILTER_VIOLATION.
     with pytest.raises(RasatError) as exc_info:
         calculate_position_size(
             symbol="BTCUSDT",
@@ -202,7 +202,7 @@ def test_calculate_position_size_price_filter_rejected():
 
 
 def test_calculate_position_size_returns_side():
-    # 3.20 M3: dönüş side'ı sabit "BUY" değil; geçilen side'a uygun olmalı.
+    # 3.20 M3: returned side is not fixed to "BUY"; it must match the passed side.
     buy = calculate_position_size(
         symbol="BTCUSDT", account_balance=10000, risk_pct=0.01,
         entry=100, stop_loss=95, filters=DEFAULT_FILTERS, side="BUY",
@@ -215,14 +215,14 @@ def test_calculate_position_size_returns_side():
     )
     assert sell["side"] == "SELL"
 
-    # küçük harfle gelen side normalleştirilir
+    # Lowercase side is normalized.
     lower = calculate_position_size(
         symbol="BTCUSDT", account_balance=10000, risk_pct=0.01,
         entry=100, stop_loss=95, filters=DEFAULT_FILTERS, side="buy",
     )
     assert lower["side"] == "BUY"
 
-    # side verilmezse varsayılan BUY
+    # BUY is the default when side is omitted.
     default = calculate_position_size(
         symbol="BTCUSDT", account_balance=10000, risk_pct=0.01,
         entry=100, stop_loss=95, filters=DEFAULT_FILTERS,
@@ -272,10 +272,10 @@ async def test_get_symbol_info_dispatches(pipeline_ctx):
 
 
 def test_symbol_filters_spot_notional_format():
-    """Canlı Binance spot exchangeInfo 'NOTIONAL' filterType kullanır (futures 'MIN_NOTIONAL').
+    """Live Binance spot exchangeInfo uses filterType 'NOTIONAL' (futures 'MIN_NOTIONAL').
 
-    Kod yalnızca MIN_NOTIONAL ararsa spot sembollerde min_notional hep 0 kalır
-    ve notional tabanı uygulanmaz (fail-open) — canlı API doğrulamasında yakalandı.
+    If code searches only for MIN_NOTIONAL, min_notional remains 0 for spot symbols
+    and the notional floor is not enforced (fail-open)—caught in live API validation.
     """
     from rasattrading_mcp.position_sizing import SymbolFilters
 
@@ -329,7 +329,7 @@ async def test_calculate_position_size_dispatches(pipeline_ctx):
 
 async def test_calculate_position_size_rejects_stale_price(pipeline_ctx):
     dispatcher, ctx, pipeline = pipeline_ctx
-    # ticker cache boş / stale -> STALE_DATA
+    # Empty/stale ticker cache -> STALE_DATA.
     pipeline.ticker_cache.mark_stale("test")
     with pytest.raises(RasatError) as exc_info:
         await dispatcher.dispatch(
@@ -347,8 +347,8 @@ async def test_calculate_position_size_rejects_stale_price(pipeline_ctx):
 
 
 async def test_get_symbol_info_universe_error_returns_stale_freshness(pipeline_ctx):
-    # 3.10 regresyon: universe != ok iken FRESHNESS_STALE import eksikliği
-    # NameError yerine doğru freshness dönmeli.
+    # 3.10 regression: missing FRESHNESS_STALE import when universe != ok.
+    # Must return correct freshness instead of NameError.
     dispatcher, ctx, pipeline = pipeline_ctx
     pipeline.universe._status = "stale"
     data, meta = await dispatcher.dispatch("get_symbol_info", {"symbol": "BTCUSDT"}, ctx)
@@ -357,9 +357,9 @@ async def test_get_symbol_info_universe_error_returns_stale_freshness(pipeline_c
 
 
 async def test_calculate_position_size_no_ticker_returns_stale_not_internal(pipeline_ctx):
-    # 3.10 regresyon: ticker None iken FRESHNESS_STALE NameError yerine STALE_DATA
+    # 3.10 regression: with ticker=None, return STALE_DATA instead of a FRESHNESS_STALE NameError.
     dispatcher, ctx, pipeline = pipeline_ctx
-    # ETHUSDT evrende ama ticker cache'inde yok → get_ticker None
+    # ETHUSDT is in the universe but absent from ticker cache → get_ticker None.
     with pytest.raises(RasatError) as exc_info:
         await dispatcher.dispatch(
             "calculate_position_size",

@@ -1,4 +1,4 @@
-"""Daemon tarafı tool handler'ları (Modül 1 örnekleri; Modül 2/3 ekler)."""
+"""Tool handlers executed by the daemon."""
 
 from __future__ import annotations
 
@@ -19,18 +19,18 @@ from ..storage.state import (
 from .server import ToolDispatcher
 
 
-# T02: execution sonucu status'u → pending terminal eşlemesi.
-# Yalnızca kesin borsa dolumu (FILLED) veya yerel paper simülasyonu kesin başarıdır;
-# NEW/PARTIALLY_FILLED gibi non-terminal ve bilinmeyen durumlar reconcile_required
-# taşır; REJECTED/CANCELED/EXPIRED deterministik rejected'dir. executed_order_id
-# yalnızca kesin başarıda doldurulur.
+# T02: map execution results to pending terminal states.
+# Only a confirmed exchange fill (FILLED) or local paper simulation is a definite
+# success; non-terminal and unknown states such as NEW/PARTIALLY_FILLED result in
+# reconcile_required; REJECTED/CANCELED/EXPIRED are deterministically rejected.
+# executed_order_id is populated only for definite success.
 _PENDING_DEFINITE_SUCCESS = frozenset({"FILLED", STATUS_PAPER})
 _PENDING_DEFINITE_REJECTED = frozenset({"REJECTED", "CANCELED", "EXPIRED"})
 
-# T3: geçici/retry-edilebilir hatalar → reconcile_required (kullanıcı ya da daemon
-# tekrar deneyebilir). Kalıcı deterministik hatalar (INSUFFICIENT_BALANCE,
-# INVALID_REQUEST, vb.) rejected'da kalır. STALE_DATA/RATE_LIMITED/TIMEOUT
-# eskiden kalıcı rejected üretiyordu — retry imkânı kayboluyordu.
+# T3: transient/retryable errors → reconcile_required (the user or daemon can
+# retry). Permanent deterministic errors (INSUFFICIENT_BALANCE, INVALID_REQUEST,
+# etc.) remain rejected. STALE_DATA/RATE_LIMITED/TIMEOUT previously produced a
+# permanent rejection, which removed the ability to retry.
 _PENDING_TRANSIENT_ERRORS = frozenset(
     {
         ErrorCode.TIMEOUT,
@@ -43,10 +43,10 @@ _PENDING_TRANSIENT_ERRORS = frozenset(
 
 
 async def _current_market_price(ctx: dict, symbol: str) -> float | None:
-    """Approve onayında market emir entry'sini dolduracak güncel piyasa fiyatı.
+    """Return the current market price used to fill a market order's entry on approval.
 
-    Daemon bağlamında `pipeline`'ın taze ticker'ı, test bağlamında `market`
-    feed'i kullanılır. Fiyat yoksa veya stale ise None döner (fail-closed).
+    In the daemon context, use the pipeline's fresh ticker; in tests, use the
+    `market` feed. Return None if no price is available or it is stale (fail closed).
     """
     pipeline = ctx.get("pipeline")
     if pipeline is not None:
@@ -99,7 +99,7 @@ def _require_pipeline(ctx: dict):
     if pipeline is None:
         raise RasatError(
             ErrorCode.PIPELINE_UNAVAILABLE,
-            "veri pipeline'ı bu daemon'da kapalı — bu tool canlı veri gerektiriyor",
+            "data pipeline is disabled in this daemon — this tool requires live data",
         )
     return pipeline
 
@@ -112,7 +112,7 @@ def _require_account_service(ctx: dict):
         return service
     db = ctx.get("db")
     if db is None:
-        raise RasatError(ErrorCode.NOT_IMPLEMENTED, "account servisi bu daemon'da başlatılmamış")
+        raise RasatError(ErrorCode.NOT_IMPLEMENTED, "account service is not initialized in this daemon")
     from ..storage.accounts import AccountService
 
     service = AccountService(db, audit=ctx.get("audit"))
@@ -127,11 +127,11 @@ async def candles_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
     limit = params.get("limit", 300)
     source = params.get("source", "spot")
     if not isinstance(symbol, str) or not symbol:
-        raise RasatError(ErrorCode.INVALID_REQUEST, "symbol zorunlu (string)")
+        raise RasatError(ErrorCode.INVALID_REQUEST, "symbol is required (string)")
     if not isinstance(timeframe, str) or not timeframe:
-        raise RasatError(ErrorCode.INVALID_REQUEST, "timeframe zorunlu (string)")
+        raise RasatError(ErrorCode.INVALID_REQUEST, "timeframe is required (string)")
     if not isinstance(limit, int):
-        raise RasatError(ErrorCode.INVALID_REQUEST, "limit integer olmalı")
+        raise RasatError(ErrorCode.INVALID_REQUEST, "limit must be an integer")
 
     rows = await pipeline.get_candles(symbol, timeframe, limit, source)
     freshness = pipeline.candle_freshness(symbol, timeframe, rows)
@@ -145,12 +145,12 @@ async def ticker_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
     pipeline = _require_pipeline(ctx)
     symbol = params.get("symbol")
     if not isinstance(symbol, str) or not symbol:
-        raise RasatError(ErrorCode.INVALID_REQUEST, "symbol zorunlu (string)")
+        raise RasatError(ErrorCode.INVALID_REQUEST, "symbol is required (string)")
     if not await pipeline.ensure_symbol(symbol):
-        raise RasatError(ErrorCode.INVALID_SYMBOL, f"evrende bilinmeyen sembol: {symbol}")
+        raise RasatError(ErrorCode.INVALID_SYMBOL, f"unknown symbol in universe: {symbol}")
     ticker = pipeline.get_ticker(symbol)
     if ticker is None:
-        raise RasatError(ErrorCode.STALE_DATA, f"ticker verisi yok: {symbol}")
+        raise RasatError(ErrorCode.STALE_DATA, f"ticker data unavailable: {symbol}")
     return ticker, Meta(as_of=utc_iso(), source="binance-ws-miniticker", freshness=ticker["freshness"])
 
 
@@ -182,7 +182,7 @@ async def remove_account_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
     return data, Meta(as_of=utc_iso(), source="sqlite-accounts", freshness=FRESHNESS_FRESH)
 
 
-# ---------- Modül 2: PA tool handler'ları ----------
+# ---------- price-action tool handlers ----------
 
 
 def _require_pa_engine(ctx: dict):
@@ -193,7 +193,7 @@ def _require_pa_engine(ctx: dict):
 
     db = ctx.get("db")
     if db is None:
-        raise RasatError(ErrorCode.NOT_IMPLEMENTED, "PA motoru bu daemon'da başlatılmamış")
+        raise RasatError(ErrorCode.NOT_IMPLEMENTED, "PA engine is not initialized in this daemon")
     engine = PAEngine(db, pipeline=ctx.get("pipeline"))
     ctx["pa_engine"] = engine
     return engine
@@ -209,8 +209,8 @@ def _pa_meta(timeframe: str, as_of: int | None, algo_version: str | None) -> Met
         algo_version=algo_version,
         extra={
             "freshness_note": (
-                "fresh = analiz, timeframe'in son kapanmış mumunu içerir (as_of, son "
-                "kapanmış mumun open_time'ıdır); ticker gibi gerçek zamanlı değil"
+                "fresh = analysis includes the timeframe's last closed candle (as_of is the "
+                "open_time of the last closed candle); it is not real-time like a ticker"
             )
         },
     )
@@ -257,7 +257,7 @@ def _require_annotations(ctx: dict):
 
     db = ctx.get("db")
     if db is None:
-        raise RasatError(ErrorCode.NOT_IMPLEMENTED, "annotation servisi bu daemon'da başlatılmamış")
+        raise RasatError(ErrorCode.NOT_IMPLEMENTED, "annotation service is not initialized in this daemon")
     svc = AnnotationService(db)
     ctx["annotations"] = svc
     return svc
@@ -299,7 +299,7 @@ async def scan_market_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
     if screener is None:
         db = ctx.get("db")
         if db is None:
-            raise RasatError(ErrorCode.NOT_IMPLEMENTED, "screener bu daemon'da başlatılmamış")
+            raise RasatError(ErrorCode.NOT_IMPLEMENTED, "screener is not initialized in this daemon")
         screener = Screener(db, engine=ctx.get("pa_engine"), pipeline=ctx.get("pipeline"))
         ctx["screener"] = screener
     data = await screener.scan(
@@ -313,7 +313,7 @@ async def scan_market_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
     return data, Meta(as_of=utc_iso(), source="pa-screener", freshness=data["freshness"])
 
 
-# ---------- Modül 2 / 2.6: alarm handler'ları ----------
+# ---------- alarm handlers ----------
 
 
 def _require_alarm_service(ctx: dict):
@@ -352,33 +352,33 @@ async def get_pending_orders_handler(params: dict, ctx: dict) -> tuple[dict, Met
 
 
 async def approve_pending_order_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
-    """Onaylı bekleyen emri GERÇEK emir olarak açıp T00 state machine'iyle kapatır.
+    """Open the approved pending order as a REAL order and complete it through the T00 state machine.
 
-    Emir boyutlandırma daemon tarafında yapılır: `execute_on_accounts`
-    risk_pct + hesap equity'si + sembol filtreleriyle; spec'teki miktar
-    kullanılmaz (agent'a güvenilmez — plan 5.2). Idempotency key:
-    `pending:<order_id>` — retry çift emir üretmez.
+    Order sizing is performed by the daemon through `execute_on_accounts`, using
+    risk_pct, account equity, and symbol filters; the amount in the spec is not
+    used because the agent is not trusted (plan 5.2). Idempotency key:
+    `pending:<order_id>` — retries do not create duplicate orders.
 
-    T02 state akışı (CAS, T00 sözleşmesi):
-    - `awaiting_approval → approved → executing` tek transaction'da claim edilir
-      (iki eşzamanlı approve yalnızca bir execution claim üretir).
-    - `execute_on_accounts` structured REJECTED/UNKNOWN sonucu başarı sayılmaz;
-      exception sonrası kayıt `approved` kilidinde kalmaz.
-    - Kesin başarı yalnızca `status == FILLED` (borsa dolumu) veya paper
-      simülasyonudur → `executed` (`executed_order_id` kesin emir kimliğiyle
-      doldurulur). REJECTED/CANCELED/EXPIRED → deterministic `rejected`;
-      NEW/PARTIALLY_FILLED/UNKNOWN ve bilinmeyen status → `reconcile_required`
-      (non-terminal/ambiguous; executed_order_id boş kalır).
+    T02 state flow (CAS, T00 contract):
+    - `awaiting_approval → approved → executing` is claimed in one transaction
+      (two concurrent approvals produce only one execution claim).
+    - A structured REJECTED/UNKNOWN result from `execute_on_accounts` is not a
+      success; after an exception, the record does not remain locked in `approved`.
+    - Definite success is only `status == FILLED` (exchange fill) or a paper
+      simulation → `executed` (`executed_order_id` is populated with the definite
+      order ID). REJECTED/CANCELED/EXPIRED → deterministic `rejected`;
+      NEW/PARTIALLY_FILLED/UNKNOWN and unknown statuses → `reconcile_required`
+      (non-terminal/ambiguous; executed_order_id remains empty).
     """
     alarm = _require_alarm_service(ctx)
     order_id = params["order_id"]
     rec = await alarm._pending_order(order_id)
     if rec["status"] != PENDING_AWAITING_APPROVAL:
-        raise RasatError(ErrorCode.INVALID_REQUEST, f"onay bekleyen durumda değil: {rec['status']}")
+        raise RasatError(ErrorCode.INVALID_REQUEST, f"order is not awaiting approval: {rec['status']}")
 
-    # T3: market emirde entry eksikse daemon'ın kendi taze piyasa fiyatıyla doldur
-    # (storage tarafında entry zorunlu — eksik değer kalıcı rejected üretiyordu).
-    # Fiyat alınamıyorsa fail-closed: kayıt awaiting_approval'da kalır, retry edilebilir.
+    # T3: fill a missing market-order entry with the daemon's own fresh market price
+    # (storage requires entry; a missing value used to produce a permanent rejection).
+    # If no price is available, fail closed: keep the record awaiting_approval for retry.
     order_type = rec.get("order_type") or "market"
     entry = rec.get("entry")
     stop_loss = rec.get("stop_loss")
@@ -387,29 +387,29 @@ async def approve_pending_order_handler(params: dict, ctx: dict) -> tuple[dict, 
         if market_price is None:
             raise RasatError(
                 ErrorCode.STALE_DATA,
-                f"market emir için güncel piyasa fiyatı alınamadı: {rec['symbol']}",
+                f"could not obtain the current market price for market order: {rec['symbol']}",
             )
         entry = market_price
         await alarm._fill_pending_entry(order_id, entry)
 
-    # T02 preflight: risk_pct/required execution alanları broker'dan ÖNCE yeniden doğrulanır.
+    # T02 preflight: revalidate risk_pct and required execution fields BEFORE the broker.
     alarm._validate_execution_inputs(
         risk_pct=rec.get("risk_pct"),
         entry=entry,
         stop_loss=stop_loss,
         order_type=rec.get("order_type"),
     )
-    # T3: stop_loss tüm order tiplerinde zorunludur (storage tarafında zorunlu tutulur).
-    # Eksikse execute_on_accounts'a gitmeden INVALID_REQUEST döner — kayıt kalıcı
-    # rejected'a düşmez, kullanıcı düzeltip yeniden onaylayabilir.
+    # T3: stop_loss is required for all order types (storage enforces this).
+    # If missing, return INVALID_REQUEST before execute_on_accounts; do not create
+    # a permanent rejection so the user can correct and approve again.
     if stop_loss is None:
         raise RasatError(
             ErrorCode.INVALID_REQUEST,
-            "stop_loss zorunlu (onaylı emir için koruma seviyesi eksik)",
+            "stop_loss is required (protection level missing for approved order)",
         )
     order_service = ctx.get("order_service")
     if order_service is None:
-        raise RasatError(ErrorCode.NOT_IMPLEMENTED, "order service bu daemon'da başlatılmamış")
+        raise RasatError(ErrorCode.NOT_IMPLEMENTED, "order service is not initialized in this daemon")
 
     await alarm.approve_and_claim_pending_execution(order_id)
 
@@ -427,7 +427,7 @@ async def approve_pending_order_handler(params: dict, ctx: dict) -> tuple[dict, 
             actor=str(ctx.get("actor", "mcp-agent")),
         )
     except RasatError as exc:
-        # Deterministik rejection → rejected; geçici/retry-edilebilir → reconcile_required.
+        # Deterministic rejection → rejected; transient/retryable → reconcile_required.
         terminal = (
             PENDING_RECONCILE_REQUIRED
             if exc.code in _PENDING_TRANSIENT_ERRORS
@@ -442,35 +442,35 @@ async def approve_pending_order_handler(params: dict, ctx: dict) -> tuple[dict, 
             order_id,
             status=PENDING_RECONCILE_REQUIRED,
             error_code=ErrorCode.INTERNAL_ERROR,
-            error_message="beklenmeyen hata; emir durumu doğrulanamadı",
+            error_message="unexpected error; could not verify order status",
         )
         raise
 
     results = executed.get("results") if isinstance(executed, dict) else None
     result = results[0] if isinstance(results, list) and results else None
     if not isinstance(result, dict):
-        # Boş/ambiguous sonuç — executed_order_id'yi doldurmadan reconcile bırak.
+        # Empty/ambiguous result — leave as reconcile without populating executed_order_id.
         await alarm.fail_pending_execution(
             order_id,
             status=PENDING_RECONCILE_REQUIRED,
             error_code=ErrorCode.ORDER_UNKNOWN,
-            error_message="emir sonucu alınamadı; reconcile gerekli",
+            error_message="order result unavailable; reconciliation required",
         )
-        raise RasatError(ErrorCode.ORDER_RECONCILE_REQUIRED, "emir sonucu belirsiz; reconcile gerekli")
+        raise RasatError(ErrorCode.ORDER_RECONCILE_REQUIRED, "order result is ambiguous; reconciliation required")
 
     status = result.get("status")
     error = result.get("error") or {}
     if status in _PENDING_DEFINITE_SUCCESS:
-        # Kesin başarı: yalnızca FILLED (borsa dolumu) veya paper simülasyonu.
+        # Definite success: only FILLED (exchange fill) or a paper simulation.
         executed_order_id = result.get("exchange_order_id") or result.get("order_id")
         if not executed_order_id:
             await alarm.fail_pending_execution(
                 order_id,
                 status=PENDING_RECONCILE_REQUIRED,
                 error_code=ErrorCode.ORDER_UNKNOWN,
-                error_message="kesin emir kimliği alınamadı; reconcile gerekli",
+                error_message="definite order ID unavailable; reconciliation required",
             )
-            raise RasatError(ErrorCode.ORDER_RECONCILE_REQUIRED, "kesin emir kimliği alınamadı")
+            raise RasatError(ErrorCode.ORDER_RECONCILE_REQUIRED, "definite order ID unavailable")
         await alarm.complete_pending_execution(order_id, executed_order_id)
         return {
             "order_id": order_id,
@@ -480,31 +480,32 @@ async def approve_pending_order_handler(params: dict, ctx: dict) -> tuple[dict, 
         }, Meta(as_of=utc_iso(), source="order-service", freshness=FRESHNESS_FRESH)
 
     if status in _PENDING_DEFINITE_REJECTED:
-        # Deterministik red: borsa emri kesin reddedildi/iptal/süresi doldu.
-        # T3: structured REJECTED içindeki geçici hata kodları (STALE_DATA,
-        # RATE_LIMITED vb.) kalıcı rejected DEĞİLDİR — retry imkânı kalsın diye
-        # reconcile_required'a çekilir. Yalnızca gerçekten kalıcı kodlar (örn.
-        # borsa ORDER_REJECTED / INSUFFICIENT_BALANCE) rejected'da kalır.
+        # Deterministic rejection: the exchange order was definitively rejected,
+        # canceled, or expired.
+        # T3: transient error codes in structured REJECTED (STALE_DATA,
+        # RATE_LIMITED, etc.) are not permanent rejections; move them to
+        # reconcile_required so retry remains possible. Only genuinely permanent
+        # codes (e.g. exchange ORDER_REJECTED / INSUFFICIENT_BALANCE) remain rejected.
         code = error.get("code") or {
             "REJECTED": ErrorCode.ORDER_REJECTED,
             "EXPIRED": ErrorCode.ORDER_EXPIRED,
             "CANCELED": ErrorCode.ORDER_REJECTED,
         }.get(status, ErrorCode.ORDER_REJECTED)
-        message = error.get("message") or f"emir kesin sonlandı (borsa durumu: {status})"
+        message = error.get("message") or f"order definitively ended (exchange status: {status})"
         terminal = PENDING_RECONCILE_REQUIRED if code in _PENDING_TRANSIENT_ERRORS else PENDING_REJECTED
         await alarm.fail_pending_execution(
             order_id, status=terminal, error_code=code, error_message=message
         )
         raise RasatError(code, message)
 
-    # Diğer tüm durumlar (UNKNOWN, NEW, PARTIALLY_FILLED ve bilinmeyen status):
-    # non-terminal/ambiguous → reconcile_required; executed_order_id doldurulmaz.
+    # All other states (UNKNOWN, NEW, PARTIALLY_FILLED, and unknown statuses):
+    # non-terminal/ambiguous → reconcile_required; executed_order_id is not populated.
     code = error.get("code") or ErrorCode.ORDER_UNKNOWN
-    message = error.get("message") or f"emir durumu kesin değil (borsa durumu: {status}); reconcile gerekli"
+    message = error.get("message") or f"order status is not definitive (exchange status: {status}); reconciliation required"
     await alarm.fail_pending_execution(
         order_id, status=PENDING_RECONCILE_REQUIRED, error_code=code, error_message=message
     )
-    raise RasatError(ErrorCode.ORDER_RECONCILE_REQUIRED, "emir kesin dolmadı; reconcile gerekli")
+    raise RasatError(ErrorCode.ORDER_RECONCILE_REQUIRED, "order was not definitively filled; reconciliation required")
 
 
 async def reject_pending_order_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
@@ -556,7 +557,7 @@ def _require_risk_service(ctx: dict):
         return service
     db = ctx.get("db")
     if db is None:
-        raise RasatError(ErrorCode.NOT_IMPLEMENTED, "risk politikası servisi bu daemon'da başlatılmamış")
+        raise RasatError(ErrorCode.NOT_IMPLEMENTED, "risk policy service is not initialized in this daemon")
     from ..storage.risk_policy import RiskPolicyService
 
     service = RiskPolicyService(db, audit=ctx.get("audit"))
@@ -612,7 +613,7 @@ def _require_symbol_filters(ctx: dict, symbol: str) -> dict:
     pipeline = _require_pipeline(ctx)
     info = pipeline.symbol_info(symbol)
     if info is None:
-        raise RasatError(ErrorCode.INVALID_SYMBOL, f"evrende bilinmeyen sembol: {symbol}")
+        raise RasatError(ErrorCode.INVALID_SYMBOL, f"unknown symbol in universe: {symbol}")
     return info
 
 
@@ -620,7 +621,7 @@ async def get_symbol_info_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
     pipeline = _require_pipeline(ctx)
     symbol = params.get("symbol")
     if not isinstance(symbol, str) or not symbol:
-        raise RasatError(ErrorCode.INVALID_REQUEST, "symbol zorunlu (string)")
+        raise RasatError(ErrorCode.INVALID_REQUEST, "symbol is required (string)")
     info = _require_symbol_filters(ctx, symbol)
     from ..position_sizing import SymbolFilters
 
@@ -635,7 +636,7 @@ async def calculate_position_size_handler(params: dict, ctx: dict) -> tuple[dict
     pipeline = _require_pipeline(ctx)
     symbol = params.get("symbol")
     if not isinstance(symbol, str) or not symbol:
-        raise RasatError(ErrorCode.INVALID_REQUEST, "symbol zorunlu (string)")
+        raise RasatError(ErrorCode.INVALID_REQUEST, "symbol is required (string)")
     account_balance = params.get("account_balance")
     risk_pct = params.get("risk_pct")
     entry = params.get("entry")
@@ -644,14 +645,14 @@ async def calculate_position_size_handler(params: dict, ctx: dict) -> tuple[dict
     fee_rate = params.get("fee_rate", 0.001)
     for name, value in (("account_balance", account_balance), ("risk_pct", risk_pct), ("entry", entry), ("stop_loss", stop_loss)):
         if not isinstance(value, (int, float)) or isinstance(value, bool):
-            raise RasatError(ErrorCode.INVALID_REQUEST, f"{name} sayı olmalı")
+            raise RasatError(ErrorCode.INVALID_REQUEST, f"{name} must be a number")
 
-    # Temel doğruluk kontrolleri (her zaman aktif, kapatılamaz):
-    # 1) sembol geçerlilik / TRADING durumu
+    # Core correctness checks (always active and non-bypassable):
+    # 1) symbol validity / TRADING status
     from ..accuracy import check_price_fresh, check_symbol_valid
 
     check_symbol_valid(symbol, set(pipeline.universe_snapshot()))
-    # 2) fiyat staleness — daemon'ın kendi taze ticker'ına güvenilir
+    # 2) price freshness — trust the daemon's own fresh ticker
     ticker = pipeline.get_ticker(symbol)
     freshness = ticker["freshness"] if ticker else FRESHNESS_STALE
     check_price_fresh(freshness, symbol)
@@ -680,7 +681,7 @@ def _require_order_service(ctx: dict):
         return service
     db = ctx.get("db")
     if db is None:
-        raise RasatError(ErrorCode.NOT_IMPLEMENTED, "order servisi bu daemon'da başlatılmamış")
+        raise RasatError(ErrorCode.NOT_IMPLEMENTED, "order service is not initialized in this daemon")
     from ..storage.orders import OrderService
 
     accounts = _require_account_service(ctx)
@@ -690,7 +691,7 @@ def _require_order_service(ctx: dict):
     if pipeline is None or broker is None:
         raise RasatError(
             ErrorCode.PIPELINE_UNAVAILABLE,
-            "order servisi için pipeline ve broker gereklidir — bu daemon'da kapalı",
+            "order service requires the pipeline and broker — disabled in this daemon",
         )
     from ..storage.orders import PipelineMarketFeed
 
@@ -740,10 +741,10 @@ async def place_order_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
 
 
 async def place_oco_order_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
-    """OCO emri: LIMIT (kâr hedefi) + STOP_LOSS_LIMIT tek emir listesinde.
+    """OCO order: LIMIT (profit target) + STOP_LOSS_LIMIT in a single order list.
 
-    Biri dolunca diğeri borsada otomatik iptal olur — aynı pozisyon için
-    ayrı ayrı SL+TP emri bakiyeyi birbirinden çaldığı için tek çağrı şarttır.
+    When one fills, the exchange automatically cancels the other; one call is
+    required because separate SL and TP orders would compete for the same balance.
     """
     service = _require_order_service(ctx)
     data = await service.place_oco_order(
@@ -808,13 +809,13 @@ async def get_unprotected_positions_handler(params: dict, ctx: dict) -> tuple[di
 
 
 async def get_audit_log_handler(params: dict, ctx: dict) -> tuple[dict, Meta]:
-    """Audit log sorgusu — tamamen DB-yerel, pipeline gerektirmez."""
+    """Query the audit log—fully DB-local and does not require the pipeline."""
     audit = ctx.get("audit")
     if audit is None:
-        raise RasatError(ErrorCode.NOT_IMPLEMENTED, "audit log bu daemon'da başlatılmamış")
+        raise RasatError(ErrorCode.NOT_IMPLEMENTED, "audit log is not initialized in this daemon")
     limit = params.get("limit", 50)
     if not isinstance(limit, int) or limit < 1 or limit > 500:
-        raise RasatError(ErrorCode.INVALID_REQUEST, "limit 1-500 arası olmalı")
+        raise RasatError(ErrorCode.INVALID_REQUEST, "limit must be between 1 and 500")
     broken = await audit.verify()
     tail = await audit.tail(limit)
     data = {
@@ -832,9 +833,9 @@ def build_dispatcher(ctx: dict) -> ToolDispatcher:
     dispatcher = ToolDispatcher(REGISTRY)
     dispatcher.register("ping", ping_handler)
     dispatcher.register("get_readiness", readiness_handler)
-    # TÜM tool'lar her zaman kayıtlıdır (adapter 32'sini de tanıtır).
-    # Pipeline'a gerçekten bağımlı olanlar çağrıldığında PIPELINE_UNAVAILABLE
-    # döner — TOOL_NOT_FOUND değil (tanıtım/tanım tutarlılığı).
+    # ALL tools are always registered (the adapter also advertises all 32).
+    # Tools that genuinely depend on the pipeline return PIPELINE_UNAVAILABLE
+    # when called, not TOOL_NOT_FOUND (advertising/definition consistency).
     dispatcher.register("get_candles", candles_handler)
     dispatcher.register("get_ticker", ticker_handler)
     dispatcher.register("get_symbol_info", get_symbol_info_handler)

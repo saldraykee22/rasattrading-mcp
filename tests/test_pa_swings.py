@@ -1,13 +1,13 @@
-"""2.1 — Swing High/Low + BOS/CHoCH fixture testleri.
+"""2.1 — Swing High/Low + BOS/CHoCH fixture tests.
 
-Bilinen mum dizileri için beklenen swing/BOS/CHoCH çıktısı doğrulanır.
-Algoritma değişirse `algo_version` artmalı — bu testler sabit girdiye karşı
-deterministik çıktıyı ve sürüm etiketini garanti eder.
+Verify expected swing/BOS/CHoCH output for known candle sequences.
+If the algorithm changes, `algo_version` must increase—these tests guarantee
+deterministic output and the version label for fixed input.
 
 Kurallar (swing-v1):
-- Pivot yalnızca iki yanda da yarım pencere varken işaretlenir
-  (indeks [lookback, n-lookback)); strict karşılaştırma (eşitler pivot değil).
-- Olaylar cross kuralıyla üretilir: barın başındaki seviyeye karşı kapanış.
+- A pivot is marked only when a half-window exists on both sides
+  (index [lookback, n-lookback)); strict comparison (equals are not pivots).
+- Events use the cross rule: close against the level at the start of the bar.
 """
 
 import time
@@ -88,7 +88,7 @@ HOLD = [
     (101, 101.5, 100.5, 101),     # 5
     (101, 101.5, 100.5, 100.5),   # 6
     (100.5, 103, 101, 102.5),     # 7  bos_bullish (102), swing high 103
-    (102.5, 102.5, 102, 102.5),   # 8  üstte kalır — yeni olay yok
+    (102.5, 102.5, 102, 102.5),   # 8  remains above — no new event.
     (102.5, 102.5, 102, 102.5),   # 9
     (102, 102.5, 101.5, 102),     # 10
     (102, 102.5, 101.5, 101.5),   # 11
@@ -109,7 +109,7 @@ def test_swing_left_edge_not_pivot():
         (100, 100.5, 100, 99.5),
     ]
     pivots = detect_swings([r[1] for r in rows], [r[2] for r in rows])
-    assert pivots == []  # 0-1 indeksleri sol yarım pencere eksik → pivot yok
+    assert pivots == []  # Indices 0-1 lack the left half-window → no pivot.
 
 
 def test_uptrend_bullish_bos():
@@ -144,7 +144,7 @@ def test_choch_bullish_from_downtrend():
 
 def test_initial_trend_first_pivot_high_is_down():
     st = detect_structure(mk(CHOCU))
-    # İlk pivot high → başlangıç trendi down; yukarı kırılım CHoCH olur.
+    # First pivot high → initial trend down; upward break becomes CHoCH.
     first = st["events"][0]
     assert first["type"] == "choch_bullish"
     assert first["level"] == 103.0

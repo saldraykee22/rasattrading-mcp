@@ -1,21 +1,20 @@
-"""2.1 — Swing High/Low + BOS/CHoCH (saf, deterministik).
+"""2.1 — Swing High/Low + BOS/CHoCH (pure, deterministic).
 
-Kurallar (sürüm `swing-v1`, eşikler `pa/params.py`):
-- **Swing (fractal):** `i` barı swing high'dır ⇔ `high[i]`, `[i-L, i+L]`
-  penceresindeki diğer tüm bar'ların high'ından katı biçimde büyüktür
-  (swing low için low'un katı biçimde küçük olması). `L = SWING_LOOKBACK`.
-- **Kapalı mum kuralı:** Bu modül girdi olarak aldığı dizi neyse onu işler;
-  hâlâ oluşmakta olan son barı hariç tutmak çağıranın işidir
-  (`filter_closed_candles` yardımcısı). Yani hesaplama asla canlı bara
-  bakmaz, deterministiktir.
-- **Yapı:** Yürüyüş sırasında en güncel swing high/low seviyeleri korunur.
-  Bir barın kapanışı (cross) bir seviyeyi geçince olay üretilir:
-  - trend `up` iken close > son swing high → `bos_bullish`
-  - trend `down` iken close < son swing low  → `bos_bearish`
-  - trend `up` iken close < son swing low   → `choch_bearish`, trend → down
-  - trend `down` iken close > son swing high → `choch_bullish`, trend → up
-- Başlangıç trendi ilk iki pivotun sırasından belirlenir: önce low sonra high
-  → up; önce high sonra low → down.
+Rules (version `swing-v1`, thresholds in `pa/params.py`):
+- **Swing (fractal):** bar `i` is a swing high iff `high[i]` is strictly greater
+  than every other bar's high in the `[i-L, i+L]` window (strictly lower for a
+  swing low). `L = SWING_LOOKBACK`.
+- **Closed-candle rule:** This module processes exactly the input array it receives;
+  the caller must exclude the still-forming last bar (`filter_closed_candles` helper).
+  Thus computation never looks at a live bar and is deterministic.
+- **Structure:** Preserve the latest swing high/low levels while walking the data.
+  Emit an event when a bar close crosses a level:
+  - while trend is `up`, close > last swing high → `bos_bullish`
+  - while trend is `down`, close < last swing low  → `bos_bearish`
+  - while trend is `up`, close < last swing low   → `choch_bearish`, trend → down
+  - while trend is `down`, close > last swing high → `choch_bullish`, trend → up
+- Determine the initial trend from the order of the first two pivots: low then high
+  → up; high then low → down.
 """
 
 from __future__ import annotations
@@ -26,20 +25,19 @@ from .params import SWING_ALGO_VERSION, SWING_LOOKBACK
 
 
 def filter_closed_candles(candles: list[dict], timeframe: str, now: float | None = None) -> list[dict]:
-    """Hâlâ oluşmakta olan (kapanmamış) son barı atar.
+    """Discard the last still-forming (not closed) bar.
 
-    Kapalı mum kuralı: PA hesaplamaları yalnızca kapanmış mumlar üzerinden
-    yapılır. Binance'te bar `open_time + period` anında kapanır; bu andan
-    önceki hiçbir bar canlı sayılmaz.
+    Closed-candle rule: PA calculations use only closed candles. On Binance, a
+    bar closes at `open_time + period`; no bar before that time counts as live.
 
-    `now` verilmezse yerel saate düşülür; veri katmanıyla (klines server clock)
-    tutarlılık için çağıranlar `PAEngine._now()` ile server clock'u geçirmeli
-    (T2) — host saati kayarsa bu karar kayar.
+    If `now` is omitted, fall back to local time; for consistency with the data
+    layer (klines server clock), callers should pass the server clock through
+    `PAEngine._now()` (T2), otherwise host-clock drift affects this decision.
     """
     from ..config import TIMEFRAME_SECONDS
 
     if timeframe not in TIMEFRAME_SECONDS:
-        raise ValueError(f"bilinmeyen timeframe: {timeframe}")
+        raise ValueError(f"unknown timeframe: {timeframe}")
     if not candles:
         return candles
     import time as _time
@@ -48,13 +46,13 @@ def filter_closed_candles(candles: list[dict], timeframe: str, now: float | None
         now = _time.time()
     period = TIMEFRAME_SECONDS[timeframe]
     latest_closed = int(now // period) * period - period
-    # TODO(T2, düşük öncelik): 1w/1M için epoch-floor kapanış hizalaması
-    # Binance'in Pazartesi/ay-başı hizalamasıyla uyuşmaz — gerekiyorsa ayrıca ele alın.
+    # TODO(T2, low priority): epoch-floor close alignment for 1w/1M does not
+    # match Binance's Monday/month-start alignment; handle separately if needed.
     return [c for c in candles if c["open_time"] <= latest_closed]
 
 
 def detect_swings(highs: list[float], lows: list[float], lookback: int = SWING_LOOKBACK) -> list[tuple[int, str, float]]:
-    """Fractal swing high/low tespiti. (index, 'high'|'low', price) üçlüleri."""
+    """Detect fractal swing highs/lows. Return (index, 'high'|'low', price) triples."""
     n = len(highs)
     pivots: list[tuple[int, str, float]] = []
     if n < 2 * lookback + 1:
@@ -74,9 +72,9 @@ def detect_structure(
     lookback: int = SWING_LOOKBACK,
     algo_version: str = SWING_ALGO_VERSION,
 ) -> dict[str, Any]:
-    """Swing + BOS/CHoCH yapısını üretir.
+    """Build swing + BOS/CHoCH structure.
 
-    Çıktı:
+    Output:
       { algo_version, trend: "up"|"down"|None,
         swings: [{index, time, kind: "high"|"low", price, label: "HH"|"LH"|"HL"|"LL"|null}],
         events: [{index, time, type: "bos_bullish"|"bos_bearish"|"choch_bullish"|"choch_bearish",
@@ -102,10 +100,10 @@ def detect_structure(
     pidx = 0
     npiv = len(pivots)
     for b in range(n):
-        # 1) Kapanış kırılımı kontrolü — barın BAŞINDAKİ seviyelere karşı.
-        #    (Aynı barda yeni bir pivot seviyeyi güncellemeden önce eski
-        #    seviyeye karşı değerlendirilir; böylece swing oluşum barındaki
-        #    yapı kırılımı da yakalanır, çift sayım olmaz.)
+        # 1) Check close breaks against the levels at the START of the bar.
+        #    Evaluate against the old level before updating a new pivot from the
+        #    same bar; this catches a structure break on the swing-formation bar
+        #    without double-counting.
         if b > 0 and last_high is not None and last_low is not None:
             prev_close = closes[b - 1]
             c = closes[b]
@@ -130,7 +128,7 @@ def detect_structure(
                         {"index": b, "time": times[b], "type": "bos_bearish", "level": last_low, "direction": "bearish"}
                     )
 
-        # 2) Aynı barda doğrulanan pivotları işle → seviyeleri güncelle.
+        # 2) Process pivots confirmed on the same bar → update levels.
         while pidx < npiv and pivots[pidx][0] == b:
             idx, kind, price = pivots[pidx]
             pidx += 1

@@ -1,10 +1,10 @@
-"""Test yardımcıları: FakeRest (Binance REST taklidi) + FakeOrderBroker."""
+"""Test helpers: FakeRest (Binance REST double) + FakeOrderBroker."""
 
 import time
 
 
 class FakeRest:
-    """Binance REST'i taklit eder: klines/exchangeInfo/premiumIndex/OI üretir, çağrıları kaydeder."""
+    """Binance REST double: produces klines/exchangeInfo/premiumIndex/OI and records calls."""
     def __init__(self, symbols: list[str] | None = None, extra_exchange_entries: list[dict] | None = None) -> None:
         self.symbols = symbols or ["BTCUSDT", "ETHUSDT"]
         self.extra_exchange_entries = extra_exchange_entries or []
@@ -50,9 +50,8 @@ class FakeRest:
             symbols.extend(self.extra_exchange_entries)
             return {"timezone": "UTC", "symbols": symbols}
         if path == "/fapi/v1/exchangeInfo":
-            # Varsayılan: spot evreninin tamamı futures'ta da var (test kolaylığı).
-            # Yalnızca belirli sembollerin futures'ta olduğunu simüle etmek için
-            # `fapi_symbols` set edilebilir.
+            # Default: the full spot universe is also present in futures (test convenience).
+            # Set `fapi_symbols` to simulate only selected symbols being in futures.
             fapi_symbols = getattr(self, "fapi_symbols", self.symbols)
             return {
                 "symbols": [
@@ -72,16 +71,16 @@ class FakeRest:
             ]
         if path == "/fapi/v1/openInterest":
             return {"openInterest": "1234.5", "time": int(time.time() * 1000)}
-        raise AssertionError(f"FakeRest bilinmeyen path: {path}")
+        raise AssertionError(f"FakeRest unknown path: {path}")
 
 
 class FakeClock:
-    """BinanceClock taklidi: offset ve availability testte kontrol edilebilir.
+    """BinanceClock double: offset and availability can be controlled in tests.
 
-    - `server_now()` `available` ise `time.time() + offset_seconds` döner;
-      değilse `None` (fail-closed senaryoları).
-    - `set_offset` / `set_available` ile host-sunucu saat kayması ve
-      clock-unavailable durumları simüle edilir.
+    - `server_now()` returns `time.time() + offset_seconds` when `available`;
+      otherwise `None` (fail-closed scenarios).
+    - `set_offset` / `set_available` simulate host-server clock skew and
+      clock-unavailable states.
     """
 
     def __init__(self, offset: float = 0.0, available: bool = True) -> None:
@@ -107,20 +106,20 @@ class FakeClock:
 
 
 class FakeOrderBroker:
-    """OrderBroker taklidi: emirleri kaydeder, durum machine'ini simüle eder.
+    """OrderBroker double: records orders and simulates the state machine.
 
-    - `place_order` çağrıları `placed` listesine eklenir; `place_result` dict'i
-      verilirse o döner (status/exchange_order_id/executed_qty/avg_price).
-    - `place_errors` dict'i {client_order_id: RasatError|Exception} ağ hatalarını
-      tetikler (timeout/reject senaryoları).
-    - `query_order` `queries` listesine eklenir; `query_results` dict'i
-      {client_order_id: OrderResult|None} verilirse onu döner, yoksa son
-      `placed` kaydını döner (bulunamadı → None).
-    - `query_oco` `oco_queries` listesine eklenir; `oco_query_results` ve
-      `oco_query_results_by_account` dict'leri OCO liste sorgularını simüle eder.
-    - `balances` dict'i {account_id: {asset: free}} bakiye simülasyonu.
-    - `locked_balances` dict'i {account_id: {asset: locked}} açık emirlerde kilitli
-      miktarları simüle eder (3.21); `get_balance_detail` bunu free ile birleştirir.
+    - `place_order` calls are added to `placed`; if `place_result` is provided,
+      return it (status/exchange_order_id/executed_qty/avg_price).
+    - `place_errors` maps {client_order_id: RasatError|Exception} to network
+      errors (timeout/reject scenarios).
+    - `query_order` adds to `queries`; if `query_results` contains
+      {client_order_id: OrderResult|None}, return it; otherwise return the last
+      `placed` record (not found → None).
+    - `query_oco` adds to `oco_queries`; `oco_query_results` and
+      `oco_query_results_by_account` simulate OCO list queries.
+    - `balances` simulates {account_id: {asset: free}} balances.
+    - `locked_balances` simulates {account_id: {asset: locked}} amounts locked in
+      open orders (3.21); `get_balance_detail` combines these with free amounts.
     """
 
     def __init__(self, balances: dict[str, dict] | None = None) -> None:
@@ -139,13 +138,13 @@ class FakeOrderBroker:
         self.oco_query_results_by_account: dict[str, object | None] = {}
         self.cancel_errors: dict[str, Exception] = {}
         self.cancel_all_errors: dict[str, Exception] = {}
-        #: Borsada duran (local DB'de kaydı olmayabilir) açık emirler.
-        #: Varsayılan, legacy `get_all_open_orders` davranışını korur (bir BTCUSDT
-        #: yetim emri); isteyen test `open_orders = []` ile temizler.
+        #: Open orders on the exchange (possibly absent from the local DB).
+        #: Default preserves legacy `get_all_open_orders` behavior (one BTCUSDT
+        #: orphan order); tests can clear it with `open_orders = []`.
         self.open_orders: list[dict] = [
             {"symbol": "BTCUSDT", "order_id": "O1", "client_order_id": "open-1", "side": "BUY", "quantity": 0.5}
         ]
-        #: get_balance çağrısında hesap bazlı hata (exposure fail-closed testleri).
+        #: Per-account error for get_balance calls (exposure fail-closed tests).
         self.get_balance_errors: dict[str, Exception] = {}
         self._seq = 1000
 
@@ -187,7 +186,7 @@ class FakeOrderBroker:
         return result
 
     async def place_oco(self, *, account_id, symbol, side, quantity, price, stop_price, stop_limit_price, client_order_id):
-        """OCO emri: tek kayıt olarak placed listesine düşer (newOrderList simülasyonu)."""
+        """OCO order: add one record to `placed` (newOrderList simulation)."""
         self.placed.append(
             {
                 "account_id": account_id,
@@ -216,7 +215,7 @@ class FakeOrderBroker:
         )
 
     def _apply_fill(self, account_id, symbol, side, result, quantity, price):
-        """FILLED olursa bakiye simülasyonunu güncelle: USDT düş, base ekle."""
+        """When FILLED, update the balance simulation: subtract USDT and add base."""
         if result.status != "FILLED" or not symbol.endswith("USDT"):
             return
         base = symbol[: -len("USDT")]
@@ -272,8 +271,8 @@ class FakeOrderBroker:
     async def cancel_oco(self, *, account_id, symbol, list_client_order_id):
         """OCO listesi iptali: `cancelled_oco` listesine kaydeder.
 
-        `cancel_oco_results[list_client_order_id]` varsa o OrderResult|None döner
-        (None = borsada bulunamadı, -2011 simülasyonu); yoksa CANCELED varsayılır.
+        Return `cancel_oco_results[list_client_order_id]` when present
+        (None = not found on the exchange, -2011 simulation); otherwise assume CANCELED.
         """
         if list_client_order_id in self.cancel_errors:
             raise self.cancel_errors[list_client_order_id]

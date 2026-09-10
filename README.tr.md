@@ -46,8 +46,10 @@ döngüsü uygular.
 - **Alarm motoru**: deduplikasyon ve cooldown içeren event-driven tetikleyiciler; composite
   alarm desteklenir. Tetiklenen bir alarm onay bekleyen `pending_order` oluşturabilir.
 - **Execution**: idempotent emir gönderimi, OCO emirleri, reconcile-before-retry ve fail-closed
-  risk politikası. Emirler **asla otomatik açılmaz** — alarmlar ve order spec'leri
-  `pending_order` üretir ve açılış için açık insan onayı (`approve_pending_order`) gerekir.
+  risk politikası. Alarm kaynaklı order spec'leri şu onay yolunu izler: `pending_order` →
+  `approve_pending_order` ile açık insan onayı. `execute_on_accounts` ve `place_order` ise
+  istisnadır: emirleri doğrudan gönderir ve pending-approval kuyruğunu atlar. Gerçek trading
+  kilidi açık hesaplarda bu tool'lar gerçek para ile emir gönderebilir.
 - **Paper/real ayrımı**: her hesap `trading_lock=paper` ile başlar. `enable_real_trading` tek
   yönlü, geri alınamaz bir unlock'tır. Gerçek trading açık olan hesaplar silinemez.
 - **Emergency stop**: daemon'dan bağımsız çalışan standalone bir kill-switch script'i
